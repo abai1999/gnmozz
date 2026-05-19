@@ -52,21 +52,16 @@ if [[ "$COARSE2CONTACT_SHADOW_ONLY" == "1" ]]; then
   SHADOW_ONLY_ARGS+=(--coarse2contact_shadow_only)
 fi
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" xvfb-run -a "$PYTHON_BIN" scripts/evaluate_rlbench_modes.py \
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" xvfb-run -a "$PYTHON_BIN" scripts/evaluate_c2c_rlbench.py \
   --checkpoint_dir "$CHECKPOINT_DIR" \
   --task_name "$TASK_NAME" \
-  --modes "$MODE" \
+  --mode "$MODE" \
   --num_episodes "$NUM_EPISODES" \
   --episode_indices "$EPISODE_INDICES" \
   --max_steps "$MAX_STEPS" \
   --output_root "$OUTPUT_ROOT" \
   --name_suffix "$NAME_SUFFIX" \
-  --coarse2contact_mode "$MODE" \
   "${SHADOW_ONLY_ARGS[@]}" \
-  --planner_no_depth \
-  --planner_no_force \
-  --use_depth \
-  --use_force \
   --record_video \
   --write_episode_videos \
   --no_best_gif \

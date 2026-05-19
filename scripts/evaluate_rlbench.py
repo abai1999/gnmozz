@@ -3628,13 +3628,12 @@ def build_coarse2contact_supervisor(args):
         visual_precontact_depth_threshold=float(getattr(args, "coarse2contact_precontact_depth_threshold", 0.20)),
         visual_contact_depth_threshold=float(getattr(args, "coarse2contact_contact_depth_threshold", 0.035)),
         max_xy_step=float(getattr(args, "coarse2contact_max_xy_step", 0.0005)),
-        max_z_step=float(getattr(args, "coarse2contact_max_z_step", 0.0005)),
         max_yaw_step=float(getattr(args, "coarse2contact_max_yaw_step", 0.0087)),
-        force_contact_threshold=float(getattr(args, "coarse2contact_force_contact_threshold", 1.0)),
-        force_delta_contact_threshold=float(getattr(args, "coarse2contact_force_delta_contact_threshold", 0.5)),
-        force_jam_threshold=float(getattr(args, "coarse2contact_force_jam_threshold", 6.0)),
-        force_torque_threshold=float(getattr(args, "coarse2contact_force_torque_threshold", 0.25)),
-        force_spike_threshold=float(getattr(args, "coarse2contact_force_spike_threshold", 10.5)),
+        force_contact_threshold=float(getattr(args, "coarse2contact_force_contact_threshold", 0.18)),
+        force_delta_contact_threshold=float(getattr(args, "coarse2contact_force_delta_contact_threshold", 0.05)),
+        force_jam_threshold=float(getattr(args, "coarse2contact_force_jam_threshold", 0.55)),
+        force_torque_threshold=float(getattr(args, "coarse2contact_force_torque_threshold", 0.12)),
+        force_spike_threshold=float(getattr(args, "coarse2contact_force_spike_threshold", 1.0)),
         backoff_m=float(getattr(args, "coarse2contact_backoff_m", 0.003)),
         lateral_m=float(getattr(args, "coarse2contact_lateral_m", 0.0015)),
         chunk_size=int(getattr(args, "coarse2contact_chunk_size", 4)),
@@ -8112,7 +8111,7 @@ def evaluate(args, preloaded_components=None):
                     delta_action,
                     force_reading=raw_force,
                     gripper_z=float(obs.gripper_pose[2]),
-                    wrist_depth=depth_tensor_96,
+                    wrist_depth=obs.wrist_depth,
                     proprio=proprio,
                 )
                 trace_entry.update(coarse2contact.get_last_trace())
@@ -8833,6 +8832,7 @@ def evaluate(args, preloaded_components=None):
             try:
                 obs, reward, terminate = task.step(abs_action)
             except InvalidActionError as e:
+                coarse2contact_recovery_abs = None
                 if alignment_diffusion_step_row is not None:
                     alignment_diffusion_step_row["invalid_action"] = np.asarray(1.0, dtype=np.float32)
                     alignment_diffusion_step_row["reward"] = np.asarray(0.0, dtype=np.float32)
@@ -8842,6 +8842,8 @@ def evaluate(args, preloaded_components=None):
                 trace_entry["invalid_action"] = True
                 trace_entry["invalid_error"] = type(e).__name__
                 trace_entry["invalid_action_count_so_far"] = int(invalid_action_count + 1)
+                trace_entry["recovery_primitive"] = trace_entry.get("recovery_primitive", "none")
+                trace_entry["recovery_phase"] = trace_entry.get("recovery_phase", "IDLE")
                 if args.record_gripper_trace:
                     gripper_trace.append(trace_entry)
                 invalid_action_count += 1
@@ -8858,6 +8860,43 @@ def evaluate(args, preloaded_components=None):
                 print(f"  Step {step_idx}: action execution failed ({type(e).__name__}), marking RECOVER and replanning")
                 action_queue.clear()
                 chunk_step = 0
+
+                if coarse2contact is not None and hasattr(coarse2contact, "build_invalid_action_recovery_absolute"):
+                    coarse2contact_recovery_abs = coarse2contact.build_invalid_action_recovery_absolute(
+                        obs.gripper_pose,
+                        obs.gripper_open,
+                        force_reading=raw_force,
+                        proprio=proprio,
+                    )
+                    trace_entry["coarse2contact_invalid_action_recovery"] = True
+                    trace_entry["coarse2contact_invalid_action_recovery_phase"] = str(
+                        coarse2contact.get_last_trace().get("recovery_phase", "IDLE")
+                    )
+                    trace_entry["coarse2contact_invalid_action_recovery_primitive"] = str(
+                        coarse2contact.get_last_trace().get("recovery_primitive", "none")
+                    )
+                    trace_entry["coarse2contact_invalid_action_recovery_reason"] = str(
+                        coarse2contact.get_last_trace().get("force_reflex_reason", "invalid_action")
+                    )
+                    recovery_abs = coarse2contact_recovery_abs
+                    recovery_abs, recovery_violation = maybe_apply_workspace_filter(
+                        recovery_abs,
+                        coarse2contact.safety,
+                        mode=args.workspace_clamp_mode,
+                        tolerance=args.workspace_clamp_tolerance,
+                    )
+                    if recovery_violation > 0:
+                        workspace_violation_count += 1
+                        workspace_violation_sum += recovery_violation
+                        workspace_violation_max = max(workspace_violation_max, recovery_violation)
+                    try:
+                        obs, reward, terminate = task.step(recovery_abs)
+                    except Exception as recovery_e:
+                        print(
+                            f"  Step {step_idx}: invalid-action recovery failed "
+                            f"({type(recovery_e).__name__}); forcing replan"
+                        )
+                        continue
 
                 if refiner is not None and hasattr(refiner, "on_invalid_action"):
                     _ = refiner.on_invalid_action(delta_action, raw_force)
@@ -9845,6 +9884,12 @@ def evaluate(args, preloaded_components=None):
                 "coarse2contact_correction_count": int(
                     coarse2contact_snapshot.get("coarse2contact_correction_count", 0)
                 ),
+                "coarse2contact_recovery_count": int(
+                    coarse2contact_snapshot.get("coarse2contact_recovery_count", 0)
+                ),
+                "coarse2contact_invalid_action_count": int(
+                    coarse2contact_snapshot.get("coarse2contact_invalid_action_count", 0)
+                ),
                 "uses_privileged_target": False,
                 "stage_target_mode_id": int(stage_tracker.stage_target_mode),
                 "stage_target_mode": stage_tracker.stage_target_mode.name,
@@ -10096,6 +10141,12 @@ def evaluate(args, preloaded_components=None):
     )
     results["coarse2contact_correction_count"] = int(
         sum(int(s.get("coarse2contact_correction_count", 0)) for s in results["stage_stats"])
+    )
+    results["coarse2contact_recovery_count"] = int(
+        sum(int(s.get("coarse2contact_recovery_count", 0)) for s in results["stage_stats"])
+    )
+    results["coarse2contact_invalid_action_count"] = int(
+        sum(int(s.get("coarse2contact_invalid_action_count", 0)) for s in results["stage_stats"])
     )
     results["uses_privileged_target"] = False
     results["total_phase_counts"] = total_phase_counts
@@ -10449,11 +10500,11 @@ def main():
     parser.add_argument("--coarse2contact_max_xy_step", type=float, default=0.0005)
     parser.add_argument("--coarse2contact_max_z_step", type=float, default=0.0005)
     parser.add_argument("--coarse2contact_max_yaw_step", type=float, default=0.0087)
-    parser.add_argument("--coarse2contact_force_contact_threshold", type=float, default=1.0)
-    parser.add_argument("--coarse2contact_force_delta_contact_threshold", type=float, default=0.5)
-    parser.add_argument("--coarse2contact_force_jam_threshold", type=float, default=6.0)
-    parser.add_argument("--coarse2contact_force_torque_threshold", type=float, default=0.25)
-    parser.add_argument("--coarse2contact_force_spike_threshold", type=float, default=10.5)
+    parser.add_argument("--coarse2contact_force_contact_threshold", type=float, default=0.18)
+    parser.add_argument("--coarse2contact_force_delta_contact_threshold", type=float, default=0.05)
+    parser.add_argument("--coarse2contact_force_jam_threshold", type=float, default=0.55)
+    parser.add_argument("--coarse2contact_force_torque_threshold", type=float, default=0.12)
+    parser.add_argument("--coarse2contact_force_spike_threshold", type=float, default=1.0)
     parser.add_argument("--coarse2contact_backoff_m", type=float, default=0.003)
     parser.add_argument("--coarse2contact_lateral_m", type=float, default=0.0015)
     parser.add_argument("--record_video", action="store_true", default=True)

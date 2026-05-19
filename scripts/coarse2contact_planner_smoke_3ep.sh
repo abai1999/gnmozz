@@ -38,23 +38,16 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 mkdir -p "$OUTPUT_ROOT"
 cd "$ROOT"
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" xvfb-run -a "$PYTHON_BIN" scripts/evaluate_rlbench_modes.py \
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" xvfb-run -a "$PYTHON_BIN" scripts/evaluate_c2c_rlbench.py \
   --checkpoint_dir "$CHECKPOINT_DIR" \
   --task_name "$TASK_NAME" \
-  --modes planner_only \
+  --mode planner_only \
   --num_episodes "$NUM_EPISODES" \
   --episode_indices "$EPISODE_INDICES" \
   --max_steps "$MAX_STEPS" \
   --output_root "$OUTPUT_ROOT" \
   --name_suffix "$NAME_SUFFIX" \
-  --planner_no_depth \
-  --planner_no_force \
-  --use_depth \
-  --use_force \
-  --depth_force_clean_support \
-  --depth_force_clean_privileged_labels \
   --eval_seed "$EVAL_SEED" \
-  --support_states_output_npz "$SUPPORT_STATES_OUTPUT_NPZ" \
   --record_video \
   --write_episode_videos \
   --no_best_gif
