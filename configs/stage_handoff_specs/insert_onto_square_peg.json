@@ -1,0 +1,129 @@
+{
+  "task_name": "insert_onto_square_peg",
+  "version": 1,
+  "description": "Demo-derived task-stage handoff thresholds. Alignment uses these as provider-owned handoff labels.",
+  "stages": [
+    {
+      "name": "insert_onto_square_peg_pregrasp_close_demo_q95",
+      "task_name": "insert_onto_square_peg",
+      "substage_id": 1,
+      "target_frame": "object_grasp_target",
+      "target_role": "pregrasp_close",
+      "yaw_symmetry_period": 1.5707963267948966,
+      "target_offset_local_7d": [
+        5.8748839364852756e-05,
+        3.694836777867749e-05,
+        -0.0014874865300953388,
+        -0.7012414932250977,
+        -0.7129237651824951,
+        -0.00023143253929447383,
+        -8.689994137967005e-05
+      ],
+      "release_thresholds": {
+        "xy_error": 0.0085,
+        "abs_z_error": 0.0035,
+        "yaw_error": 0.12434040009975433,
+        "tilt_error": -1.0
+      },
+      "optimization_thresholds": {
+        "xy_error": 0.003,
+        "abs_z_error": 0.001,
+        "yaw_error": 0.12,
+        "tilt_error": -1.0
+      },
+      "metric_thresholds": {
+        "xy_error": 0.0085,
+        "abs_z_error": 0.0035,
+        "yaw_error": 0.12434040009975433,
+        "tilt_error": -1.0
+      },
+      "min_stable_frames": 1,
+      "required_gripper_state": "open",
+      "required_contact_state": "any",
+      "source": "privileged_success_rollout",
+      "uses_privileged": true,
+      "num_episodes_used": 38,
+      "num_metric_rows": 76,
+      "quantile": 0.9,
+      "threshold_scale": 1.0,
+      "episodes_dir": "data/rlbench_data/insert_onto_square_peg/train/episodes",
+      "episode_names": [
+        "episode0",
+        "episode1",
+        "episode2",
+        "episode3",
+        "episode4",
+        "episode5",
+        "episode6",
+        "episode7",
+        "episode8",
+        "episode9",
+        "episode10",
+        "episode11",
+        "episode12",
+        "episode13",
+        "episode14",
+        "episode15",
+        "episode16",
+        "episode18",
+        "episode19",
+        "episode21",
+        "episode22",
+        "episode23",
+        "episode24",
+        "episode25",
+        "episode26",
+        "episode27",
+        "episode28",
+        "episode29",
+        "episode30",
+        "episode31",
+        "episode32",
+        "episode33",
+        "episode34",
+        "episode35",
+        "episode36",
+        "episode37",
+        "episode38",
+        "episode39"
+      ],
+      "support_npz": "/home/guoning/code/VLA/runtime_artifacts/residual_data/insert_phase1_teacher_support_states_demo_grasp_yaw_20260419a/support_states.npz",
+      "meta_json": "/home/guoning/code/VLA/runtime_artifacts/residual_data/insert_phase1_visual_posefield_candidates_demo_grasp_yaw_20260419p_yawfocus/candidates.meta.json"
+    },
+    {
+      "name": "insert_onto_square_peg_insert_commit_demo_q95",
+      "task_name": "insert_onto_square_peg",
+      "substage_id": 2,
+      "target_frame": "task_success_centre",
+      "target_role": "insert_commit",
+      "yaw_symmetry_period": 1.5707963267948966,
+      "release_thresholds": {
+        "xy_error": 0.015,
+        "abs_z_error": 0.020,
+        "yaw_error": 0.18,
+        "tilt_error": -1.0
+      },
+      "optimization_thresholds": {
+        "xy_error": 0.008,
+        "abs_z_error": 0.010,
+        "yaw_error": 0.10,
+        "tilt_error": -1.0
+      },
+      "metric_thresholds": {
+        "xy_error": 0.015,
+        "abs_z_error": 0.020,
+        "yaw_error": 0.18,
+        "tilt_error": -1.0
+      },
+      "min_stable_frames": 1,
+      "required_gripper_state": "closed",
+      "required_contact_state": "any",
+      "source": "demo_perturb_insert_commit",
+      "uses_privileged": true,
+      "num_episodes_used": 0,
+      "num_metric_rows": 0,
+      "quantile": 0.9,
+      "threshold_scale": 1.0
+    }
+  ]
+}

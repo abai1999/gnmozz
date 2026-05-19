@@ -1,0 +1,30 @@
+{
+  "name": "insert_onto_square_peg_phase1_demo_fallback",
+  "grasp_offset_local_7d": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "pregrasp_hover_offset_local_6d": [
+    0.0,
+    0.0,
+    0.015,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "close_xy_threshold": 0.006,
+  "close_abs_z_threshold": 0.005,
+  "close_yaw_threshold": 0.12,
+  "orientation_rescue_enabled": false,
+  "orientation_rescue_xy_threshold": 0.015,
+  "orientation_rescue_angle_threshold_deg": 8.0,
+  "commit_switch_xy_threshold": 0.012,
+  "commit_switch_z_threshold": 0.012,
+  "commit_switch_yaw_threshold": 0.2,
+  "yaw_symmetry_period": 1.5707963267948966
+}
