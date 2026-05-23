@@ -292,11 +292,12 @@ class PrecisionSkillSupervisor:
             return True, info
 
         self._reset_inactive_precision_gates(key)
-        skill = self._skill_for_type(key)
+        skill = active_skill if active_skill is not None and active_skill.skill_type == key else self._skill_for_type(key)
         if skill is None:
             info.update(active=False, reason="missing_skill")
             self._last_precision_gate_info = dict(info)
             return False, info
+        info["skill_name"] = str(skill.name)
 
         flags = dict(self.task_spec.runtime_flags if self.task_spec is not None else {})
         required_frames = int(flags.get("precision_takeover_stable_frames", 3) or 3)
@@ -879,8 +880,11 @@ class PrecisionSkillSupervisor:
         bundle = observation if isinstance(observation, PrecisionObservationBundle) else PrecisionObservationBundle.from_observation(observation, instruction=current_instruction)
         robot_state = dict(robot_state or {})
         robot_state.setdefault("planner_delta_7d", np.asarray(planner_delta_7d, dtype=np.float32).tolist())
+        planner_delta_7d = np.asarray(planner_delta_7d, dtype=np.float32).reshape(-1)
+        current_quat = self._extract_current_quat(bundle.proprio)
 
         if self.task_spec is None or not self.stage_names:
+            local_base = world_delta_to_local(planner_delta_7d[:6], current_quat).astype(np.float32)
             self._last_trace = {
                 "c2c_v2_stage": "planner_only",
                 "c2c_v2_skill_type": "none",
@@ -898,11 +902,13 @@ class PrecisionSkillSupervisor:
                 "phase_owner": "planner",
                 "phase_reason": "no_task_spec",
                 "invalid_action_flag": False,
-                "planner_action_world": np.asarray(planner_delta_7d, dtype=np.float32)[:6].tolist(),
-                "planner_chunk_local_6d": np.asarray(planner_delta_7d, dtype=np.float32)[:6].tolist(),
-                "pre_clip_action_world_6d": np.asarray(planner_delta_7d, dtype=np.float32)[:6].tolist(),
-                "post_clip_action_world_6d": np.asarray(planner_delta_7d, dtype=np.float32)[:6].tolist(),
-                "executed_action_world_6d": np.asarray(planner_delta_7d, dtype=np.float32)[:6].tolist(),
+                "planner_action_world": planner_delta_7d[:6].tolist(),
+                "planner_chunk_local_6d": local_base.tolist(),
+                "local_command_local_6d": local_base.tolist(),
+                "local_residual_vs_planner_local_6d": np.zeros(6, dtype=np.float32).tolist(),
+                "pre_clip_action_world_6d": planner_delta_7d[:6].tolist(),
+                "post_clip_action_world_6d": planner_delta_7d[:6].tolist(),
+                "executed_action_world_6d": planner_delta_7d[:6].tolist(),
                 "local_correction_local_6d": np.zeros(6, dtype=np.float32).tolist(),
                 "local_correction_owner": "planner",
                 "grasp_gripper_override": None,
@@ -913,7 +919,7 @@ class PrecisionSkillSupervisor:
                 "raw_wrench": np.zeros(6, dtype=np.float32).tolist(),
                 "filtered_wrench": np.zeros(6, dtype=np.float32).tolist(),
             }
-            return np.asarray(planner_delta_7d, dtype=np.float32).copy()
+            return planner_delta_7d.copy()
 
         if self.current_stage() is None:
             self._set_stage(self._default_stage or self.stage_names[0])
@@ -922,9 +928,7 @@ class PrecisionSkillSupervisor:
         if stage is None:
             stage = self.task_spec.get_stage(self._default_stage or self.stage_names[0])
 
-        current_quat = self._extract_current_quat(bundle.proprio)
         self._last_current_quat = current_quat.copy()
-        planner_delta_7d = np.asarray(planner_delta_7d, dtype=np.float32).reshape(-1)
         local_base = world_delta_to_local(planner_delta_7d[:6], current_quat).astype(np.float32)
         local_out = local_base.copy()
         active_skill, active_skill_type = self._skill_context_for_stage(stage)
@@ -1143,6 +1147,8 @@ class PrecisionSkillSupervisor:
             "invalid_action_flag": invalid_action_flag,
             "planner_action_world": planner_delta_7d[:6].tolist(),
             "planner_chunk_local_6d": local_base.astype(np.float32).tolist(),
+            "local_command_local_6d": local_out.astype(np.float32).tolist(),
+            "local_residual_vs_planner_local_6d": (local_out - local_base).astype(np.float32).tolist(),
             "pre_clip_action_world_6d": world_out[:6].tolist(),
             "post_clip_action_world_6d": final_action[:6].tolist(),
             "executed_action_world_6d": final_action[:6].tolist(),
@@ -1160,6 +1166,7 @@ class PrecisionSkillSupervisor:
             "grasp_contact_rule_stable": grasp_close_trace["stable"],
             "c2c_stage_age": int(self.stage_age),
             "c2c_gate_skill": str(gate_info.get("skill", "none")),
+            "c2c_gate_skill_name": str(gate_info.get("skill_name", "none")),
             "c2c_gate_active": bool(gate_active),
             "c2c_gate_reason": str(gate_info.get("reason", "none")),
             "c2c_gate_stable_frames": int(gate_info.get("stable_frames", 0)),
@@ -1193,9 +1200,13 @@ class PrecisionSkillSupervisor:
                 self._last_trace["phase_owner"] = "basin_recovery"
                 self._last_trace["phase_reason"] = basin_decision.reason
                 self._last_trace["local_correction_owner"] = "basin_recovery"
-                self._last_trace["local_correction_local_6d"] = np.asarray(basin_decision.local_action_6d, dtype=np.float32).tolist()
+                command_local = np.asarray(basin_decision.local_action_6d, dtype=np.float32).reshape(6)
+                residual_local = (command_local - local_base).astype(np.float32)
+                self._last_trace["local_command_local_6d"] = command_local.tolist()
+                self._last_trace["local_residual_vs_planner_local_6d"] = residual_local.tolist()
+                self._last_trace["local_correction_local_6d"] = residual_local.tolist()
                 self._last_trace["force_skill_state"] = basin_decision.mode.value
-        corr_vec = np.asarray(self._last_trace.get("local_correction_local_6d", [0.0] * 6), dtype=np.float32).reshape(-1)
+        corr_vec = np.asarray(self._last_trace.get("local_residual_vs_planner_local_6d", self._last_trace.get("local_correction_local_6d", [0.0] * 6)), dtype=np.float32).reshape(-1)
         if corr_vec.size >= 6 and float(np.linalg.norm(corr_vec[:6])) <= 1.0e-9:
             self._last_trace["phase_owner"] = "planner"
             self._last_trace["local_correction_owner"] = "planner"

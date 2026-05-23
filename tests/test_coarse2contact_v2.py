@@ -290,6 +290,8 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         np.testing.assert_allclose(action, planner_delta, atol=1e-6)
         np.testing.assert_allclose(np.asarray(trace["executed_action_world_6d"], dtype=np.float32), planner_delta[:6], atol=1e-6)
         np.testing.assert_allclose(np.asarray(trace["pre_clip_action_world_6d"], dtype=np.float32), planner_delta[:6], atol=1e-6)
+        np.testing.assert_allclose(np.asarray(trace["local_command_local_6d"], dtype=np.float32), np.asarray(trace["planner_chunk_local_6d"], dtype=np.float32), atol=1e-6)
+        np.testing.assert_allclose(np.asarray(trace["local_residual_vs_planner_local_6d"], dtype=np.float32), np.zeros(6, dtype=np.float32), atol=1e-6)
 
     def test_heatmap_localizer_exposes_axis_endpoints(self) -> None:
         model = DepthGeometryLocalizerNet.from_vocab(
@@ -470,6 +472,7 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         sup = PrecisionSkillSupervisor(None, mode="planner_only", shadow_only=True)
         sup.reset()
         obs = _make_observation()
+        obs["gripper_pose"] = np.array([0.0, 0.0, 0.35, 0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)], dtype=np.float32)
         planner_delta = np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         action = sup.step(planner_delta, obs, robot_state={}, task_spec=None, current_instruction="test")
         trace = sup.get_last_trace()
@@ -477,6 +480,37 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(trace["c2c_v2_stage"], "planner_only")
         self.assertFalse(trace["uses_privileged_target"])
         self.assertFalse(trace["uses_rlbench_mask_runtime"])
+        expected_local = world_delta_to_local(planner_delta[:6], obs["gripper_pose"][3:7])
+        np.testing.assert_allclose(np.asarray(trace["planner_chunk_local_6d"], dtype=np.float32), expected_local, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(trace["local_command_local_6d"], dtype=np.float32), expected_local, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(trace["local_residual_vs_planner_local_6d"], dtype=np.float32), np.zeros(6, dtype=np.float32), atol=1e-6)
+
+    def test_precision_gate_prefers_active_skill_over_first_skill_type_match(self) -> None:
+        spec = load_precision_task_spec("insert_onto_square_peg")
+        assert spec is not None
+        sup = PrecisionSkillSupervisor(spec, mode="basin_recovery_only", shadow_only=False)
+        sup.reset()
+        sup._set_stage("RING_GRASP_CONTACT")
+        obs = _make_observation(blue_center=(48, 48))
+        obs["wrist_depth"] = np.full((96, 96), 0.08, dtype=np.float32)
+        obs["front_depth"] = np.full((96, 96), 0.08, dtype=np.float32)
+        planner_delta = np.array([0.001, -0.001, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        _ = sup.step(
+            planner_delta,
+            obs,
+            robot_state={
+                "wrist_valid_depth_ratio": 1.0,
+                "wrist_depth_near_fraction": 1.0,
+                "wrist_is_occluded": False,
+                "wrist_is_low_visibility": False,
+            },
+            task_spec=spec,
+            current_instruction="put the ring on the red spoke",
+        )
+        trace = sup.get_last_trace()
+        self.assertEqual(trace["c2c_v2_stage"], "RING_GRASP_CONTACT")
+        self.assertEqual(trace["c2c_gate_skill"], "precision_grasp")
+        self.assertEqual(trace["c2c_gate_skill_name"], "grasp_contact_ring")
 
     def test_recovery_audit_helpers(self) -> None:
         xy, yaw_abs, dyaw, score = planner_bias_xyyaw([0.003, -0.004, 0.0, 0.0, 0.0, 0.02])
