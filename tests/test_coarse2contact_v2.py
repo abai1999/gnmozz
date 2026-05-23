@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 from prismatic.robot.coarse2contact_v2 import (
     PrecisionObservationBundle,
@@ -47,6 +48,7 @@ from prismatic.robot.coarse2contact_v2.basin_recovery import BasinStateEstimator
 from prismatic.robot.coarse2contact_v2.basin_state import BasinAxisCalibration, BasinStateCalibration, CalibratedGraspBasinEstimator, EstimatedBasinError, load_basin_state_calibration_report
 from prismatic.robot.residual_safety import ResidualSafety
 from prismatic.robot.residual_transforms import local_delta_to_world, world_delta_to_local
+from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,8 +90,58 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(spec.task_name, "insert_onto_square_peg")
         self.assertIn("held_square_ring", spec.entities)
         self.assertIn("target_red_spoke", spec.entities)
+        self.assertIn("ring_grasp_frame", spec.entities)
+        self.assertIn("target_spoke_axis_frame", spec.entities)
+        self.assertEqual(spec.get_skill("precision_grasp_ring").target_entity, "ring_grasp_frame")
+        self.assertEqual(spec.get_skill("grasp_contact_ring").target_entity, "ring_grasp_frame")
+        self.assertEqual(spec.get_skill("precision_align_ring_to_spoke").target_entity, "target_spoke_axis_frame")
         self.assertEqual(spec.default_stage, "COARSE_TO_RING")
         self.assertGreaterEqual(len(spec.stage_graph), 6)
+
+    def test_precision_skill_contract_rejects_object_targets(self) -> None:
+        raw = yaml.safe_load((ROOT / "configs" / "coarse2contact" / "tasks" / "insert_onto_square_peg.yaml").read_text(encoding="utf-8"))
+        raw["skills"]["precision_grasp_ring"]["target_entity"] = "held_square_ring"
+        with self.assertRaises(ValueError):
+            from prismatic.robot.coarse2contact_v2.specs import PrecisionTaskSpec
+
+            PrecisionTaskSpec.from_dict(raw)
+
+    def test_frame_to_frame_relabel_synthetic_geometry(self) -> None:
+        gripper_pose = np.array([0.0, 0.0, 0.50, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        ring_pose = np.array([0.02, -0.01, 0.42, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        spoke_pose = np.array([0.05, 0.03, 0.40, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        trace_row = {
+            "c2c_v2_skill_type": "precision_grasp",
+            "c2c_v2_stage": "RING_GRASP_ALIGN",
+            "planner_local_delta_6d": [0.0] * 6,
+            "local_residual_vs_planner_local_6d": [0.0] * 6,
+        }
+        row = _frame_label_fields(
+            task_name="insert_onto_square_peg",
+            trace_row=trace_row,
+            gripper_pose=gripper_pose,
+            ring_pose=ring_pose,
+            spoke_pose=spoke_pose,
+        )
+        self.assertEqual(row["target_frame"], "ring_grasp_frame")
+        self.assertEqual(row["reference_frame"], "gripper_jaw_frame")
+        self.assertAlmostEqual(float(row["privileged_dx"]), 0.02, places=6)
+        self.assertAlmostEqual(float(row["privileged_dy"]), 0.01, places=6)
+        self.assertGreater(float(row["privileged_dz"]), 0.0)
+        self.assertTrue(row["near_grasp_basin"] or not row["close_ready_basin"])
+        self.assertEqual(row["z_semantics"], "descend_progress_to_grasp_frame")
+
+        align_row = _frame_label_fields(
+            task_name="insert_onto_square_peg",
+            trace_row={"c2c_v2_skill_type": "precision_align", "c2c_v2_stage": "RING_SPOKE_ALIGN"},
+            gripper_pose=gripper_pose,
+            ring_pose=ring_pose,
+            spoke_pose=spoke_pose,
+        )
+        self.assertEqual(align_row["target_frame"], "target_spoke_axis_frame")
+        self.assertEqual(align_row["reference_frame"], "held_ring_aperture_frame")
+        self.assertEqual(align_row["z_semantics"], "axis_alignment_depth")
+        self.assertTrue(np.isfinite(float(align_row["privileged_dyaw"])))
 
     def test_recovery_mainline_points_to_v11(self) -> None:
         self.assertIn("grasp_recovery_head_v11_runtime_failure", str(RECOVERY_MAINLINE_CHECKPOINT))
@@ -569,7 +621,7 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             frame_consistency=0.9,
             source="unit_test",
             reason="synthetic",
-            target_entity="held_square_ring",
+            target_entity="ring_grasp_frame",
             reference_entity="gripper_jaw_frame",
             stage_name="RING_GRASP_ALIGN",
         )
@@ -598,7 +650,7 @@ class Coarse2ContactV2Tests(unittest.TestCase):
                 "fit_residual": 0.05,
                 "inlier_ratio": 0.95,
                 "reason": "ok",
-                "target_entity": "held_square_ring",
+                "target_entity": "ring_grasp_frame",
                 "reference_entity": "gripper_jaw_frame",
                 "stage_name": "RING_GRASP_ALIGN",
             },

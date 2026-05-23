@@ -64,6 +64,10 @@ class PrecisionSkillSpec:
     target_entity: str
     reference_entity: str
     controlled_dofs: tuple[str, ...]
+    error_frame: str = "reference_local"
+    yaw_mode: str = "proxy_axis"
+    z_semantics: str = "proxy_depth"
+    requires_yaw_observability: bool = False
     confidence_threshold: float = 0.35
     apply_confidence: float = 0.40
     shadow_confidence: float = 0.20
@@ -91,6 +95,10 @@ class PrecisionSkillSpec:
             target_entity=str(data.get("target_entity", "")),
             reference_entity=str(data.get("reference_entity", "")),
             controlled_dofs=tuple(str(x) for x in _as_tuple(data.get("controlled_dofs"), default=())),
+            error_frame=str(data.get("error_frame", "reference_local")),
+            yaw_mode=str(data.get("yaw_mode", "proxy_axis")),
+            z_semantics=str(data.get("z_semantics", "proxy_depth")),
+            requires_yaw_observability=bool(data.get("requires_yaw_observability", False)),
             confidence_threshold=_as_float(data.get("confidence_threshold"), 0.35),
             apply_confidence=_as_float(data.get("apply_confidence"), _as_float(data.get("confidence_threshold"), 0.40)),
             shadow_confidence=_as_float(data.get("shadow_confidence"), 0.20),
@@ -177,6 +185,29 @@ class PrecisionTaskSpec:
                 raise ValueError(f"skill {skill_name!r} references unknown reference entity {skill.reference_entity!r}")
             if not skill.skill_type:
                 raise ValueError(f"skill {skill_name!r} must define skill_type")
+            if skill.skill_type in {"precision_grasp", "precision_align"}:
+                if skill.error_frame not in {"reference_local", "frame_local"}:
+                    raise ValueError(f"skill {skill_name!r} must use reference_local error_frame, got {skill.error_frame!r}")
+                if skill.skill_type == "precision_grasp":
+                    if not self._entity_is_frame_like(skill.reference_entity):
+                        raise ValueError(
+                            f"skill {skill_name!r} requires frame-like robot reference entity, got {skill.reference_entity!r}"
+                        )
+                    if not self._entity_is_frame_like(skill.target_entity):
+                        raise ValueError(
+                            f"skill {skill_name!r} requires frame-like manipulated target entity, got {skill.target_entity!r}"
+                        )
+                    self._validate_precision_grasp_roles(skill_name, skill)
+                elif skill.skill_type == "precision_align":
+                    if not self._entity_is_frame_like(skill.reference_entity):
+                        raise ValueError(
+                            f"skill {skill_name!r} requires frame-like manipulated reference entity, got {skill.reference_entity!r}"
+                        )
+                    if not self._entity_is_frame_like(skill.target_entity):
+                        raise ValueError(
+                            f"skill {skill_name!r} requires frame-like target entity, got {skill.target_entity!r}"
+                        )
+                    self._validate_precision_align_roles(skill_name, skill)
 
         stage_names = {s.name for s in self.stage_graph}
         for stage in self.stage_graph:
@@ -248,6 +279,48 @@ class PrecisionTaskSpec:
 
     def stage_by_name(self, stage_name: str) -> StageTransition:
         return self.get_stage(stage_name)
+
+    def _entity_is_frame_like(self, entity_name: str) -> bool:
+        entity = self.entities.get(entity_name)
+        if entity is None:
+            return False
+        if entity.primitive == "frame":
+            return True
+        if str(entity.observable_hints.get("frame_type", "")).strip():
+            return True
+        if str(entity.observable_hints.get("axis_hint", "")).strip():
+            return True
+        if str(entity.role).endswith("_reference"):
+            return True
+        return False
+
+    def _validate_precision_grasp_roles(self, skill_name: str, skill: PrecisionSkillSpec) -> None:
+        ref = self.entities.get(skill.reference_entity)
+        tgt = self.entities.get(skill.target_entity)
+        if ref is None or tgt is None:
+            return
+        if ref.role not in {"robot_reference", "robot_frame"}:
+            raise ValueError(
+                f"skill {skill_name!r} requires robot reference role, got {skill.reference_entity!r} with role {ref.role!r}"
+            )
+        if tgt.role not in {"manipulated_reference", "manipulated_target", "manipulated_frame"}:
+            raise ValueError(
+                f"skill {skill_name!r} requires manipulated target role, got {skill.target_entity!r} with role {tgt.role!r}"
+            )
+
+    def _validate_precision_align_roles(self, skill_name: str, skill: PrecisionSkillSpec) -> None:
+        ref = self.entities.get(skill.reference_entity)
+        tgt = self.entities.get(skill.target_entity)
+        if ref is None or tgt is None:
+            return
+        if ref.role not in {"manipulated_reference", "manipulated_target", "manipulated_frame"}:
+            raise ValueError(
+                f"skill {skill_name!r} requires manipulated reference role, got {skill.reference_entity!r} with role {ref.role!r}"
+            )
+        if tgt.role not in {"target_reference", "target_frame", "target_axis"}:
+            raise ValueError(
+                f"skill {skill_name!r} requires target reference role, got {skill.target_entity!r} with role {tgt.role!r}"
+            )
 
 
 class PrecisionTaskRegistry:

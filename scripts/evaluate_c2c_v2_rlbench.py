@@ -76,6 +76,7 @@ from scripts.evaluate_rlbench import resolve_live_target_handle, safe_live_targe
 from prismatic.robot.coarse2contact_v2 import BasinRecoveryConfig, PrecisionSkillSupervisor, load_precision_task_spec, load_basin_state_calibration_report
 from prismatic.robot.coarse2contact_v2.learned_force import LearnedForceClassifierAdapter
 from prismatic.robot.coarse2contact_v2.learned_localizer import LearnedDepthLocalizerAdapter
+from prismatic.robot.residual_transforms import world_delta_to_local
 from prismatic.vla.constants import FORCE_HISTORY_LEN
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -133,6 +134,54 @@ def _stack_runtime_obs_rows(rows: list[dict[str, np.ndarray]]) -> dict[str, np.n
         else:
             out[key] = np.asarray(values)
     return out
+
+
+def _safe_pose_from_handle(handle) -> np.ndarray | None:
+    if handle is None:
+        return None
+    try:
+        pose = np.asarray(handle.get_pose(), dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if pose.size < 7 or not np.all(np.isfinite(pose[:7])):
+        return None
+    return pose[:7].astype(np.float32)
+
+
+def _resolve_live_frame_handle(task, candidate_names: tuple[str, ...]) -> object | None:
+    task_obj = getattr(task, "_task", task)
+    for name in candidate_names:
+        if hasattr(task_obj, name):
+            return getattr(task_obj, name)
+    return None
+
+
+def _episode_privileged_frame_pack(task, obs) -> dict[str, np.ndarray | None]:
+    nan_pose = np.full((7,), np.nan, dtype=np.float32)
+    gripper_pose = np.asarray(getattr(obs, "gripper_pose", np.full((7,), np.nan, dtype=np.float32)), dtype=np.float32).reshape(-1)
+    gripper_pose = gripper_pose[:7] if gripper_pose.size >= 7 else nan_pose.copy()
+    ring_handle = resolve_live_target_handle(task)
+    ring_pose = _safe_pose_from_handle(ring_handle)
+    spoke_handle = _resolve_live_frame_handle(task, ("_success_centre", "_target", "_target_frame", "_spoke_axis", "_spoke_axis_frame"))
+    spoke_pose = _safe_pose_from_handle(spoke_handle)
+    task_low_dim_pose = None
+    try:
+        task_low_dim_pose = np.asarray(task.get_low_dim_state(), dtype=np.float32).reshape(-1)
+        if task_low_dim_pose.size >= 7 and np.all(np.isfinite(task_low_dim_pose[:7])):
+            task_low_dim_pose = task_low_dim_pose[:7].astype(np.float32)
+        else:
+            task_low_dim_pose = None
+    except Exception:
+        task_low_dim_pose = None
+    if spoke_pose is None and task_low_dim_pose is not None:
+        spoke_pose = task_low_dim_pose.copy()
+    return {
+        "episode_gripper_pose_7d": gripper_pose.astype(np.float32),
+        "episode_ring_pose_7d": ring_pose if ring_pose is not None else nan_pose.copy(),
+        "episode_spoke_pose_7d": spoke_pose if spoke_pose is not None else nan_pose.copy(),
+        "episode_target_pose_7d": ring_pose if ring_pose is not None else nan_pose.copy(),
+        "episode_task_low_dim_pose_7d": task_low_dim_pose if task_low_dim_pose is not None else nan_pose.copy(),
+    }
 
 
 def build_c2c_v2_supervisor(args, task_spec):
@@ -337,6 +386,7 @@ def evaluate(args: argparse.Namespace) -> float:
         "runtime_obs_paths": [],
         "uses_privileged_target": False,
         "uses_rlbench_mask_runtime": False,
+        "uses_privileged_label_for_eval": bool(args.dump_runtime_obs and args.capture_failure_target_pose),
         "depth_error_trend": [],
     }
 
@@ -401,7 +451,8 @@ def evaluate(args: argparse.Namespace) -> float:
 
             delta_action = action_queue.pop(0)
             base_delta_action = delta_action.copy()
-            planner_chunk_local = np.asarray(base_delta_action[:6], dtype=np.float32)
+            planner_chunk_local = world_delta_to_local(np.asarray(base_delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
+            privileged_frame_pack = _episode_privileged_frame_pack(task, obs) if args.dump_runtime_obs and args.capture_failure_target_pose else None
             trace_entry = {
                 "step": int(step_idx),
                 "planner_action_world_6d": _jsonable_value(np.asarray(base_delta_action[:6], dtype=np.float32)),
@@ -429,7 +480,11 @@ def evaluate(args: argparse.Namespace) -> float:
                 "raw_wrench": _jsonable_value(np.asarray(raw_force if raw_force is not None else np.zeros(6, dtype=np.float32), dtype=np.float32)),
                 "filtered_wrench": _jsonable_value(np.zeros(6, dtype=np.float32)),
                 "mp4_path": None,
+                "uses_privileged_runtime": False,
+                "uses_privileged_label_for_eval": bool(args.dump_runtime_obs and args.capture_failure_target_pose),
             }
+            if privileged_frame_pack is not None:
+                trace_entry.update({k: _jsonable_value(v) for k, v in privileged_frame_pack.items()})
 
             if c2c is not None:
                 delta_action = c2c.step(
@@ -522,9 +577,14 @@ def evaluate(args: argparse.Namespace) -> float:
                                 "invalid_action": np.asarray(float(trace_entry["invalid_action"]), dtype=np.float32),
                                 "reward": np.asarray(float(reward), dtype=np.float32),
                                 "terminate": np.asarray(float(terminate), dtype=np.float32),
+                                "uses_privileged_runtime": np.asarray(0.0, dtype=np.float32),
+                                "uses_privileged_label_for_eval": np.asarray(float(args.dump_runtime_obs and args.capture_failure_target_pose), dtype=np.float32),
                             }
                             if episode_target_pose_7d is not None:
                                 obs_row["episode_target_pose_7d"] = np.asarray(episode_target_pose_7d, dtype=np.float32)
+                            if privileged_frame_pack is not None:
+                                for key, value in privileged_frame_pack.items():
+                                    obs_row[key] = np.asarray(value, dtype=np.float32)
                             runtime_obs_rows.append(obs_row)
                         continue
                 else:
@@ -550,9 +610,14 @@ def evaluate(args: argparse.Namespace) -> float:
                             "invalid_action": np.asarray(float(trace_entry["invalid_action"]), dtype=np.float32),
                             "reward": np.asarray(float(reward), dtype=np.float32),
                             "terminate": np.asarray(float(terminate), dtype=np.float32),
+                            "uses_privileged_runtime": np.asarray(0.0, dtype=np.float32),
+                            "uses_privileged_label_for_eval": np.asarray(float(args.dump_runtime_obs and args.capture_failure_target_pose), dtype=np.float32),
                         }
                         if episode_target_pose_7d is not None:
                             obs_row["episode_target_pose_7d"] = np.asarray(episode_target_pose_7d, dtype=np.float32)
+                        if privileged_frame_pack is not None:
+                            for key, value in privileged_frame_pack.items():
+                                obs_row[key] = np.asarray(value, dtype=np.float32)
                         runtime_obs_rows.append(obs_row)
                     continue
 
@@ -609,15 +674,21 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_gripper_override"] = last_trace.get("grasp_gripper_override", None)
                 trace_entry["slide_gripper_override"] = last_trace.get("slide_gripper_override", None)
                 trace_entry["c2c_stage_age"] = int(last_trace.get("c2c_stage_age", 0))
+                trace_entry["uses_privileged_runtime"] = False
+                trace_entry["uses_privileged_label_for_eval"] = bool(args.dump_runtime_obs and args.capture_failure_target_pose)
             else:
                 trace_entry["pre_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
                 trace_entry["post_clip_action_world_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
                 trace_entry["post_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
                 trace_entry["executed_action_world_6d"] = _jsonable_value(np.asarray(executed_action[:6], dtype=np.float32))
                 trace_entry["planner_action_world"] = _jsonable_value(np.asarray(base_delta_action[:6], dtype=np.float32))
+                trace_entry["uses_privileged_runtime"] = False
+                trace_entry["uses_privileged_label_for_eval"] = bool(args.dump_runtime_obs and args.capture_failure_target_pose)
             trace_entry["executed_action_world_8d"] = _jsonable_value(np.asarray(executed_action, dtype=np.float32))
             trace_entry["invalid_action_recovery_executed"] = bool(recovery_applied)
             trace_entry["final_action_world_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+            if privileged_frame_pack is not None:
+                trace_entry.update({k: _jsonable_value(v) for k, v in privileged_frame_pack.items()})
             gripper_trace.append(trace_entry)
             if args.dump_runtime_obs:
                 obs_row = {
@@ -642,9 +713,14 @@ def evaluate(args: argparse.Namespace) -> float:
                     "invalid_action": np.asarray(float(trace_entry["invalid_action"]), dtype=np.float32),
                     "reward": np.asarray(float(reward), dtype=np.float32),
                     "terminate": np.asarray(float(terminate), dtype=np.float32),
+                    "uses_privileged_runtime": np.asarray(0.0, dtype=np.float32),
+                    "uses_privileged_label_for_eval": np.asarray(float(args.dump_runtime_obs and args.capture_failure_target_pose), dtype=np.float32),
                 }
                 if episode_target_pose_7d is not None:
                     obs_row["episode_target_pose_7d"] = np.asarray(episode_target_pose_7d, dtype=np.float32)
+                if privileged_frame_pack is not None:
+                    for key, value in privileged_frame_pack.items():
+                        obs_row[key] = np.asarray(value, dtype=np.float32)
                 runtime_obs_rows.append(obs_row)
 
             if reward > 0.0:
@@ -730,6 +806,7 @@ def evaluate(args: argparse.Namespace) -> float:
             "coarse2contact_v2_skill_type": stage_counter["c2c_v2_skill_type"],
             "uses_privileged_target": False,
             "uses_rlbench_mask_runtime": False,
+            "uses_privileged_label_for_eval": bool(args.dump_runtime_obs and args.capture_failure_target_pose),
             "mp4_path": episode_mp4_path,
             "runtime_obs_path": str(runtime_obs_path) if runtime_obs_path is not None else None,
             "c2c_stage_shadow": bool(args.mode == "c2c_stage_shadow" or args.shadow_only),

@@ -33,6 +33,14 @@ entities:
     observable_hints:
       frame_type: jaw_center
 
+  ring_grasp_frame:
+    role: manipulated_reference
+    primitive: frame
+    color_hint: blue
+    observable_hints:
+      frame_type: grasp
+      symmetry_period: 1.5707963267948966
+
   held_square_ring:
     role: manipulated_object
     primitive: square_ring
@@ -68,9 +76,13 @@ entities:
 skills:
   precision_grasp_ring:
     skill_type: precision_grasp
-    target_entity: held_square_ring
+    target_entity: ring_grasp_frame
     reference_entity: gripper_jaw_frame
     controlled_dofs: [x, y, z, yaw]
+    error_frame: reference_local
+    yaw_mode: square_symmetry_axis
+    z_semantics: descend_progress
+    requires_yaw_observability: true
     confidence_threshold: 0.35
     apply_confidence: 0.45
     shadow_confidence: 0.20
@@ -93,9 +105,13 @@ skills:
 
   grasp_contact_ring:
     skill_type: precision_grasp
-    target_entity: held_square_ring
+    target_entity: ring_grasp_frame
     reference_entity: gripper_jaw_frame
     controlled_dofs: [gripper_close]
+    error_frame: reference_local
+    yaw_mode: square_symmetry_axis
+    z_semantics: descend_progress
+    requires_yaw_observability: true
     confidence_threshold: 0.35
     apply_confidence: 0.45
     shadow_confidence: 0.20
@@ -109,9 +125,13 @@ skills:
 
   precision_align_ring_to_spoke:
     skill_type: precision_align
-    target_entity: target_red_spoke
+    target_entity: target_spoke_axis_frame
     reference_entity: ring_aperture_frame
     controlled_dofs: [x, y, z, yaw]
+    error_frame: reference_local
+    yaw_mode: square_symmetry_axis
+    z_semantics: axis_alignment_depth
+    requires_yaw_observability: true
     confidence_threshold: 0.012
     apply_confidence: 0.015
     shadow_confidence: 0.008
@@ -133,7 +153,7 @@ skills:
 
   guarded_slide_ring_to_spoke:
     skill_type: guarded_slide
-    target_entity: target_red_spoke
+    target_entity: target_spoke_axis_frame
     reference_entity: ring_aperture_frame
     controlled_dofs: [z, x_micro, y_micro, yaw_micro]
     confidence_threshold: 0.26
@@ -149,7 +169,7 @@ skills:
 
   recovery:
     skill_type: recovery
-    target_entity: target_red_spoke
+    target_entity: target_spoke_axis_frame
     reference_entity: ring_aperture_frame
     controlled_dofs: [backoff, unload, micro_search, reapproach]
     confidence_threshold: 0.0
