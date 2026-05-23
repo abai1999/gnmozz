@@ -130,6 +130,8 @@ def _summarize_rollouts(rollouts: list[dict], *, bucket_names: list[str]) -> dic
             "close_ready_entry_rate": 0.0,
             "monotonic_decay_rate": 0.0,
             "overshoot_rate": 0.0,
+            "micro_entry_ready_rate": 0.0,
+            "micro_yaw_active_rate": 0.0,
             "reacquire_view_rate": 0.0,
             "visual_pullback_rate": 0.0,
             "micro_servo_rate": 0.0,
@@ -143,6 +145,9 @@ def _summarize_rollouts(rollouts: list[dict], *, bucket_names: list[str]) -> dic
     close_entries = np.asarray([bool(r["entered_close_ready_basin"]) for r in rollouts], dtype=np.float32)
     monotonic = np.asarray([bool(r["monotonic_decay"]) for r in rollouts], dtype=np.float32)
     overshoot = np.asarray([bool(r["overshoot_any"]) for r in rollouts], dtype=np.float32)
+    total_steps = int(sum(int(r.get("step_count", 0)) for r in rollouts))
+    micro_entry_ready_steps = int(sum(int(r.get("micro_entry_ready_steps", 0)) for r in rollouts))
+    micro_yaw_active_steps = int(sum(int(r.get("micro_yaw_active_steps", 0)) for r in rollouts))
     mode_counts: dict[str, int] = {}
     total_modes = 0
     for rollout in rollouts:
@@ -165,6 +170,8 @@ def _summarize_rollouts(rollouts: list[dict], *, bucket_names: list[str]) -> dic
         "close_ready_entry_rate": float(np.mean(close_entries)),
         "monotonic_decay_rate": float(np.mean(monotonic)),
         "overshoot_rate": float(np.mean(overshoot)),
+        "micro_entry_ready_rate": float(micro_entry_ready_steps / max(total_steps, 1)),
+        "micro_yaw_active_rate": float(micro_yaw_active_steps / max(total_steps, 1)),
         "reacquire_view_rate": float(mode_counts.get("REACQUIRE_VIEW", 0) / max(total_modes, 1)),
         "visual_pullback_rate": float(mode_counts.get("VISUAL_PULLBACK", 0) / max(total_modes, 1)),
         "micro_servo_rate": float(mode_counts.get("MICRO_SERVO_TO_BASIN", 0) / max(total_modes, 1)),
@@ -314,6 +321,8 @@ def main() -> None:
             overshoot_any = False
             selected_names: list[str] = []
             basin_mode_sequence: list[str] = []
+            micro_entry_ready_steps = 0
+            micro_yaw_active_steps = 0
 
             for step in range(int(args.steps)):
                 pre_error = current_error.copy()
@@ -361,15 +370,10 @@ def main() -> None:
                         "dy": float(decision.correction_xyyaw[1]),
                         "dyaw": float(decision.correction_xyyaw[2]),
                         "confidence": float(decision.confidence),
-                        "basin_recovery_mode": decision.mode.value,
-                        "basin_recovery_reason": decision.reason,
-                        "basin_recovery_basin_label": decision.basin_label.value,
-                        "basin_recovery_visual_evidence_class": decision.visual_evidence_class.value,
-                        "basin_recovery_line_search_scale": float(decision.line_search_scale),
-                        "basin_recovery_used_visual_geometry": bool(decision.used_visual_geometry),
-                        "basin_recovery_used_learned_proposal": bool(decision.used_learned_proposal),
-                        "basin_recovery_dry_run_scaled_for_eval": bool(decision.dry_run_scaled_for_eval),
                     }
+                    pred.update(decision.to_trace())
+                    micro_entry_ready_steps += int(bool(pred.get("basin_recovery_micro_entry_ready", False)))
+                    micro_yaw_active_steps += int(bool(pred.get("basin_recovery_micro_yaw_active", False)))
 
                 selected_names.append(chosen_name)
                 correction = np.asarray([float(pred["dx"]), float(pred["dy"]), float(pred["dyaw"])], dtype=np.float32)
@@ -473,6 +477,9 @@ def main() -> None:
                     "error_curve": [float(x) for x in error_curve],
                     "selected_model_sequence": selected_names,
                     "basin_recovery_mode_sequence": basin_mode_sequence,
+                    "step_count": int(len(error_curve) - 1),
+                    "micro_entry_ready_steps": int(micro_entry_ready_steps),
+                    "micro_yaw_active_steps": int(micro_yaw_active_steps),
                 }
             )
 

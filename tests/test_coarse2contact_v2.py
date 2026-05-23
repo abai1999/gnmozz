@@ -703,6 +703,10 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         np.testing.assert_allclose(decision.correction_xyyaw, np.zeros(3, dtype=np.float32), atol=1e-8)
         self.assertLess(float(decision.local_action_6d[2]), 0.0)
         self.assertFalse(decision.uses_privileged_target)
+        trace = decision.to_trace()
+        self.assertIn("basin_recovery_micro_entry_ready", trace)
+        self.assertIn("basin_recovery_micro_yaw_active", trace)
+        self.assertFalse(trace["basin_recovery_micro_entry_ready"])
 
     def test_basin_recovery_visual_pullback_can_reduce_aligned_error(self) -> None:
         config = BasinRecoveryConfig(visual_conf_threshold=0.01, visual_observability_threshold=0.001, visual_axis_strength_threshold=1e-6)
