@@ -50,17 +50,27 @@ class BasinRecoveryDataset(Dataset):
         r = self.records[idx]
         feat = list(r.get("state_feature_vector") or basin_recovery_feature_vector(r))
         feat = (feat + [0.0] * self.feature_dim)[: self.feature_dim]
+        true_error = r.get("true_basin_error_t") or {}
+        action_t = r.get("action_t") or {}
+        basin_label = str(r.get("basin_label", "") or "")
+        if not basin_label:
+            if bool(r.get("close_ready_basin", False)):
+                basin_label = "close_ready"
+            elif bool(r.get("near_grasp_basin", False)):
+                basin_label = "near_grasp"
+            else:
+                basin_label = "outside"
         target = torch.tensor(
             [
-                float(r.get("initial_error_dx", r.get("recovery_target_dx", 0.0))),
-                float(r.get("initial_error_dy", r.get("recovery_target_dy", 0.0))),
-                float(r.get("initial_error_dyaw", r.get("recovery_target_dyaw", 0.0))),
+                float(true_error.get("dx", r.get("initial_error_dx", r.get("recovery_target_dx", 0.0)))),
+                float(true_error.get("dy", r.get("initial_error_dy", r.get("recovery_target_dy", 0.0)))),
+                float(true_error.get("dyaw", r.get("initial_error_dyaw", r.get("recovery_target_dyaw", 0.0)))),
             ],
             dtype=torch.float32,
         )
         evidence = EVIDENCE_TO_ID.get(str(r.get("visual_evidence_class", "prior_only")), 2)
-        basin = BASIN_TO_ID.get(str(r.get("basin_label", "outside")), 0)
-        pullback_allowed = float(bool(r.get("pullback_allowed", False)))
+        basin = BASIN_TO_ID.get(basin_label, 0)
+        pullback_allowed = float(bool(r.get("pullback_allowed", evidence != 2)))
         return {
             "features": torch.tensor(feat, dtype=torch.float32),
             "evidence": torch.tensor(evidence, dtype=torch.long),
@@ -68,6 +78,14 @@ class BasinRecoveryDataset(Dataset):
             "reacquire_needed": torch.tensor(float(bool(r.get("reacquire_needed", evidence != 0))), dtype=torch.float32),
             "pullback_allowed": torch.tensor(pullback_allowed, dtype=torch.float32),
             "target_error": target,
+            "action_target": torch.tensor(
+                [
+                    float((action_t.get("local_correction_local_6d") or action_t.get("planner_local_delta_6d") or [0.0] * 6)[0]),
+                    float((action_t.get("local_correction_local_6d") or action_t.get("planner_local_delta_6d") or [0.0] * 6)[1]),
+                    float((action_t.get("local_correction_local_6d") or action_t.get("planner_local_delta_6d") or [0.0] * 6)[5] if len((action_t.get("local_correction_local_6d") or action_t.get("planner_local_delta_6d") or [0.0] * 6)) > 5 else 0.0),
+                ],
+                dtype=torch.float32,
+            ),
         }
 
 

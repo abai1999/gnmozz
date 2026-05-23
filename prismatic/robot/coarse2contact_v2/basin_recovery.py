@@ -260,6 +260,130 @@ def _clamp_basin_correction(
     return corr.astype(np.float32)
 
 
+@dataclass
+class GraspOnlyBasinPullbackPolicy:
+    """Minimal grasp-only pullback policy for privileged replay/audit.
+
+    The policy is intentionally conservative: it only acts on x/y by default,
+    abstains or reacquires under prior-only visibility, and keeps z as a
+    diagnostic channel unless explicitly enabled.
+    """
+
+    config: BasinRecoveryConfig = field(default_factory=BasinRecoveryConfig)
+    xy_gain: float = 0.35
+    yaw_gain: float = 0.0
+    z_gain: float = 0.0
+    yaw_observable_min_abs: float = 0.01
+    allow_z: bool = False
+    allow_yaw: bool = False
+
+    @staticmethod
+    def _as_estimated(estimated_basin_error: EstimatedBasinError | Mapping[str, Any] | None) -> EstimatedBasinError | None:
+        if estimated_basin_error is None:
+            return None
+        if isinstance(estimated_basin_error, EstimatedBasinError):
+            return estimated_basin_error
+        try:
+            return EstimatedBasinError.from_dict(estimated_basin_error)
+        except Exception:
+            return None
+
+    def step(
+        self,
+        *,
+        estimated_basin_error: EstimatedBasinError | Mapping[str, Any] | None,
+        visual_evidence_class: VisualEvidenceClass | str = VisualEvidenceClass.PRIOR_ONLY,
+        stage_name: str = "",
+    ) -> BasinRecoveryDecision:
+        est = self._as_estimated(estimated_basin_error)
+        visual_class = visual_evidence_class.value if isinstance(visual_evidence_class, VisualEvidenceClass) else str(visual_evidence_class)
+        if est is None or visual_class == VisualEvidenceClass.PRIOR_ONLY.value or not est.valid:
+            local_action = np.zeros(6, dtype=np.float32)
+            local_action[2] = -float(self.config.reacquire_lift_step)
+            return BasinRecoveryDecision(
+                mode=BasinRecoveryMode.REACQUIRE_VIEW,
+                visual_evidence_class=VisualEvidenceClass.PRIOR_ONLY if visual_class == VisualEvidenceClass.PRIOR_ONLY.value else VisualEvidenceClass.PARTIAL_OBSERVABLE,
+                basin_label=BasinLabel.OUTSIDE,
+                correction_xyyaw=np.zeros(3, dtype=np.float32),
+                local_action_6d=local_action,
+                confidence=0.0,
+                reason="prior_only_reacquire" if visual_class == VisualEvidenceClass.PRIOR_ONLY.value else "replay_abstain",
+                stable_basin_count=0,
+                recovery_step=0,
+                variant_name=self.config.variant_name,
+                micro_entry_ready=False,
+                micro_yaw_active=False,
+                micro_entry_xy_error=float("nan"),
+                micro_entry_dyaw=float("nan"),
+                used_learned_proposal=False,
+                used_visual_geometry=False,
+                dry_run_scaled_for_eval=False,
+                uses_privileged_target=False,
+                uses_privileged_label_for_eval=True,
+            )
+
+        correction = np.zeros(6, dtype=np.float32)
+        if est.x_valid:
+            correction[0] = float(self.xy_gain * est.dx)
+        if est.y_valid:
+            correction[1] = float(self.xy_gain * est.dy)
+        if self.allow_z and est.z_valid:
+            correction[2] = float(self.z_gain * est.dz)
+        if self.allow_yaw and est.yaw_valid and abs(float(est.dyaw)) >= float(self.yaw_observable_min_abs):
+            correction[5] = float(self.yaw_gain * est.dyaw)
+
+        max_xy = self.config.max_micro_xy_step if est.close_ready(xy_threshold=self.config.close_ready_xy_threshold, z_threshold=self.config.close_ready_yaw_threshold, yaw_threshold=self.config.close_ready_yaw_threshold, yaw_required=False) else self.config.max_pullback_xy_step
+        max_z = self.config.max_micro_z_step if self.allow_z else 0.0
+        max_yaw = self.config.max_micro_yaw_step if self.allow_yaw else 0.0
+        correction = _clamp_basin_correction(
+            np.asarray([correction[0], correction[1], correction[2], correction[5]], dtype=np.float32),
+            max_xy=max_xy,
+            max_z=max_z,
+            max_yaw=max_yaw,
+        )
+        micro_ready = bool(
+            est.close_ready(
+                xy_threshold=self.config.close_ready_xy_threshold,
+                z_threshold=0.010,
+                yaw_threshold=0.03,
+                yaw_required=False,
+            )
+        )
+        mode = BasinRecoveryMode.MICRO_SERVO_TO_BASIN if micro_ready else BasinRecoveryMode.VISUAL_PULLBACK
+        if self.allow_yaw and abs(float(correction[3])) > 1.0e-9:
+            mode = BasinRecoveryMode.MICRO_SERVO_TO_BASIN
+        if visual_class in VisualEvidenceClass._value2member_map_:
+            visual_enum = VisualEvidenceClass(visual_class)
+        else:
+            visual_enum = VisualEvidenceClass.VISUAL_OBSERVABLE
+        local_action = np.zeros(6, dtype=np.float32)
+        local_action[0] = float(correction[0])
+        local_action[1] = float(correction[1])
+        local_action[2] = float(correction[2])
+        local_action[5] = float(correction[3])
+        return BasinRecoveryDecision(
+            mode=mode,
+            visual_evidence_class=visual_enum,
+            basin_label=BasinLabel.CLOSE_READY if mode == BasinRecoveryMode.MICRO_SERVO_TO_BASIN else BasinLabel.NEAR_GRASP,
+            correction_xyyaw=np.asarray([correction[0], correction[1], correction[3]], dtype=np.float32),
+            local_action_6d=local_action,
+            confidence=float(np.clip(est.confidence, 0.0, 1.0)),
+            reason="grasp_only_replay_pullback",
+            stable_basin_count=0,
+            recovery_step=0,
+            variant_name=self.config.variant_name,
+            micro_entry_ready=bool(micro_ready),
+            micro_yaw_active=bool(self.allow_yaw and abs(float(correction[3])) > 1.0e-9),
+            micro_entry_xy_error=float(np.hypot(float(est.dx), float(est.dy))),
+            micro_entry_dyaw=float(est.dyaw),
+            used_learned_proposal=False,
+            used_visual_geometry=True,
+            dry_run_scaled_for_eval=True,
+            uses_privileged_target=False,
+            uses_privileged_label_for_eval=True,
+        )
+
+
 class BasinRecoverySupervisor:
     """Mode-aware recovery controller for grasp-basin pullback.
 

@@ -44,8 +44,8 @@ from prismatic.robot.coarse2contact_v2.recovery_audit import (
 )
 from prismatic.robot.coarse2contact_v2.recovery_augmentation import failure_morphology_bucket
 from prismatic.robot.coarse2contact_v2.learned_localizer import GraspSkillHeadNet
-from prismatic.robot.coarse2contact_v2.basin_recovery import BasinStateEstimatorNet, BasinPullbackPolicyNet
-from prismatic.robot.coarse2contact_v2.basin_state import BasinAxisCalibration, BasinStateCalibration, CalibratedGraspBasinEstimator, EstimatedBasinError, load_basin_state_calibration_report
+from prismatic.robot.coarse2contact_v2.basin_recovery import BasinStateEstimatorNet, BasinPullbackPolicyNet, GraspOnlyBasinPullbackPolicy
+from prismatic.robot.coarse2contact_v2.basin_state import BasinAxisCalibration, BasinStateCalibration, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, load_basin_state_calibration_report
 from prismatic.robot.residual_safety import ResidualSafety
 from prismatic.robot.residual_transforms import local_delta_to_world, world_delta_to_local
 from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
@@ -142,6 +142,70 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(align_row["reference_frame"], "held_ring_aperture_frame")
         self.assertEqual(align_row["z_semantics"], "axis_alignment_depth")
         self.assertTrue(np.isfinite(float(align_row["privileged_dyaw"])))
+
+    def test_frame_relabel_outputs_unified_sample_schema(self) -> None:
+        gripper_pose = np.array([0.0, 0.0, 0.50, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        ring_pose = np.array([0.02, -0.01, 0.42, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        spoke_pose = np.array([0.05, 0.03, 0.40, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        row = _frame_label_fields(
+            task_name="insert_onto_square_peg",
+            trace_row={"c2c_v2_skill_type": "precision_grasp", "c2c_v2_stage": "RING_GRASP_ALIGN"},
+            gripper_pose=gripper_pose,
+            ring_pose=ring_pose,
+            spoke_pose=spoke_pose,
+        )
+        self.assertIn("obs_t", row)
+        self.assertIn("planner_prior", row)
+        self.assertIn("frame_contract", row)
+        self.assertIn("true_basin_error_t", row)
+        self.assertIn("action_t", row)
+        self.assertIn("true_basin_error_t_plus_1", row)
+        self.assertIn("yaw_observable", row)
+        self.assertIn("micro_entry_ready", row)
+        self.assertEqual(row["frame_contract"]["target_frame"], "ring_grasp_frame")
+        self.assertEqual(row["frame_contract"]["reference_frame"], "gripper_jaw_frame")
+        self.assertIn("local_delta_6d", row["planner_prior"])
+        self.assertIn("local_correction_local_6d", row["action_t"])
+        self.assertEqual(row["obs_t"]["visual_observability_class"], row["visual_observability_class"])
+
+    def test_replay_basin_estimator_and_grasp_only_pullback_policy(self) -> None:
+        gripper_pose = np.array([0.0, 0.0, 0.50, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        ring_pose = np.array([0.02, -0.01, 0.42, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        spoke_pose = np.array([0.05, 0.03, 0.40, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        row = _frame_label_fields(
+            task_name="insert_onto_square_peg",
+            trace_row={
+                "c2c_v2_skill_type": "precision_grasp",
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "local_geometry_error": {
+                    "grasp": {
+                        "confidence": 0.92,
+                        "observability": 0.18,
+                        "fit_residual": 0.01,
+                    }
+                },
+            },
+            gripper_pose=gripper_pose,
+            ring_pose=ring_pose,
+            spoke_pose=spoke_pose,
+        )
+        estimator = FrameRelabelBasinEstimator()
+        est = estimator.estimate(row, stage_name="RING_GRASP_ALIGN")
+        policy = GraspOnlyBasinPullbackPolicy()
+        decision = policy.step(estimated_basin_error=est, visual_evidence_class=row["visual_observability_class"])
+        self.assertIn(decision.mode, {BasinRecoveryMode.VISUAL_PULLBACK, BasinRecoveryMode.MICRO_SERVO_TO_BASIN})
+        post, _ = apply_closed_loop_recovery_step(
+            [float(row["true_basin_error_t"]["dx"]), float(row["true_basin_error_t"]["dy"]), float(row["true_basin_error_t"]["dyaw"])],
+            row["planner_prior"]["local_delta_6d"],
+            decision.correction_xyyaw,
+        )
+        self.assertLessEqual(
+            recovery_error_norm(float(post[0]), float(post[1]), float(post[2])),
+            recovery_error_norm(float(row["true_basin_error_t"]["dx"]), float(row["true_basin_error_t"]["dy"]), float(row["true_basin_error_t"]["dyaw"])),
+        )
+        prior_only = policy.step(estimated_basin_error=est, visual_evidence_class=VisualEvidenceClass.PRIOR_ONLY)
+        self.assertEqual(prior_only.mode, BasinRecoveryMode.REACQUIRE_VIEW)
+        self.assertLess(float(prior_only.local_action_6d[2]), 0.0)
 
     def test_recovery_mainline_points_to_v11(self) -> None:
         self.assertIn("grasp_recovery_head_v11_runtime_failure", str(RECOVERY_MAINLINE_CHECKPOINT))

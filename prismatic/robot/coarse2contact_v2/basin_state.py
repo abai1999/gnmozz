@@ -319,6 +319,229 @@ class EstimatedBasinError:
         }
 
 
+@dataclass(frozen=True)
+class FrameRelabelBasinEstimator:
+    """Replay-friendly estimator backed by privileged relabel rows.
+
+    The estimator does not infer geometry from RGBD.  It consumes the offline
+    relabel schema and emits a conservative basin estimate so replay/audit can
+    verify whether a grasp-only pullback policy would contract the privileged
+    error.
+    """
+
+    yaw_observable_min_abs: float = 0.01
+    close_ready_z_threshold: float = 0.010
+
+    def _row_error(self, row: Mapping[str, Any]) -> tuple[float, float, float, float]:
+        if isinstance(row.get("true_basin_error_t"), Mapping):
+            err = dict(row.get("true_basin_error_t") or {})
+        else:
+            err = row
+        dx = _as_float(err.get("dx", err.get("privileged_dx", 0.0)), 0.0)
+        dy = _as_float(err.get("dy", err.get("privileged_dy", 0.0)), 0.0)
+        dz = _as_float(err.get("dz", err.get("privileged_dz", 0.0)), 0.0)
+        dyaw = _as_float(err.get("dyaw", err.get("privileged_dyaw", 0.0)), 0.0)
+        return dx, dy, dz, dyaw
+
+    def estimate(
+        self,
+        relabel_row: Mapping[str, Any],
+        *,
+        stage_name: str = "",
+    ) -> EstimatedBasinError:
+        obs = dict(relabel_row.get("obs_t") or {})
+        visual_class = str(obs.get("visual_observability_class", relabel_row.get("visual_observability_class", "prior_only")))
+        frame_conf = float(obs.get("frame_confidence", relabel_row.get("source_frame_confidence", 0.0)) or 0.0)
+        frame_obs = float(obs.get("frame_observability", relabel_row.get("source_frame_observability", 0.0)) or 0.0)
+        frame_axis = float(obs.get("frame_axis_strength", relabel_row.get("source_frame_axis_strength", 0.0)) or 0.0)
+        yaw_observable = bool(relabel_row.get("yaw_observable", False))
+        reacquire_needed = bool(relabel_row.get("reacquire_needed", visual_class == "prior_only"))
+        dx, dy, dz, dyaw = self._row_error(relabel_row)
+
+        pullback_allowed = bool(not reacquire_needed)
+        x_valid = bool(pullback_allowed and np.isfinite(dx))
+        y_valid = bool(pullback_allowed and np.isfinite(dy))
+        z_valid = bool(pullback_allowed and np.isfinite(dz))
+        yaw_valid = bool(pullback_allowed and yaw_observable and np.isfinite(dyaw) and abs(float(dyaw)) >= float(self.yaw_observable_min_abs))
+
+        confidence = float(np.clip(max(frame_conf, frame_obs, frame_axis), 0.0, 1.0))
+        if visual_class == "prior_only":
+            confidence *= 0.0
+            x_valid = y_valid = z_valid = yaw_valid = False
+
+        if not any((x_valid, y_valid, z_valid, yaw_valid)):
+            reason = "reacquire_needed" if visual_class == "prior_only" else "abstain_low_axis_validity"
+        elif yaw_valid:
+            reason = "replay_yaw_observable"
+        elif x_valid or y_valid:
+            reason = "replay_xy_pullback"
+        else:
+            reason = "replay_z_diagnostic"
+
+        proxy = dict(relabel_row.get("proxy_local_geometry_error") or {})
+        est = dict(relabel_row.get("estimated_basin_error") or {})
+        return EstimatedBasinError(
+            valid=bool(any((x_valid, y_valid, z_valid, yaw_valid))),
+            confidence=confidence,
+            dx=float(dx),
+            dy=float(dy),
+            dz=float(dz),
+            dyaw=float(dyaw),
+            x_valid=bool(x_valid),
+            y_valid=bool(y_valid),
+            z_valid=bool(z_valid),
+            yaw_valid=bool(yaw_valid),
+            x_confidence=float(confidence if x_valid else 0.0),
+            y_confidence=float(confidence if y_valid else 0.0),
+            z_confidence=float(confidence if z_valid else 0.0),
+            yaw_confidence=float(confidence if yaw_valid else 0.0),
+            frame_consistency=float(np.clip(max(frame_obs, frame_axis), 0.0, 1.0)),
+            source="privileged_relabel",
+            reason=reason,
+            target_entity=str((relabel_row.get("frame_contract") or {}).get("target_frame", relabel_row.get("target_frame", ""))),
+            reference_entity=str((relabel_row.get("frame_contract") or {}).get("reference_frame", relabel_row.get("reference_frame", ""))),
+            stage_name=str(stage_name or relabel_row.get("stage_name", "")),
+            proxy_dx=float(proxy.get("dx", est.get("dx", 0.0)) or 0.0),
+            proxy_dy=float(proxy.get("dy", est.get("dy", 0.0)) or 0.0),
+            proxy_dz=float(proxy.get("dz", est.get("dz", 0.0)) or 0.0),
+            proxy_dyaw=float(proxy.get("dyaw", est.get("dyaw", 0.0)) or 0.0),
+        )
+
+
+@dataclass(frozen=True)
+class ReplayBasinResult:
+    estimated_basin_error: EstimatedBasinError
+    correction_local_6d: np.ndarray
+    post_error_t: np.ndarray
+    post_error_t_plus_1: np.ndarray | None
+    one_step_contraction: bool
+    overshoot: bool
+    monotonic_prefix: bool
+    micro_entry_ready: bool
+    micro_entry_block_reason: str
+    close_ready_ready: bool
+    close_ready_block_reason: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "estimated_basin_error": self.estimated_basin_error.to_trace(),
+            "correction_local_6d": [float(x) for x in np.asarray(self.correction_local_6d, dtype=np.float32).reshape(-1)[:6]],
+            "post_error_t": [float(x) for x in np.asarray(self.post_error_t, dtype=np.float32).reshape(-1)[:3]],
+            "post_error_t_plus_1": None if self.post_error_t_plus_1 is None else [float(x) for x in np.asarray(self.post_error_t_plus_1, dtype=np.float32).reshape(-1)[:3]],
+            "one_step_contraction": bool(self.one_step_contraction),
+            "overshoot": bool(self.overshoot),
+            "monotonic_prefix": bool(self.monotonic_prefix),
+            "micro_entry_ready": bool(self.micro_entry_ready),
+            "micro_entry_block_reason": str(self.micro_entry_block_reason),
+            "close_ready_ready": bool(self.close_ready_ready),
+            "close_ready_block_reason": str(self.close_ready_block_reason),
+            "reason": str(self.reason),
+        }
+
+
+@dataclass(frozen=True)
+class ReplayBasinEstimator:
+    """Replay the privileged relabel into a minimal grasp-only pullback step."""
+
+    estimator: FrameRelabelBasinEstimator = field(default_factory=FrameRelabelBasinEstimator)
+    xy_gain: float = 0.35
+    yaw_gain: float = 0.0
+    z_gain: float = 0.0
+    max_xy_step: float = 0.003
+    max_z_step: float = 0.0012
+    max_yaw_step: float = 0.0
+    yaw_enabled: bool = False
+    z_enabled: bool = False
+
+    @staticmethod
+    def _clamp_xyyaw(correction: np.ndarray, *, max_xy: float, max_z: float, max_yaw: float) -> np.ndarray:
+        corr = np.asarray(correction, dtype=np.float32).reshape(-1)
+        corr = np.pad(corr, (0, max(0, 6 - corr.size)))[:6]
+        xy = corr[:2]
+        norm = float(np.linalg.norm(xy))
+        if norm > float(max_xy) > 0.0:
+            xy = xy * (float(max_xy) / max(norm, 1.0e-9))
+        corr[:2] = xy
+        corr[2] = float(np.clip(corr[2], -float(max_z), float(max_z)))
+        corr[5] = float(np.clip(corr[5], -float(max_yaw), float(max_yaw)))
+        return corr.astype(np.float32)
+
+    def propose(self, relabel_row: Mapping[str, Any], *, stage_name: str = "") -> dict[str, Any]:
+        est = self.estimator.estimate(relabel_row, stage_name=stage_name)
+        visual_class = str((relabel_row.get("obs_t") or {}).get("visual_observability_class", relabel_row.get("visual_observability_class", "prior_only")))
+        if visual_class == "prior_only" or not est.valid:
+            corr = np.zeros(6, dtype=np.float32)
+            return {
+                "estimated_basin_error": est,
+                "correction_local_6d": corr,
+                "mode": "REACQUIRE_VIEW",
+                "reason": "prior_only_reacquire" if visual_class == "prior_only" else "replay_abstain",
+            }
+
+        corr = np.zeros(6, dtype=np.float32)
+        if est.x_valid:
+            corr[0] = float(self.xy_gain * est.dx)
+        if est.y_valid:
+            corr[1] = float(self.xy_gain * est.dy)
+        if self.z_enabled and est.z_valid:
+            corr[2] = float(self.z_gain * est.dz)
+        if self.yaw_enabled and est.yaw_valid:
+            corr[5] = float(self.yaw_gain * est.dyaw)
+        corr = self._clamp_xyyaw(corr, max_xy=self.max_xy_step, max_z=self.max_z_step, max_yaw=self.max_yaw_step if self.yaw_enabled else 0.0)
+        mode = "VISUAL_PULLBACK"
+        if self.yaw_enabled and abs(float(corr[5])) > 1.0e-9:
+            mode = "MICRO_SERVO_TO_BASIN"
+        return {
+            "estimated_basin_error": est,
+            "correction_local_6d": corr,
+            "mode": mode,
+            "reason": "privileged_relabel_replay",
+        }
+
+    def replay(self, relabel_row: Mapping[str, Any], *, stage_name: str = "") -> ReplayBasinResult:
+        from .recovery_audit import apply_closed_loop_recovery_step, monotonic_decay_prefix, recovery_error_norm, recovery_overshoot_flag
+
+        proposal = self.propose(relabel_row, stage_name=stage_name)
+        est = proposal["estimated_basin_error"]
+        correction = np.asarray(proposal["correction_local_6d"], dtype=np.float32).reshape(-1)[:6]
+        true_error = np.asarray(
+            [
+                _as_float((relabel_row.get("true_basin_error_t") or relabel_row).get("dx", relabel_row.get("privileged_dx", 0.0))),
+                _as_float((relabel_row.get("true_basin_error_t") or relabel_row).get("dy", relabel_row.get("privileged_dy", 0.0))),
+                _as_float((relabel_row.get("true_basin_error_t") or relabel_row).get("dyaw", relabel_row.get("privileged_dyaw", 0.0))),
+            ],
+            dtype=np.float32,
+        )
+        planner_prior = np.asarray((list((relabel_row.get("planner_prior") or {}).get("local_delta_6d", relabel_row.get("planner_local_delta_6d", []))) + [0.0] * 6)[:6], dtype=np.float32)
+        post_error, _ = apply_closed_loop_recovery_step(true_error, planner_prior, correction[:3])
+        next_error = relabel_row.get("true_basin_error_t_plus_1") or {}
+        next_vec = np.asarray(
+            [
+                _as_float(next_error.get("dx", relabel_row.get("next_privileged_dx", float("nan"))), float("nan")),
+                _as_float(next_error.get("dy", relabel_row.get("next_privileged_dy", float("nan"))), float("nan")),
+                _as_float(next_error.get("dyaw", relabel_row.get("next_privileged_dyaw", float("nan"))), float("nan")),
+            ],
+            dtype=np.float32,
+        )
+        pre_norm = recovery_error_norm(float(true_error[0]), float(true_error[1]), float(true_error[2]))
+        post_norm = recovery_error_norm(float(post_error[0]), float(post_error[1]), float(post_error[2]))
+        next_norm = recovery_error_norm(float(next_vec[0]), float(next_vec[1]), float(next_vec[2])) if np.all(np.isfinite(next_vec)) else float("nan")
+        return ReplayBasinResult(
+            estimated_basin_error=est,
+            correction_local_6d=correction.astype(np.float32),
+            post_error_t=post_error.astype(np.float32),
+            post_error_t_plus_1=next_vec.astype(np.float32) if np.all(np.isfinite(next_vec)) else None,
+            one_step_contraction=bool(post_norm <= pre_norm + 1.0e-9),
+            overshoot=bool(recovery_overshoot_flag(true_error, post_error)),
+            monotonic_prefix=bool(monotonic_decay_prefix([pre_norm, post_norm, next_norm])) if np.isfinite(next_norm) else bool(pre_norm >= post_norm),
+            micro_entry_ready=bool(est.close_ready(xy_threshold=0.015, z_threshold=self.estimator.close_ready_z_threshold, yaw_threshold=0.08, yaw_required=False)),
+            micro_entry_block_reason=str(proposal.get("reason", "")),
+            close_ready_ready=bool(est.close_ready(xy_threshold=0.005, z_threshold=self.estimator.close_ready_z_threshold, yaw_threshold=0.03, yaw_required=False)),
+            close_ready_block_reason=str(proposal.get("reason", "")),
+            reason=str(proposal.get("reason", "")),
+        )
+
 class BasinStateEstimator(Protocol):
     def estimate(
         self,

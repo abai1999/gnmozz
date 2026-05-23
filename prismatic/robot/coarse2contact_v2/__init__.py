@@ -9,6 +9,7 @@ from .basin_recovery import (
     BasinRecoveryMode,
     BasinRecoverySupervisor,
     BasinStateEstimatorNet,
+    GraspOnlyBasinPullbackPolicy,
     VisualEvidenceClass,
     basin_recovery_feature_vector,
     classify_basin_label,
@@ -39,7 +40,7 @@ from .recovery_augmentation import (
     select_hard_trajectories,
     select_focus_trajectories_by_bucket,
 )
-from .basin_state import BasinAxisCalibration, BasinStateCalibration, BasinStateEstimator, CalibratedGraspBasinEstimator, EstimatedBasinError, load_basin_state_calibration_report
+from .basin_state import BasinAxisCalibration, BasinStateCalibration, BasinStateEstimator, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, ReplayBasinResult, load_basin_state_calibration_report
 from .localizers import LocalGeometryError, RingGraspLocalizer, RingSpokeAlignLocalizer
 from .mainline import (
     BASIN_RECOVERY_CLOSED_LOOP_REPORT,
@@ -84,11 +85,15 @@ __all__ = [
     "BasinRecoveryMode",
     "BasinRecoverySupervisor",
     "BasinStateEstimatorNet",
+    "GraspOnlyBasinPullbackPolicy",
     "BasinAxisCalibration",
     "BasinStateCalibration",
     "BasinStateEstimator",
     "CalibratedGraspBasinEstimator",
     "EstimatedBasinError",
+    "FrameRelabelBasinEstimator",
+    "ReplayBasinEstimator",
+    "ReplayBasinResult",
     "load_basin_state_calibration_report",
     "VisualEvidenceClass",
     "basin_recovery_feature_vector",

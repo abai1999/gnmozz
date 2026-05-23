@@ -176,10 +176,11 @@ def _frame_label_fields(
         skill_name = "precision_align_ring_to_spoke"
     else:
         skill_name = str(trace_row.get("skill_name", skill_type or ""))
-    reference_frame = "gripper_jaw_frame" if skill_type == "precision_grasp" else "held_ring_aperture_frame"
-    target_frame = "ring_grasp_frame" if skill_type == "precision_grasp" else "target_spoke_axis_frame"
-    label_pose = grasp_commit if skill_type == "precision_grasp" else spoke_pose
-    raw_residual = grasp_residual if skill_type == "precision_grasp" else align_residual
+    precision_row = skill_type in {"precision_grasp", "precision_align"}
+    reference_frame = "gripper_jaw_frame" if skill_type == "precision_grasp" else ("held_ring_aperture_frame" if skill_type == "precision_align" else "")
+    target_frame = "ring_grasp_frame" if skill_type == "precision_grasp" else ("target_spoke_axis_frame" if skill_type == "precision_align" else "")
+    label_pose = grasp_commit if skill_type == "precision_grasp" else (spoke_pose if skill_type == "precision_align" else nan_pose)
+    raw_residual = grasp_residual if skill_type == "precision_grasp" else (align_residual if skill_type == "precision_align" else np.full((6,), np.nan, dtype=np.float32))
     if raw_residual.size < 6:
         raw_residual = np.pad(raw_residual, (0, max(0, 6 - raw_residual.size)))[:6]
 
@@ -188,6 +189,57 @@ def _frame_label_fields(
     privileged_z = float(raw_residual[2]) if raw_residual.size >= 3 else float("nan")
     z_semantics = "descend_progress_to_grasp_frame" if skill_type == "precision_grasp" else "axis_alignment_depth"
     visual_obs = classify_visual_evidence_for_basin(_visual_record(trace_row))
+    try:
+        skill_spec = spec.get_skill(skill_name)
+    except Exception:
+        skill_spec = None
+    requires_yaw_observability = bool(getattr(skill_spec, "requires_yaw_observability", False)) if precision_row else False
+    yaw_observable = bool(
+        precision_row
+        and visual_obs == visual_obs.__class__.VISUAL_OBSERVABLE
+        and np.isfinite(privileged_yaw_abs)
+        and privileged_yaw_abs >= 0.01
+    )
+    reacquire_needed = bool(precision_row and visual_obs == visual_obs.__class__.PRIOR_ONLY)
+    pullback_allowed = bool(precision_row and not reacquire_needed)
+    axis_gate_policy = {
+        "x": "trusted_control" if pullback_allowed else "abstain",
+        "y": "trusted_control" if pullback_allowed else "abstain",
+        "z": "diagnostic_only" if pullback_allowed else "abstain",
+        "yaw": "trusted_control" if yaw_observable else "abstain",
+    }
+    micro_entry_ready = bool(
+        pullback_allowed
+        and in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))
+        and (not requires_yaw_observability or yaw_observable)
+    )
+    close_ready_ready = bool(
+        pullback_allowed
+        and in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))
+        and (not requires_yaw_observability or yaw_observable)
+    )
+    micro_entry_block_reason_parts = []
+    if precision_row and reacquire_needed:
+        micro_entry_block_reason_parts.append("prior_only")
+    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= 0.015):
+        micro_entry_block_reason_parts.append("xy")
+    if precision_row and requires_yaw_observability and not yaw_observable:
+        micro_entry_block_reason_parts.append("yaw")
+    micro_entry_block_reason = "+".join(micro_entry_block_reason_parts) if micro_entry_block_reason_parts else "ready"
+    close_ready_block_reason_parts = []
+    if precision_row and reacquire_needed:
+        close_ready_block_reason_parts.append("prior_only")
+    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= 0.005):
+        close_ready_block_reason_parts.append("xy")
+    if precision_row and abs(float(privileged_z)) > 0.01:
+        close_ready_block_reason_parts.append("z")
+    if precision_row and requires_yaw_observability and not yaw_observable:
+        close_ready_block_reason_parts.append("yaw")
+    if not precision_row:
+        micro_entry_block_reason_parts = ["not_precision"]
+        close_ready_block_reason_parts = ["not_precision"]
+        micro_entry_block_reason = "not_precision"
+    close_ready_block_reason = "+".join(close_ready_block_reason_parts) if close_ready_block_reason_parts else "ready"
 
     estimated = trace_row.get("estimated_basin_error", {}) or {}
     proxy = trace_row.get("local_geometry_error", {}) or {}
@@ -206,6 +258,32 @@ def _frame_label_fields(
 
     return {
         "task_name": task_name,
+        "frame_contract": {
+            "target_frame": target_frame,
+            "reference_frame": reference_frame,
+            "error_frame": str(getattr(skill_spec, "error_frame", "reference_local")),
+            "yaw_mode": str(getattr(skill_spec, "yaw_mode", "proxy_axis")),
+            "z_semantics": z_semantics if precision_row else "none",
+            "requires_yaw_observability": bool(requires_yaw_observability),
+        },
+        "obs_t": {
+            "episode_idx": int(trace_row.get("episode_idx", trace_row.get("episode_index", -1))),
+            "step_idx": int(trace_row.get("step", trace_row.get("step_idx", -1))),
+            "visual_observability_class": visual_obs.value,
+            "frame_confidence": float(_visual_record(trace_row)["frame_confidence"]),
+            "frame_observability": float(_visual_record(trace_row)["frame_observability"]),
+            "frame_axis_strength": float(_visual_record(trace_row)["frame_axis_strength"]),
+            "source_phase_owner": str(trace_row.get("phase_owner", trace_row.get("c2c_v2_owner", ""))),
+            "source_basin_recovery_mode": str(trace_row.get("basin_recovery_mode", "")),
+            "source_localizer_abstained": bool(trace_row.get("localizer_abstained", False)),
+            "uses_privileged_target": False,
+            "uses_privileged_runtime": False,
+            "uses_rlbench_mask_runtime": False,
+        },
+        "planner_prior": {
+            "world_delta_6d": planner_world.tolist(),
+            "local_delta_6d": planner_local.tolist(),
+        },
         "stage_name": stage_name,
         "skill_name": skill_name,
         "skill_type": skill_type,
@@ -226,9 +304,33 @@ def _frame_label_fields(
         "axis_alignment_depth": privileged_z if skill_type != "precision_grasp" else float("nan"),
         "xy_error": privileged_xy,
         "yaw_abs": privileged_yaw_abs,
+        "yaw_observable": bool(yaw_observable),
+        "reacquire_needed": bool(reacquire_needed),
+        "pullback_allowed": bool(pullback_allowed),
+        "micro_entry_ready": bool(micro_entry_ready),
+        "micro_entry_block_reason": str(micro_entry_block_reason),
+        "close_ready_ready": bool(close_ready_ready),
+        "close_ready_block_reason": str(close_ready_block_reason),
+        "axis_gate_policy": axis_gate_policy,
+        "true_basin_error_t": {
+            "dx": float(raw_residual[0]) if raw_residual.size >= 1 else float("nan"),
+            "dy": float(raw_residual[1]) if raw_residual.size >= 2 else float("nan"),
+            "dz": privileged_z,
+            "dyaw": float(raw_residual[5]) if raw_residual.size >= 6 else float("nan"),
+        },
+        "action_t": {
+            "local_correction_local_6d": np.asarray(trace_row.get("local_correction_local_6d", local_residual.tolist()), dtype=np.float32).reshape(-1)[:6].tolist(),
+            "planner_local_delta_6d": planner_local.tolist(),
+        },
         "near_grasp_basin": bool(in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))),
         "close_ready_basin": bool(in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))),
         "near_insert_basin": False,
+        "true_basin_error_t_plus_1": {
+            "dx": float("nan"),
+            "dy": float("nan"),
+            "dz": float("nan"),
+            "dyaw": float("nan"),
+        },
         "next_privileged_dx": float("nan"),
         "next_privileged_dy": float("nan"),
         "next_privileged_dz": float("nan"),
@@ -362,6 +464,12 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
                     record["next_privileged_dyaw"] = float(next_record["privileged_dyaw"])
                     record["next_xy_error"] = float(next_record["xy_error"])
                     record["next_yaw_abs"] = float(next_record["yaw_abs"])
+                    record["true_basin_error_t_plus_1"] = {
+                        "dx": float(next_record["privileged_dx"]),
+                        "dy": float(next_record["privileged_dy"]),
+                        "dz": float(next_record["privileged_dz"]),
+                        "dyaw": float(next_record["privileged_dyaw"]),
+                    }
                 all_rows.append(record)
                 key = (str(record["stage_name"]), str(record["skill_name"]), str(record["visual_observability_class"]))
                 per_group[key].append(record)
