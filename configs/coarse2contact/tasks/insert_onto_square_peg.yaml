@@ -1,0 +1,245 @@
+task_name: insert_onto_square_peg
+description: Pick the small square ring, transfer it, align its aperture with the red spoke, and slide it on.
+language_targets:
+  - put the ring on the red spoke
+  - slide the ring onto the red colored spoke
+  - place the ring onto the red spoke
+default_stage: COARSE_TO_RING
+runtime_flags:
+  grasp_ready_stable_frames: 4
+  precision_takeover_stable_frames: 3
+  precision_grasp_takeover_planner_xy_max: 0.006
+  precision_grasp_takeover_planner_z_max: 0.012
+  precision_grasp_takeover_error_xy_max: 0.018
+  precision_grasp_takeover_depth_max: 0.12
+  precision_grasp_takeover_confidence_min: 0.28
+  precision_grasp_takeover_observability_min: 0.0012
+  precision_align_takeover_planner_xy_max: 0.008
+  precision_align_takeover_planner_z_max: 0.014
+  precision_align_takeover_error_xy_max: 0.022
+  precision_align_takeover_depth_max: 0.10
+  precision_align_takeover_confidence_min: 0.012
+  precision_align_takeover_observability_min: 0.0008
+notes:
+  - v2 task contract for a multi-stage precision ring-on-spoke assembly
+  - planner handles coarse approach and transfer only
+  - C2C owns all high-precision local skills
+
+entities:
+  gripper_jaw_frame:
+    role: robot_reference
+    primitive: frame
+    color_hint: null
+    observable_hints:
+      frame_type: jaw_center
+
+  held_square_ring:
+    role: manipulated_object
+    primitive: square_ring
+    color_hint: blue
+    observable_hints:
+      symmetry_period: 1.5707963267948966
+      expected_visibility: high
+
+  ring_aperture_frame:
+    role: manipulated_reference
+    primitive: ring_aperture
+    color_hint: blue
+    observable_hints:
+      frame_type: aperture
+      symmetry_period: 1.5707963267948966
+
+  target_red_spoke:
+    role: target_object
+    primitive: spoke
+    color_hint: red
+    observable_hints:
+      axis_hint: vertical
+      expected_visibility: high
+
+  target_spoke_axis_frame:
+    role: target_reference
+    primitive: frame
+    color_hint: red
+    observable_hints:
+      frame_type: spoke_axis
+      axis_hint: vertical
+
+skills:
+  precision_grasp_ring:
+    skill_type: precision_grasp
+    target_entity: held_square_ring
+    reference_entity: gripper_jaw_frame
+    controlled_dofs: [x, y, z, yaw]
+    confidence_threshold: 0.35
+    apply_confidence: 0.45
+    shadow_confidence: 0.20
+    xy_tolerance: 0.003
+    z_tolerance: 0.006
+    yaw_tolerance: 0.12
+    max_xy_step: 0.0003
+    max_dz_step: 0.0012
+    max_yaw_step: 0.020
+    roi_size_px: 96
+    roi_resize_px: 128
+    heatmap_xy_range_m: 0.040
+    heatmap_size: 32
+    heatmap_sigma_px: 0.9
+    heatmap_channels: 3
+    heatmap_pos_weight: 8.0
+    notes:
+      - diagnostic ring-frame localizer only; learned depth apply is disabled until a separate grasp skill head is trained
+      - xy clamp follows successful demo pre-close lateral scale, not broad reach-frame visual offsets
+
+  grasp_contact_ring:
+    skill_type: precision_grasp
+    target_entity: held_square_ring
+    reference_entity: gripper_jaw_frame
+    controlled_dofs: [gripper_close]
+    confidence_threshold: 0.35
+    apply_confidence: 0.45
+    shadow_confidence: 0.20
+    xy_tolerance: 0.004
+    yaw_tolerance: 0.14
+    max_xy_step: 0.0005
+    max_dz_step: 0.0006
+    max_yaw_step: 0.020
+    notes:
+      - verify contact and stable grasp after the ring closes
+
+  precision_align_ring_to_spoke:
+    skill_type: precision_align
+    target_entity: target_red_spoke
+    reference_entity: ring_aperture_frame
+    controlled_dofs: [x, y, z, yaw]
+    confidence_threshold: 0.012
+    apply_confidence: 0.015
+    shadow_confidence: 0.008
+    xy_tolerance: 0.008
+    z_tolerance: 0.010
+    yaw_tolerance: 0.14
+    max_xy_step: 0.0010
+    max_dz_step: 0.0008
+    max_yaw_step: 0.030
+    roi_size_px: 112
+    roi_resize_px: 128
+    heatmap_xy_range_m: 0.045
+    heatmap_size: 32
+    heatmap_sigma_px: 0.9
+    heatmap_channels: 3
+    heatmap_pos_weight: 8.0
+    notes:
+      - align the held ring aperture with the red spoke axis
+
+  guarded_slide_ring_to_spoke:
+    skill_type: guarded_slide
+    target_entity: target_red_spoke
+    reference_entity: ring_aperture_frame
+    controlled_dofs: [z, x_micro, y_micro, yaw_micro]
+    confidence_threshold: 0.26
+    apply_confidence: 0.34
+    shadow_confidence: 0.16
+    xy_tolerance: 0.008
+    yaw_tolerance: 0.14
+    max_xy_step: 0.0008
+    max_dz_step: 0.0012
+    max_yaw_step: 0.025
+    notes:
+      - guarded axial slide with small lateral relief
+
+  recovery:
+    skill_type: recovery
+    target_entity: target_red_spoke
+    reference_entity: ring_aperture_frame
+    controlled_dofs: [backoff, unload, micro_search, reapproach]
+    confidence_threshold: 0.0
+    apply_confidence: 0.0
+    shadow_confidence: 0.0
+    xy_tolerance: 0.020
+    yaw_tolerance: 0.35
+    max_xy_step: 0.0010
+    max_dz_step: 0.0010
+    max_yaw_step: 0.035
+    notes:
+      - backoff/unload/micro-search/reapproach recovery primitives
+
+stages:
+  - name: COARSE_TO_RING
+    owner: planner
+    skill_name: null
+    next_stage: RING_GRASP_ALIGN
+    transition_on: grasp_visible
+    min_steps: 10
+    max_steps: 90
+    recover_to_stage: RING_GRASP_ALIGN
+    gripper_mode: hold
+
+  - name: RING_GRASP_ALIGN
+    owner: c2c_depth
+    skill_name: precision_grasp_ring
+    next_stage: RING_GRASP_CONTACT
+    transition_on: grasp_aligned
+    min_steps: 8
+    max_steps: 40
+    recover_to_stage: RING_GRASP_ALIGN
+    gripper_mode: open
+
+  - name: RING_GRASP_CONTACT
+    owner: c2c_force
+    skill_name: grasp_contact_ring
+    next_stage: RING_LIFT_VERIFY
+    transition_on: grasp_contacted
+    min_steps: 1
+    max_steps: 30
+    recover_to_stage: RING_GRASP_ALIGN
+    gripper_mode: close
+
+  - name: RING_LIFT_VERIFY
+    owner: c2c_force
+    skill_name: grasp_contact_ring
+    next_stage: COARSE_TO_SPOKE
+    transition_on: lifted
+    min_steps: 1
+    max_steps: 30
+    recover_to_stage: RING_GRASP_ALIGN
+    gripper_mode: hold
+
+  - name: COARSE_TO_SPOKE
+    owner: planner
+    skill_name: null
+    next_stage: RING_SPOKE_ALIGN
+    transition_on: spoke_visible
+    min_steps: 8
+    max_steps: 120
+    recover_to_stage: RING_SPOKE_ALIGN
+    gripper_mode: hold
+
+  - name: RING_SPOKE_ALIGN
+    owner: c2c_depth
+    skill_name: precision_align_ring_to_spoke
+    next_stage: SLIDE_ON_SPOKE
+    transition_on: spoke_aligned
+    min_steps: 1
+    max_steps: 50
+    recover_to_stage: RING_SPOKE_ALIGN
+    gripper_mode: hold
+
+  - name: SLIDE_ON_SPOKE
+    owner: c2c_force
+    skill_name: guarded_slide_ring_to_spoke
+    next_stage: null
+    transition_on: slide_seated
+    min_steps: 1
+    max_steps: 80
+    recover_to_stage: RING_SPOKE_ALIGN
+    gripper_mode: hold
+
+  - name: RECOVER
+    owner: c2c_recovery
+    skill_name: recovery
+    next_stage: null
+    transition_on: recover_complete
+    min_steps: 1
+    max_steps: 20
+    recover_to_stage: RING_GRASP_ALIGN
+    gripper_mode: hold
