@@ -252,6 +252,25 @@ class EstimatedBasinError:
             axes.append("yaw")
         return tuple(axes)
 
+    @property
+    def pullback_ready_axes(self) -> tuple[str, ...]:
+        """Axes that may participate in bounded pullback even if entry is not yet ready.
+
+        This is intentionally weaker than `close_ready()`: it separates control
+        permission from basin-entry permission.
+        """
+
+        axes: list[str] = []
+        if self.x_valid:
+            axes.append("x")
+        if self.y_valid:
+            axes.append("y")
+        if self.z_valid:
+            axes.append("z")
+        if self.yaw_valid:
+            axes.append("yaw")
+        return tuple(axes)
+
     def close_ready(
         self,
         *,
@@ -307,6 +326,7 @@ class EstimatedBasinError:
             f"{prefix}_proxy_dyaw": float(self.proxy_dyaw),
             f"{prefix}_axis_validity": self.axis_validity,
             f"{prefix}_axis_confidence": self.axis_confidence,
+            f"{prefix}_pullback_ready_axes": list(self.pullback_ready_axes),
             f"{prefix}_close_ready": bool(
                 self.close_ready(
                     xy_threshold=xy_threshold,

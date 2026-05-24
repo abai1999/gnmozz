@@ -72,11 +72,13 @@ from scripts.evaluate_c2c_rlbench import (
     process_obs,
 )
 from scripts.evaluate_rlbench import resolve_live_target_handle, safe_live_target_pose_7d
+from prismatic.robot.stage_target_provider import apply_yaw_symmetry_to_delta, build_phase1_teacher_targets, load_phase1_grasp_spec, pose_delta_local_between
+from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin, recovery_overshoot_flag
 
 from prismatic.robot.coarse2contact_v2 import BasinRecoveryConfig, PrecisionSkillSupervisor, load_precision_task_spec, load_basin_state_calibration_report
 from prismatic.robot.coarse2contact_v2.learned_force import LearnedForceClassifierAdapter
 from prismatic.robot.coarse2contact_v2.learned_localizer import LearnedDepthLocalizerAdapter
-from prismatic.robot.residual_transforms import world_delta_to_local
+from prismatic.robot.residual_transforms import local_delta_to_world, world_delta_to_local
 from prismatic.vla.constants import FORCE_HISTORY_LEN
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -184,6 +186,39 @@ def _episode_privileged_frame_pack(task, obs) -> dict[str, np.ndarray | None]:
     }
 
 
+def _grasp_teacher_error_from_pack(
+    frame_pack: dict[str, np.ndarray | None] | None,
+    grasp_spec,
+) -> np.ndarray | None:
+    if frame_pack is None or grasp_spec is None:
+        return None
+    gripper_pose = np.asarray(frame_pack.get("episode_gripper_pose_7d", np.full((7,), np.nan, dtype=np.float32)), dtype=np.float32).reshape(-1)[:7]
+    ring_pose = np.asarray(frame_pack.get("episode_ring_pose_7d", np.full((7,), np.nan, dtype=np.float32)), dtype=np.float32).reshape(-1)[:7]
+    if not np.all(np.isfinite(gripper_pose[:7])) or not np.all(np.isfinite(ring_pose[:7])):
+        return None
+    try:
+        _, grasp_commit = build_phase1_teacher_targets(ring_pose, grasp_spec)
+        if not np.all(np.isfinite(grasp_commit[:7])):
+            return None
+        delta = pose_delta_local_between(gripper_pose, grasp_commit)
+        return apply_yaw_symmetry_to_delta(delta, float(getattr(grasp_spec, "yaw_symmetry_period", -1.0))).astype(np.float32)
+    except Exception:
+        return None
+
+
+def _bounded_xy_oracle_probe_step(error_local_6d: np.ndarray, *, xy_gain: float, max_xy_step: float) -> np.ndarray:
+    correction = np.zeros(6, dtype=np.float32)
+    err = np.asarray(error_local_6d, dtype=np.float32).reshape(-1)
+    if err.size < 2 or not np.all(np.isfinite(err[:2])):
+        return correction
+    correction[0] = float(xy_gain * err[0])
+    correction[1] = float(xy_gain * err[1])
+    norm = float(np.linalg.norm(correction[:2]))
+    if norm > float(max_xy_step) > 0.0:
+        correction[:2] = correction[:2] * (float(max_xy_step) / max(norm, 1.0e-9))
+    return correction.astype(np.float32)
+
+
 def build_c2c_v2_supervisor(args, task_spec):
     if args.mode == "planner_only" and task_spec is None:
         return None
@@ -260,6 +295,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--basin_visual_gain", type=float, default=0.35)
     parser.add_argument("--basin_max_pullback_xy_step", type=float, default=0.0030)
     parser.add_argument("--basin_max_recovery_steps", type=int, default=24)
+    parser.add_argument("--c2c_grasp_probe_policy", type=str, default="off", choices=["off", "replay_oracle_xy"])
+    parser.add_argument("--c2c_grasp_probe_xy_gain", type=float, default=0.35)
+    parser.add_argument("--c2c_grasp_probe_max_xy_step", type=float, default=0.0030)
+    parser.add_argument("--near_grasp_xy_threshold", type=float, default=0.015)
+    parser.add_argument("--near_grasp_yaw_threshold", type=float, default=0.08)
+    parser.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
+    parser.add_argument("--close_ready_yaw_threshold", type=float, default=0.03)
     parser.add_argument("--num_episodes", type=int, default=3)
     parser.add_argument("--episode_indices", type=str, default="5,8,19")
     parser.add_argument("--max_steps", type=int, default=320)
@@ -326,10 +368,16 @@ def evaluate(args: argparse.Namespace) -> float:
 
     task_spec = _select_task_spec(args.task_name)
     task_spec = _maybe_attach_basin_state_calibration(task_spec, args.basin_state_calibration_report or None)
+    grasp_spec = load_phase1_grasp_spec(args.task_name)
     if task_spec is None:
         print(f"[c2c-v2] No task spec found for {args.task_name}; falling back to planner-only runtime.", flush=True)
         args.mode = "planner_only"
         args.shadow_only = True
+    if args.c2c_grasp_probe_policy != "off":
+        if not args.dump_runtime_obs or not args.capture_failure_target_pose:
+            raise ValueError("--c2c_grasp_probe_policy requires --dump_runtime_obs and --capture_failure_target_pose")
+        if not args.shadow_only and args.mode not in {"c2c_stage_shadow", "basin_recovery_shadow"}:
+            raise ValueError("--c2c_grasp_probe_policy is intended for shadow-only intervention data collection")
 
     vla, processor, action_head, proprio_projector, norm_stats = load_checkpoint(
         args.checkpoint_dir,
@@ -363,12 +411,14 @@ def evaluate(args: argparse.Namespace) -> float:
     video_dir = output_dir / "videos"
     trace_dir = output_dir / "gripper_traces"
     gate_frame_dir = output_dir / "gate_frames"
+    probe_frame_dir = output_dir / "probe_frames"
     runtime_obs_dir = Path(args.runtime_obs_root) if args.runtime_obs_root else (output_dir / "runtime_observations")
     if args.record_video and args.write_episode_videos:
         video_dir.mkdir(parents=True, exist_ok=True)
     if args.record_gripper_trace:
         trace_dir.mkdir(parents=True, exist_ok=True)
         gate_frame_dir.mkdir(parents=True, exist_ok=True)
+        probe_frame_dir.mkdir(parents=True, exist_ok=True)
     if args.dump_runtime_obs:
         runtime_obs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -387,6 +437,9 @@ def evaluate(args: argparse.Namespace) -> float:
         "uses_privileged_target": False,
         "uses_rlbench_mask_runtime": False,
         "uses_privileged_label_for_eval": bool(args.dump_runtime_obs and args.capture_failure_target_pose),
+        "c2c_grasp_probe_policy": str(args.c2c_grasp_probe_policy),
+        "c2c_grasp_probe_xy_gain": float(args.c2c_grasp_probe_xy_gain),
+        "c2c_grasp_probe_max_xy_step": float(args.c2c_grasp_probe_max_xy_step),
         "depth_error_trend": [],
     }
 
@@ -411,6 +464,7 @@ def evaluate(args: argparse.Namespace) -> float:
         terminate = False
         runtime_obs_rows: list[dict[str, np.ndarray]] = []
         gate_frame_saved = False
+        probe_frame_saved = False
         episode_target_pose_7d = None
         if c2c is not None:
             c2c.reset()
@@ -453,7 +507,10 @@ def evaluate(args: argparse.Namespace) -> float:
             base_delta_action = delta_action.copy()
             planner_chunk_local = world_delta_to_local(np.asarray(base_delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
             privileged_frame_pack = _episode_privileged_frame_pack(task, obs) if args.dump_runtime_obs and args.capture_failure_target_pose else None
+            probe_true_error_before = _grasp_teacher_error_from_pack(privileged_frame_pack, grasp_spec) if args.c2c_grasp_probe_policy != "off" else None
             trace_entry = {
+                "episode_idx": int(ep_idx),
+                "episode_loop_idx": int(loop_idx),
                 "step": int(step_idx),
                 "planner_action_world_6d": _jsonable_value(np.asarray(base_delta_action[:6], dtype=np.float32)),
                 "planner_action_world_8d": _jsonable_value(np.asarray(base_delta_action, dtype=np.float32)),
@@ -506,6 +563,51 @@ def evaluate(args: argparse.Namespace) -> float:
                     Image.fromarray(np.asarray(frames[-1], dtype=np.uint8)).save(gate_path)
                     trace_entry["c2c_gate_frame_path"] = str(gate_path)
                     gate_frame_saved = True
+                probe_visibility_bucket = str(
+                    trace_entry.get("basin_recovery_visual_evidence_class", trace_entry.get("visual_observability_class", "prior_only"))
+                )
+                probe_stage = str(trace_entry.get("c2c_v2_stage", ""))
+                probe_eligible = bool(
+                    args.c2c_grasp_probe_policy == "replay_oracle_xy"
+                    and probe_stage == "RING_GRASP_ALIGN"
+                    and probe_visibility_bucket != "prior_only"
+                    and probe_true_error_before is not None
+                    and np.all(np.isfinite(np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:2]))
+                )
+                trace_entry["grasp_probe_policy"] = str(args.c2c_grasp_probe_policy)
+                trace_entry["grasp_probe_visibility_bucket"] = probe_visibility_bucket
+                trace_entry["grasp_probe_active"] = bool(probe_eligible)
+                trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else ("prior_only_abstain" if probe_visibility_bucket == "prior_only" else "inactive")
+                trace_entry["grasp_probe_pre_true_error_t"] = _jsonable_value(
+                    np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4] if probe_true_error_before is not None else np.full((4,), np.nan, dtype=np.float32)
+                )
+                if probe_eligible:
+                    probe_correction_local = _bounded_xy_oracle_probe_step(
+                        np.asarray(probe_true_error_before, dtype=np.float32),
+                        xy_gain=float(args.c2c_grasp_probe_xy_gain),
+                        max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
+                    )
+                    current_local_command = world_delta_to_local(np.asarray(delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
+                    probe_local_command = current_local_command.copy()
+                    probe_local_command[0] += float(probe_correction_local[0])
+                    probe_local_command[1] += float(probe_correction_local[1])
+                    probe_world_delta = local_delta_to_world(probe_local_command, np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
+                    delta_action = delta_action.copy()
+                    delta_action[:6] = probe_world_delta[:6]
+                    trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(probe_correction_local)
+                    trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(probe_local_command)
+                    trace_entry["grasp_probe_control_gate_axes"] = list(c2c.get_last_trace().get("basin_control_gate_axes", []))
+                    trace_entry["grasp_probe_pullback_ready_axes"] = list(c2c.get_last_trace().get("basin_pullback_ready_axes", []))
+                    if args.record_video and not probe_frame_saved and frames:
+                        probe_path = probe_frame_dir / f"ep{ep_idx:03d}_probe_start_step{step_idx:03d}.png"
+                        Image.fromarray(np.asarray(frames[-1], dtype=np.uint8)).save(probe_path)
+                        trace_entry["grasp_probe_frame_path"] = str(probe_path)
+                        probe_frame_saved = True
+                else:
+                    trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(np.zeros(6, dtype=np.float32))
+                    trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+                    trace_entry["grasp_probe_control_gate_axes"] = list(c2c.get_last_trace().get("basin_control_gate_axes", []))
+                    trace_entry["grasp_probe_pullback_ready_axes"] = list(c2c.get_last_trace().get("basin_pullback_ready_axes", []))
 
             abs_action = delta_to_absolute(delta_action, obs.gripper_pose)
             safety = c2c.safety if c2c is not None else None
@@ -551,6 +653,7 @@ def evaluate(args: argparse.Namespace) -> float:
                     trace_entry["coarse2contact_invalid_action_recovery_primitive"] = str(c2c.get_last_trace().get("local_correction_owner", "none"))
                     trace_entry["coarse2contact_invalid_action_recovery_reason"] = str(c2c.get_last_trace().get("phase_reason", "invalid_action"))
                     trace_entry["retry_id"] = int(c2c.get_last_trace().get("recovery_cycle_id", 0))
+                    trace_entry["post_clip_action_absolute_6d"] = _jsonable_value(np.asarray(recovery_abs[:6], dtype=np.float32))
                     try:
                         obs, reward, terminate = task.step(recovery_abs)
                         recovery_applied = True
@@ -559,6 +662,8 @@ def evaluate(args: argparse.Namespace) -> float:
                         if args.dump_runtime_obs:
                             obs_row = {
                                 "step": np.asarray(int(step_idx), dtype=np.int32),
+                                "episode_idx": np.asarray(int(ep_idx), dtype=np.int32),
+                                "episode_loop_idx": np.asarray(int(loop_idx), dtype=np.int32),
                                 "front_rgb": np.asarray(obs.front_rgb, dtype=np.uint8),
                                 "wrist_rgb": np.asarray(obs.wrist_rgb, dtype=np.uint8),
                                 "wrist_depth": np.asarray(
@@ -573,6 +678,8 @@ def evaluate(args: argparse.Namespace) -> float:
                                 "planner_action_world_6d": np.asarray(base_delta_action[:6], dtype=np.float32),
                                 "pre_clip_action_world_6d": np.asarray(abs_action[:6], dtype=np.float32),
                                 "post_clip_action_world_6d": np.asarray(trace_entry.get("post_clip_action_world_6d", abs_action[:6]), dtype=np.float32),
+                                "pre_clip_action_absolute_6d": np.asarray(abs_action[:6], dtype=np.float32),
+                                "post_clip_action_absolute_6d": np.asarray(recovery_abs[:6], dtype=np.float32),
                                 "executed_action_world_6d": np.asarray(executed_action[:6], dtype=np.float32),
                                 "invalid_action": np.asarray(float(trace_entry["invalid_action"]), dtype=np.float32),
                                 "reward": np.asarray(float(reward), dtype=np.float32),
@@ -592,6 +699,8 @@ def evaluate(args: argparse.Namespace) -> float:
                     if args.dump_runtime_obs:
                         obs_row = {
                             "step": np.asarray(int(step_idx), dtype=np.int32),
+                            "episode_idx": np.asarray(int(ep_idx), dtype=np.int32),
+                            "episode_loop_idx": np.asarray(int(loop_idx), dtype=np.int32),
                             "front_rgb": np.asarray(obs.front_rgb, dtype=np.uint8),
                             "wrist_rgb": np.asarray(obs.wrist_rgb, dtype=np.uint8),
                             "wrist_depth": np.asarray(
@@ -606,6 +715,8 @@ def evaluate(args: argparse.Namespace) -> float:
                             "planner_action_world_6d": np.asarray(base_delta_action[:6], dtype=np.float32),
                             "pre_clip_action_world_6d": np.asarray(abs_action[:6], dtype=np.float32),
                             "post_clip_action_world_6d": np.asarray(trace_entry.get("post_clip_action_world_6d", abs_action[:6]), dtype=np.float32),
+                            "pre_clip_action_absolute_6d": np.asarray(abs_action[:6], dtype=np.float32),
+                            "post_clip_action_absolute_6d": np.asarray(abs_action[:6], dtype=np.float32),
                             "executed_action_world_6d": np.asarray(executed_action[:6], dtype=np.float32),
                             "invalid_action": np.asarray(float(trace_entry["invalid_action"]), dtype=np.float32),
                             "reward": np.asarray(float(reward), dtype=np.float32),
@@ -687,12 +798,97 @@ def evaluate(args: argparse.Namespace) -> float:
             trace_entry["executed_action_world_8d"] = _jsonable_value(np.asarray(executed_action, dtype=np.float32))
             trace_entry["invalid_action_recovery_executed"] = bool(recovery_applied)
             trace_entry["final_action_world_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+            if args.c2c_grasp_probe_policy != "off" and bool(trace_entry.get("grasp_probe_active", False)) and args.dump_runtime_obs and args.capture_failure_target_pose:
+                probe_after_pack = _episode_privileged_frame_pack(task, obs)
+                probe_true_error_after = _grasp_teacher_error_from_pack(probe_after_pack, grasp_spec)
+                if probe_true_error_after is not None and probe_true_error_before is not None:
+                    pre_probe = np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4]
+                    post_probe = np.asarray(probe_true_error_after, dtype=np.float32).reshape(-1)[:4]
+                    trace_entry["grasp_probe_post_true_error_t"] = _jsonable_value(post_probe)
+                    trace_entry["grasp_probe_pre_xy_error"] = float(np.hypot(float(pre_probe[0]), float(pre_probe[1])))
+                    trace_entry["grasp_probe_post_xy_error"] = float(np.hypot(float(post_probe[0]), float(post_probe[1])))
+                    trace_entry["grasp_probe_pre_error_norm"] = float(np.linalg.norm(np.asarray([pre_probe[0], pre_probe[1], 0.04 * pre_probe[3]], dtype=np.float32)))
+                    trace_entry["grasp_probe_post_error_norm"] = float(np.linalg.norm(np.asarray([post_probe[0], post_probe[1], 0.04 * post_probe[3]], dtype=np.float32)))
+                    trace_entry["grasp_probe_xy_contracted"] = bool(trace_entry["grasp_probe_post_xy_error"] < trace_entry["grasp_probe_pre_xy_error"] - 1.0e-9)
+                    trace_entry["grasp_probe_overshoot"] = bool(recovery_overshoot_flag(pre_probe[:3], post_probe[:3]))
+                    trace_entry["grasp_probe_micro_entry_ready_before"] = bool(
+                        in_near_grasp_basin(
+                            float(pre_probe[0]),
+                            float(pre_probe[1]),
+                            float(pre_probe[3]),
+                            xy_threshold=float(args.near_grasp_xy_threshold),
+                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        )
+                        and trace_entry.get("grasp_probe_visibility_bucket", "prior_only") != "prior_only"
+                    )
+                    trace_entry["grasp_probe_micro_entry_ready_after"] = bool(
+                        in_near_grasp_basin(
+                            float(post_probe[0]),
+                            float(post_probe[1]),
+                            float(post_probe[3]),
+                            xy_threshold=float(args.near_grasp_xy_threshold),
+                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        )
+                        and trace_entry.get("grasp_probe_visibility_bucket", "prior_only") != "prior_only"
+                    )
+                    trace_entry["grasp_probe_near_grasp_before"] = bool(
+                        in_near_grasp_basin(
+                            float(pre_probe[0]),
+                            float(pre_probe[1]),
+                            float(pre_probe[3]),
+                            xy_threshold=float(args.near_grasp_xy_threshold),
+                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        )
+                    )
+                    trace_entry["grasp_probe_near_grasp_after"] = bool(
+                        in_near_grasp_basin(
+                            float(post_probe[0]),
+                            float(post_probe[1]),
+                            float(post_probe[3]),
+                            xy_threshold=float(args.near_grasp_xy_threshold),
+                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        )
+                    )
+                    trace_entry["grasp_probe_close_ready_before"] = bool(
+                        in_close_ready_basin(
+                            float(pre_probe[0]),
+                            float(pre_probe[1]),
+                            float(pre_probe[3]),
+                            xy_threshold=float(args.close_ready_xy_threshold),
+                            yaw_threshold=float(args.close_ready_yaw_threshold),
+                        )
+                    )
+                    trace_entry["grasp_probe_close_ready_after"] = bool(
+                        in_close_ready_basin(
+                            float(post_probe[0]),
+                            float(post_probe[1]),
+                            float(post_probe[3]),
+                            xy_threshold=float(args.close_ready_xy_threshold),
+                            yaw_threshold=float(args.close_ready_yaw_threshold),
+                        )
+                    )
+                else:
+                    trace_entry["grasp_probe_post_true_error_t"] = _jsonable_value(np.full((4,), np.nan, dtype=np.float32))
+                    trace_entry["grasp_probe_pre_xy_error"] = float("nan")
+                    trace_entry["grasp_probe_post_xy_error"] = float("nan")
+                    trace_entry["grasp_probe_pre_error_norm"] = float("nan")
+                    trace_entry["grasp_probe_post_error_norm"] = float("nan")
+                    trace_entry["grasp_probe_xy_contracted"] = False
+                    trace_entry["grasp_probe_overshoot"] = False
+                    trace_entry["grasp_probe_micro_entry_ready_before"] = False
+                    trace_entry["grasp_probe_micro_entry_ready_after"] = False
+                    trace_entry["grasp_probe_near_grasp_before"] = False
+                    trace_entry["grasp_probe_near_grasp_after"] = False
+                    trace_entry["grasp_probe_close_ready_before"] = False
+                    trace_entry["grasp_probe_close_ready_after"] = False
             if privileged_frame_pack is not None:
                 trace_entry.update({k: _jsonable_value(v) for k, v in privileged_frame_pack.items()})
             gripper_trace.append(trace_entry)
             if args.dump_runtime_obs:
                 obs_row = {
                     "step": np.asarray(int(step_idx), dtype=np.int32),
+                    "episode_idx": np.asarray(int(ep_idx), dtype=np.int32),
+                    "episode_loop_idx": np.asarray(int(loop_idx), dtype=np.int32),
                     "front_rgb": np.asarray(obs.front_rgb, dtype=np.uint8),
                     "wrist_rgb": np.asarray(obs.wrist_rgb, dtype=np.uint8),
                     "wrist_depth": np.asarray(

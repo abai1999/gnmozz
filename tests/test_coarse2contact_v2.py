@@ -207,6 +207,93 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(prior_only.mode, BasinRecoveryMode.REACQUIRE_VIEW)
         self.assertLess(float(prior_only.local_action_6d[2]), 0.0)
 
+    def test_pullback_ready_axes_do_not_imply_close_ready(self) -> None:
+        est = EstimatedBasinError(
+            valid=True,
+            confidence=0.92,
+            dx=0.010,
+            dy=0.008,
+            dz=0.030,
+            dyaw=0.120,
+            x_valid=True,
+            y_valid=True,
+            z_valid=False,
+            yaw_valid=False,
+            x_confidence=0.9,
+            y_confidence=0.9,
+            z_confidence=0.1,
+            yaw_confidence=0.0,
+            frame_consistency=0.85,
+            source="unit_test",
+            reason="xy_pullback_only",
+        )
+        self.assertIn("x", est.pullback_ready_axes)
+        self.assertIn("y", est.pullback_ready_axes)
+        self.assertFalse(est.close_ready(xy_threshold=0.005, z_threshold=0.010, yaw_threshold=0.03, yaw_required=True))
+
+    def test_xy_pullback_can_apply_while_micro_entry_false(self) -> None:
+        row = {
+            "task_name": "insert_onto_square_peg",
+            "stage_name": "RING_GRASP_ALIGN",
+            "skill_name": "precision_grasp_ring",
+            "skill_type": "precision_grasp",
+            "visual_observability_class": "visual_observable",
+            "reacquire_needed": False,
+            "yaw_observable": False,
+            "true_basin_error_t": {"dx": 0.020, "dy": -0.016, "dz": 0.028, "dyaw": 0.110},
+            "planner_prior": {"local_delta_6d": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            "proxy_local_geometry_error": {"dx": 0.030, "dy": -0.020, "dz": 0.030, "dyaw": 0.110},
+            "estimated_basin_error": {
+                "dx": 0.020,
+                "dy": -0.016,
+                "dz": 0.028,
+                "dyaw": 0.110,
+                "axis_validity": {"x": True, "y": True, "z": False, "yaw": False},
+                "axis_confidence": {"x": 0.8, "y": 0.8, "z": 0.1, "yaw": 0.0},
+            },
+        }
+        replay = ReplayBasinEstimator(xy_gain=0.35, max_xy_step=0.0030, yaw_enabled=False, z_enabled=False)
+        result = replay.replay(row, stage_name="RING_GRASP_ALIGN")
+        self.assertEqual(result.estimated_basin_error.pullback_ready_axes[:2], ("x", "y"))
+        self.assertEqual(result.estimated_basin_error.source, "privileged_relabel")
+        self.assertEqual(result.estimated_basin_error.reason, "replay_xy_pullback")
+        self.assertEqual(result.reason, "privileged_relabel_replay")
+        self.assertEqual(result.micro_entry_block_reason, "privileged_relabel_replay")
+        self.assertFalse(result.micro_entry_ready)
+        self.assertFalse(result.close_ready_ready)
+        self.assertEqual(result.reason, "privileged_relabel_replay")
+        self.assertEqual(result.correction_local_6d.shape[0], 6)
+        self.assertGreater(np.linalg.norm(result.correction_local_6d[:2]), 0.0)
+
+    def test_close_stays_locked_until_entry_gate(self) -> None:
+        row = {
+            "task_name": "insert_onto_square_peg",
+            "stage_name": "RING_GRASP_ALIGN",
+            "skill_name": "precision_grasp_ring",
+            "skill_type": "precision_grasp",
+            "visual_observability_class": "visual_observable",
+            "reacquire_needed": False,
+            "yaw_observable": True,
+            "true_basin_error_t": {"dx": 0.022, "dy": 0.017, "dz": 0.032, "dyaw": 0.090},
+            "planner_prior": {"local_delta_6d": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            "proxy_local_geometry_error": {"dx": 0.025, "dy": 0.019, "dz": 0.032, "dyaw": 0.090},
+            "estimated_basin_error": {
+                "dx": 0.022,
+                "dy": 0.017,
+                "dz": 0.032,
+                "dyaw": 0.090,
+                "axis_validity": {"x": True, "y": True, "z": False, "yaw": True},
+                "axis_confidence": {"x": 0.8, "y": 0.8, "z": 0.1, "yaw": 0.7},
+            },
+        }
+        replay = ReplayBasinEstimator(xy_gain=0.35, max_xy_step=0.0030, yaw_enabled=False, z_enabled=False)
+        proposal = replay.propose(row, stage_name="RING_GRASP_ALIGN")
+        self.assertEqual(proposal["mode"], "VISUAL_PULLBACK")
+        result = replay.replay(row, stage_name="RING_GRASP_ALIGN")
+        self.assertFalse(result.micro_entry_ready)
+        self.assertFalse(result.close_ready_ready)
+        self.assertGreater(np.linalg.norm(result.correction_local_6d[:2]), 0.0)
+
     def test_recovery_mainline_points_to_v11(self) -> None:
         self.assertIn("grasp_recovery_head_v11_runtime_failure", str(RECOVERY_MAINLINE_CHECKPOINT))
 

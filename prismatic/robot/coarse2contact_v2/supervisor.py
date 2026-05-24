@@ -1127,6 +1127,8 @@ class PrecisionSkillSupervisor:
             "uses_rlbench_mask_runtime": False,
             "basin_axis_validity": estimated_basin_error.axis_validity if estimated_basin_error is not None else {"x": False, "y": False, "z": False, "yaw": False},
             "basin_axis_confidence": estimated_basin_error.axis_confidence if estimated_basin_error is not None else {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+            "basin_pullback_ready_axes": list(estimated_basin_error.pullback_ready_axes) if estimated_basin_error is not None else [],
+            "basin_control_gate_axes": list(estimated_basin_error.trusted_control_axes) if estimated_basin_error is not None else [],
             "basin_axis_policy": {
                 "x": str(self._last_basin_state_calibration.x.policy if self._last_basin_state_calibration is not None else "abstain"),
                 "y": str(self._last_basin_state_calibration.y.policy if self._last_basin_state_calibration is not None else "abstain"),
@@ -1135,6 +1137,13 @@ class PrecisionSkillSupervisor:
             },
             "basin_axis_source": str(estimated_basin_error.source if estimated_basin_error is not None else "none"),
             "basin_frame_consistency": float(estimated_basin_error.frame_consistency if estimated_basin_error is not None else 0.0),
+            "basin_entry_gate_ready": bool(estimated_basin_error.close_ready(
+                xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
+                z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
+                yaw_threshold=float(active_skill.yaw_tolerance if active_skill is not None else 0.03),
+                yaw_required=bool(estimated_basin_error.yaw_valid) if estimated_basin_error is not None else False,
+                min_frame_consistency=0.20,
+            ) if estimated_basin_error is not None else False),
             "basin_close_ready": bool(estimated_basin_error.close_ready(
                 xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
                 z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
