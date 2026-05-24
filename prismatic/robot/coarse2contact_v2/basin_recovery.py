@@ -56,6 +56,7 @@ class BasinRecoveryConfig:
     near_grasp_xy_threshold: float = 0.015
     near_grasp_yaw_threshold: float = 0.08
     close_ready_xy_threshold: float = 0.005
+    close_ready_z_threshold: float = 0.010
     close_ready_yaw_threshold: float = 0.03
     visual_conf_threshold: float = 0.01
     visual_observability_threshold: float = 0.002
@@ -332,7 +333,12 @@ class GraspOnlyBasinPullbackPolicy:
         if self.allow_yaw and est.yaw_valid and abs(float(est.dyaw)) >= float(self.yaw_observable_min_abs):
             correction[5] = float(self.yaw_gain * est.dyaw)
 
-        max_xy = self.config.max_micro_xy_step if est.close_ready(xy_threshold=self.config.close_ready_xy_threshold, z_threshold=self.config.close_ready_yaw_threshold, yaw_threshold=self.config.close_ready_yaw_threshold, yaw_required=False) else self.config.max_pullback_xy_step
+        max_xy = self.config.max_micro_xy_step if est.close_ready(
+            xy_threshold=self.config.close_ready_xy_threshold,
+            z_threshold=self.config.close_ready_z_threshold,
+            yaw_threshold=self.config.close_ready_yaw_threshold,
+            yaw_required=False,
+        ) else self.config.max_pullback_xy_step
         max_z = self.config.max_micro_z_step if self.allow_z else 0.0
         max_yaw = self.config.max_micro_yaw_step if self.allow_yaw else 0.0
         correction = _clamp_basin_correction(
@@ -344,8 +350,8 @@ class GraspOnlyBasinPullbackPolicy:
         micro_ready = bool(
             est.close_ready(
                 xy_threshold=self.config.close_ready_xy_threshold,
-                z_threshold=0.010,
-                yaw_threshold=0.03,
+                z_threshold=self.config.close_ready_z_threshold,
+                yaw_threshold=self.config.close_ready_yaw_threshold,
                 yaw_required=False,
             )
         )

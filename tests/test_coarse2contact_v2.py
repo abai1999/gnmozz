@@ -48,6 +48,7 @@ from prismatic.robot.coarse2contact_v2.basin_recovery import BasinStateEstimator
 from prismatic.robot.coarse2contact_v2.basin_state import BasinAxisCalibration, BasinStateCalibration, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, load_basin_state_calibration_report
 from prismatic.robot.residual_safety import ResidualSafety
 from prismatic.robot.residual_transforms import local_delta_to_world, world_delta_to_local
+from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_intervention
 from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
 
 
@@ -293,6 +294,82 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertFalse(result.micro_entry_ready)
         self.assertFalse(result.close_ready_ready)
         self.assertGreater(np.linalg.norm(result.correction_local_6d[:2]), 0.0)
+
+    def test_grasp_pullback_policy_uses_explicit_z_threshold(self) -> None:
+        est = EstimatedBasinError(
+            valid=True,
+            confidence=0.9,
+            dx=0.004,
+            dy=0.0,
+            dz=0.020,
+            dyaw=0.0,
+            x_valid=True,
+            y_valid=True,
+            z_valid=True,
+            yaw_valid=False,
+            x_confidence=0.9,
+            y_confidence=0.9,
+            z_confidence=0.9,
+            yaw_confidence=0.0,
+            frame_consistency=0.9,
+            source="unit_test",
+            reason="z_threshold_regression",
+        )
+        config = BasinRecoveryConfig(close_ready_z_threshold=0.010, close_ready_yaw_threshold=0.030)
+        policy = GraspOnlyBasinPullbackPolicy(config=config)
+        decision = policy.step(estimated_basin_error=est, visual_evidence_class=VisualEvidenceClass.VISUAL_OBSERVABLE)
+        self.assertEqual(decision.mode, BasinRecoveryMode.VISUAL_PULLBACK)
+        self.assertGreater(abs(float(decision.local_action_6d[0])), config.max_micro_xy_step + 1.0e-6)
+
+    def test_grasp_intervention_audit_feasible_horizon_shell(self) -> None:
+        rows = [
+            {
+                "episode_idx": 8,
+                "step": 58,
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": True,
+                "grasp_probe_reason": "replay_oracle_xy",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_requested_horizon": 3,
+                "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_pre_true_error_t": [0.023, 0.0, 0.0, 0.040],
+                "grasp_probe_post_true_error_t": [0.020, 0.0, 0.0, 0.040],
+                "grasp_probe_horizon_final_true_error_t": [0.014, 0.0, 0.0, 0.040],
+                "grasp_probe_near_grasp_after": False,
+                "grasp_probe_horizon_near_grasp_after": True,
+                "grasp_probe_horizon_micro_entry_ready_after": True,
+                "grasp_probe_horizon_overshoot": False,
+            }
+        ]
+        report = audit_grasp_intervention(
+            rows,
+            near_grasp_xy_threshold=0.015,
+            near_grasp_yaw_threshold=0.08,
+            max_xy_step=0.003,
+            horizon_steps=3,
+        )
+        shells = report["overall"]["feasible_shells"]
+        self.assertEqual(shells["one_step_xy_feasible"]["count"], 0)
+        self.assertEqual(shells["horizon_xy_and_yaw_feasible"]["count"], 1)
+        self.assertEqual(shells["horizon_xy_and_yaw_feasible"]["horizon_near_grasp_after_rate"], 1.0)
+        self.assertEqual(report["overall"]["horizon_xy_contraction_rate"], 1.0)
+
+    def test_prior_only_probe_rows_remain_abstain_in_audit(self) -> None:
+        rows = [
+            {
+                "episode_idx": 5,
+                "step": 10,
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": False,
+                "grasp_probe_reason": "prior_only_abstain",
+                "grasp_probe_visibility_bucket": "prior_only",
+                "grasp_probe_pre_true_error_t": [0.030, 0.0, 0.0, 0.0],
+                "grasp_probe_post_true_error_t": [0.030, 0.0, 0.0, 0.0],
+            }
+        ]
+        report = audit_grasp_intervention(rows)
+        self.assertEqual(report["overall"]["active_rows"], 0)
+        self.assertEqual(report["overall"]["prior_only_abstain_rate"], 1.0)
 
     def test_recovery_mainline_points_to_v11(self) -> None:
         self.assertIn("grasp_recovery_head_v11_runtime_failure", str(RECOVERY_MAINLINE_CHECKPOINT))

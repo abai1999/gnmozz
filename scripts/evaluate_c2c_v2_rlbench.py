@@ -219,6 +219,112 @@ def _bounded_xy_oracle_probe_step(error_local_6d: np.ndarray, *, xy_gain: float,
     return correction.astype(np.float32)
 
 
+def _grasp_probe_metric_fields(
+    pre_probe: np.ndarray,
+    post_probe: np.ndarray,
+    *,
+    visibility_bucket: str,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float,
+    close_ready_xy_threshold: float,
+    close_ready_yaw_threshold: float,
+) -> dict[str, object]:
+    pre = np.asarray(pre_probe, dtype=np.float32).reshape(-1)[:4]
+    post = np.asarray(post_probe, dtype=np.float32).reshape(-1)[:4]
+    visible = str(visibility_bucket) != "prior_only"
+    return {
+        "grasp_probe_pre_xy_error": float(np.hypot(float(pre[0]), float(pre[1]))),
+        "grasp_probe_post_xy_error": float(np.hypot(float(post[0]), float(post[1]))),
+        "grasp_probe_pre_error_norm": float(np.linalg.norm(np.asarray([pre[0], pre[1], 0.04 * pre[3]], dtype=np.float32))),
+        "grasp_probe_post_error_norm": float(np.linalg.norm(np.asarray([post[0], post[1], 0.04 * post[3]], dtype=np.float32))),
+        "grasp_probe_xy_contracted": bool(float(np.hypot(float(post[0]), float(post[1]))) < float(np.hypot(float(pre[0]), float(pre[1]))) - 1.0e-9),
+        "grasp_probe_overshoot": bool(recovery_overshoot_flag(pre[:3], post[:3])),
+        "grasp_probe_micro_entry_ready_before": bool(
+            visible
+            and in_near_grasp_basin(
+                float(pre[0]),
+                float(pre[1]),
+                float(pre[3]),
+                xy_threshold=float(near_grasp_xy_threshold),
+                yaw_threshold=float(near_grasp_yaw_threshold),
+            )
+        ),
+        "grasp_probe_micro_entry_ready_after": bool(
+            visible
+            and in_near_grasp_basin(
+                float(post[0]),
+                float(post[1]),
+                float(post[3]),
+                xy_threshold=float(near_grasp_xy_threshold),
+                yaw_threshold=float(near_grasp_yaw_threshold),
+            )
+        ),
+        "grasp_probe_near_grasp_before": bool(
+            in_near_grasp_basin(
+                float(pre[0]),
+                float(pre[1]),
+                float(pre[3]),
+                xy_threshold=float(near_grasp_xy_threshold),
+                yaw_threshold=float(near_grasp_yaw_threshold),
+            )
+        ),
+        "grasp_probe_near_grasp_after": bool(
+            in_near_grasp_basin(
+                float(post[0]),
+                float(post[1]),
+                float(post[3]),
+                xy_threshold=float(near_grasp_xy_threshold),
+                yaw_threshold=float(near_grasp_yaw_threshold),
+            )
+        ),
+        "grasp_probe_close_ready_before": bool(
+            in_close_ready_basin(
+                float(pre[0]),
+                float(pre[1]),
+                float(pre[3]),
+                xy_threshold=float(close_ready_xy_threshold),
+                yaw_threshold=float(close_ready_yaw_threshold),
+            )
+        ),
+        "grasp_probe_close_ready_after": bool(
+            in_close_ready_basin(
+                float(post[0]),
+                float(post[1]),
+                float(post[3]),
+                xy_threshold=float(close_ready_xy_threshold),
+                yaw_threshold=float(close_ready_yaw_threshold),
+            )
+        ),
+    }
+
+
+def _nan_grasp_probe_metric_fields() -> dict[str, object]:
+    return {
+        "grasp_probe_pre_xy_error": float("nan"),
+        "grasp_probe_post_xy_error": float("nan"),
+        "grasp_probe_pre_error_norm": float("nan"),
+        "grasp_probe_post_error_norm": float("nan"),
+        "grasp_probe_xy_contracted": False,
+        "grasp_probe_overshoot": False,
+        "grasp_probe_micro_entry_ready_before": False,
+        "grasp_probe_micro_entry_ready_after": False,
+        "grasp_probe_near_grasp_before": False,
+        "grasp_probe_near_grasp_after": False,
+        "grasp_probe_close_ready_before": False,
+        "grasp_probe_close_ready_after": False,
+    }
+
+
+def _prefix_grasp_probe_fields(fields: dict[str, object], prefix: str) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in fields.items():
+        if key.startswith("grasp_probe_"):
+            out[f"{prefix}_{key[len('grasp_probe_'):]}"] = value
+        else:
+            out[f"{prefix}_{key}"] = value
+    return out
+
+
 def build_c2c_v2_supervisor(args, task_spec):
     if args.mode == "planner_only" and task_spec is None:
         return None
@@ -298,6 +404,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2c_grasp_probe_policy", type=str, default="off", choices=["off", "replay_oracle_xy"])
     parser.add_argument("--c2c_grasp_probe_xy_gain", type=float, default=0.35)
     parser.add_argument("--c2c_grasp_probe_max_xy_step", type=float, default=0.0030)
+    parser.add_argument("--c2c_grasp_probe_horizon", type=int, default=1)
     parser.add_argument("--near_grasp_xy_threshold", type=float, default=0.015)
     parser.add_argument("--near_grasp_yaw_threshold", type=float, default=0.08)
     parser.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
@@ -440,6 +547,7 @@ def evaluate(args: argparse.Namespace) -> float:
         "c2c_grasp_probe_policy": str(args.c2c_grasp_probe_policy),
         "c2c_grasp_probe_xy_gain": float(args.c2c_grasp_probe_xy_gain),
         "c2c_grasp_probe_max_xy_step": float(args.c2c_grasp_probe_max_xy_step),
+        "c2c_grasp_probe_horizon": int(args.c2c_grasp_probe_horizon),
         "depth_error_trend": [],
     }
 
@@ -578,6 +686,9 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_visibility_bucket"] = probe_visibility_bucket
                 trace_entry["grasp_probe_active"] = bool(probe_eligible)
                 trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else ("prior_only_abstain" if probe_visibility_bucket == "prior_only" else "inactive")
+                trace_entry["grasp_probe_requested_horizon"] = int(max(1, int(args.c2c_grasp_probe_horizon)))
+                trace_entry["grasp_probe_horizon_steps_executed"] = 0
+                trace_entry["grasp_probe_close_locked"] = bool(probe_eligible)
                 trace_entry["grasp_probe_pre_true_error_t"] = _jsonable_value(
                     np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4] if probe_true_error_before is not None else np.full((4,), np.nan, dtype=np.float32)
                 )
@@ -594,6 +705,7 @@ def evaluate(args: argparse.Namespace) -> float:
                     probe_world_delta = local_delta_to_world(probe_local_command, np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
                     delta_action = delta_action.copy()
                     delta_action[:6] = probe_world_delta[:6]
+                    delta_action[6] = 1.0
                     trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(probe_correction_local)
                     trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(probe_local_command)
                     trace_entry["grasp_probe_control_gate_axes"] = list(c2c.get_last_trace().get("basin_control_gate_axes", []))
@@ -801,86 +913,134 @@ def evaluate(args: argparse.Namespace) -> float:
             if args.c2c_grasp_probe_policy != "off" and bool(trace_entry.get("grasp_probe_active", False)) and args.dump_runtime_obs and args.capture_failure_target_pose:
                 probe_after_pack = _episode_privileged_frame_pack(task, obs)
                 probe_true_error_after = _grasp_teacher_error_from_pack(probe_after_pack, grasp_spec)
+                trace_entry["grasp_probe_horizon_records"] = []
                 if probe_true_error_after is not None and probe_true_error_before is not None:
                     pre_probe = np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4]
                     post_probe = np.asarray(probe_true_error_after, dtype=np.float32).reshape(-1)[:4]
+                    visibility_bucket = str(trace_entry.get("grasp_probe_visibility_bucket", "prior_only"))
+                    metric_fields = _grasp_probe_metric_fields(
+                        pre_probe,
+                        post_probe,
+                        visibility_bucket=visibility_bucket,
+                        near_grasp_xy_threshold=float(args.near_grasp_xy_threshold),
+                        near_grasp_yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        close_ready_xy_threshold=float(args.close_ready_xy_threshold),
+                        close_ready_yaw_threshold=float(args.close_ready_yaw_threshold),
+                    )
                     trace_entry["grasp_probe_post_true_error_t"] = _jsonable_value(post_probe)
-                    trace_entry["grasp_probe_pre_xy_error"] = float(np.hypot(float(pre_probe[0]), float(pre_probe[1])))
-                    trace_entry["grasp_probe_post_xy_error"] = float(np.hypot(float(post_probe[0]), float(post_probe[1])))
-                    trace_entry["grasp_probe_pre_error_norm"] = float(np.linalg.norm(np.asarray([pre_probe[0], pre_probe[1], 0.04 * pre_probe[3]], dtype=np.float32)))
-                    trace_entry["grasp_probe_post_error_norm"] = float(np.linalg.norm(np.asarray([post_probe[0], post_probe[1], 0.04 * post_probe[3]], dtype=np.float32)))
-                    trace_entry["grasp_probe_xy_contracted"] = bool(trace_entry["grasp_probe_post_xy_error"] < trace_entry["grasp_probe_pre_xy_error"] - 1.0e-9)
-                    trace_entry["grasp_probe_overshoot"] = bool(recovery_overshoot_flag(pre_probe[:3], post_probe[:3]))
-                    trace_entry["grasp_probe_micro_entry_ready_before"] = bool(
-                        in_near_grasp_basin(
-                            float(pre_probe[0]),
-                            float(pre_probe[1]),
-                            float(pre_probe[3]),
-                            xy_threshold=float(args.near_grasp_xy_threshold),
-                            yaw_threshold=float(args.near_grasp_yaw_threshold),
-                        )
-                        and trace_entry.get("grasp_probe_visibility_bucket", "prior_only") != "prior_only"
+                    trace_entry.update(metric_fields)
+                    trace_entry["grasp_probe_horizon_steps_executed"] = 1
+                    trace_entry["grasp_probe_horizon_records"].append(
+                        {
+                            "horizon_step": 1,
+                            "pre_true_error_t": _jsonable_value(pre_probe),
+                            "post_true_error_t": _jsonable_value(post_probe),
+                            "applied_xy_step_local_6d": trace_entry.get("grasp_probe_applied_xy_step_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32))),
+                            "xy_contracted": bool(metric_fields["grasp_probe_xy_contracted"]),
+                            "near_grasp_after": bool(metric_fields["grasp_probe_near_grasp_after"]),
+                            "micro_entry_ready_after": bool(metric_fields["grasp_probe_micro_entry_ready_after"]),
+                            "overshoot": bool(metric_fields["grasp_probe_overshoot"]),
+                        }
                     )
-                    trace_entry["grasp_probe_micro_entry_ready_after"] = bool(
-                        in_near_grasp_basin(
-                            float(post_probe[0]),
-                            float(post_probe[1]),
-                            float(post_probe[3]),
-                            xy_threshold=float(args.near_grasp_xy_threshold),
-                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+
+                    final_probe = post_probe.copy()
+                    requested_horizon = int(max(1, int(args.c2c_grasp_probe_horizon)))
+                    while (
+                        int(trace_entry["grasp_probe_horizon_steps_executed"]) < requested_horizon
+                        and not bool(terminate)
+                    ):
+                        latest_pack = _episode_privileged_frame_pack(task, obs)
+                        latest_error = _grasp_teacher_error_from_pack(latest_pack, grasp_spec)
+                        if latest_error is None:
+                            break
+                        step_pre = np.asarray(latest_error, dtype=np.float32).reshape(-1)[:4]
+                        if not np.all(np.isfinite(step_pre[:2])):
+                            break
+                        step_correction_local = _bounded_xy_oracle_probe_step(
+                            step_pre,
+                            xy_gain=float(args.c2c_grasp_probe_xy_gain),
+                            max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
                         )
-                        and trace_entry.get("grasp_probe_visibility_bucket", "prior_only") != "prior_only"
-                    )
-                    trace_entry["grasp_probe_near_grasp_before"] = bool(
-                        in_near_grasp_basin(
-                            float(pre_probe[0]),
-                            float(pre_probe[1]),
-                            float(pre_probe[3]),
-                            xy_threshold=float(args.near_grasp_xy_threshold),
-                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        step_local_command = np.zeros(6, dtype=np.float32)
+                        step_local_command[0] = float(step_correction_local[0])
+                        step_local_command[1] = float(step_correction_local[1])
+                        step_world_delta = local_delta_to_world(step_local_command, np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
+                        extra_delta = np.zeros_like(delta_action, dtype=np.float32)
+                        extra_delta[:6] = step_world_delta[:6]
+                        if extra_delta.shape[0] > 6:
+                            extra_delta[6] = 1.0
+                        extra_abs = delta_to_absolute(extra_delta, obs.gripper_pose)
+                        extra_abs, extra_workspace_violation = maybe_apply_workspace_filter(
+                            extra_abs,
+                            safety,
+                            mode=args.workspace_clamp_mode,
+                            tolerance=args.workspace_clamp_tolerance,
                         )
-                    )
-                    trace_entry["grasp_probe_near_grasp_after"] = bool(
-                        in_near_grasp_basin(
-                            float(post_probe[0]),
-                            float(post_probe[1]),
-                            float(post_probe[3]),
-                            xy_threshold=float(args.near_grasp_xy_threshold),
-                            yaw_threshold=float(args.near_grasp_yaw_threshold),
+                        if extra_workspace_violation > 0.0:
+                            workspace_violation_count += 1
+                            workspace_violation_max = max(workspace_violation_max, float(extra_workspace_violation))
+                        try:
+                            obs, reward, terminate = task.step(extra_abs)
+                            executed_action = extra_abs
+                        except InvalidActionError as exc:
+                            trace_entry["grasp_probe_horizon_invalid_action"] = type(exc).__name__
+                            trace_entry["invalid_action"] = True
+                            trace_entry["invalid_action_flag"] = True
+                            invalid_action_count += 1
+                            break
+                        if args.record_video:
+                            frames.append(_compose_video_frame(obs.front_rgb.copy(), obs.wrist_rgb.copy() if obs.wrist_rgb is not None else None, layout=args.video_layout))
+                        step_after_pack = _episode_privileged_frame_pack(task, obs)
+                        step_after_error = _grasp_teacher_error_from_pack(step_after_pack, grasp_spec)
+                        if step_after_error is None:
+                            break
+                        step_post = np.asarray(step_after_error, dtype=np.float32).reshape(-1)[:4]
+                        step_metrics = _grasp_probe_metric_fields(
+                            step_pre,
+                            step_post,
+                            visibility_bucket=visibility_bucket,
+                            near_grasp_xy_threshold=float(args.near_grasp_xy_threshold),
+                            near_grasp_yaw_threshold=float(args.near_grasp_yaw_threshold),
+                            close_ready_xy_threshold=float(args.close_ready_xy_threshold),
+                            close_ready_yaw_threshold=float(args.close_ready_yaw_threshold),
                         )
-                    )
-                    trace_entry["grasp_probe_close_ready_before"] = bool(
-                        in_close_ready_basin(
-                            float(pre_probe[0]),
-                            float(pre_probe[1]),
-                            float(pre_probe[3]),
-                            xy_threshold=float(args.close_ready_xy_threshold),
-                            yaw_threshold=float(args.close_ready_yaw_threshold),
+                        trace_entry["grasp_probe_horizon_steps_executed"] = int(trace_entry["grasp_probe_horizon_steps_executed"]) + 1
+                        trace_entry["grasp_probe_horizon_records"].append(
+                            {
+                                "horizon_step": int(trace_entry["grasp_probe_horizon_steps_executed"]),
+                                "pre_true_error_t": _jsonable_value(step_pre),
+                                "post_true_error_t": _jsonable_value(step_post),
+                                "applied_xy_step_local_6d": _jsonable_value(step_correction_local),
+                                "xy_contracted": bool(step_metrics["grasp_probe_xy_contracted"]),
+                                "near_grasp_after": bool(step_metrics["grasp_probe_near_grasp_after"]),
+                                "micro_entry_ready_after": bool(step_metrics["grasp_probe_micro_entry_ready_after"]),
+                                "overshoot": bool(step_metrics["grasp_probe_overshoot"]),
+                            }
                         )
-                    )
-                    trace_entry["grasp_probe_close_ready_after"] = bool(
-                        in_close_ready_basin(
-                            float(post_probe[0]),
-                            float(post_probe[1]),
-                            float(post_probe[3]),
-                            xy_threshold=float(args.close_ready_xy_threshold),
-                            yaw_threshold=float(args.close_ready_yaw_threshold),
+                        final_probe = step_post.copy()
+                        action_queue.clear()
+
+                    trace_entry["grasp_probe_horizon_final_true_error_t"] = _jsonable_value(final_probe)
+                    trace_entry.update(
+                        _prefix_grasp_probe_fields(
+                            _grasp_probe_metric_fields(
+                                pre_probe,
+                                final_probe,
+                                visibility_bucket=visibility_bucket,
+                                near_grasp_xy_threshold=float(args.near_grasp_xy_threshold),
+                                near_grasp_yaw_threshold=float(args.near_grasp_yaw_threshold),
+                                close_ready_xy_threshold=float(args.close_ready_xy_threshold),
+                                close_ready_yaw_threshold=float(args.close_ready_yaw_threshold),
+                            ),
+                            "grasp_probe_horizon",
                         )
                     )
                 else:
-                    trace_entry["grasp_probe_post_true_error_t"] = _jsonable_value(np.full((4,), np.nan, dtype=np.float32))
-                    trace_entry["grasp_probe_pre_xy_error"] = float("nan")
-                    trace_entry["grasp_probe_post_xy_error"] = float("nan")
-                    trace_entry["grasp_probe_pre_error_norm"] = float("nan")
-                    trace_entry["grasp_probe_post_error_norm"] = float("nan")
-                    trace_entry["grasp_probe_xy_contracted"] = False
-                    trace_entry["grasp_probe_overshoot"] = False
-                    trace_entry["grasp_probe_micro_entry_ready_before"] = False
-                    trace_entry["grasp_probe_micro_entry_ready_after"] = False
-                    trace_entry["grasp_probe_near_grasp_before"] = False
-                    trace_entry["grasp_probe_near_grasp_after"] = False
-                    trace_entry["grasp_probe_close_ready_before"] = False
-                    trace_entry["grasp_probe_close_ready_after"] = False
+                    nan_error = np.full((4,), np.nan, dtype=np.float32)
+                    trace_entry["grasp_probe_post_true_error_t"] = _jsonable_value(nan_error)
+                    trace_entry["grasp_probe_horizon_final_true_error_t"] = _jsonable_value(nan_error)
+                    trace_entry.update(_nan_grasp_probe_metric_fields())
+                    trace_entry.update(_prefix_grasp_probe_fields(_nan_grasp_probe_metric_fields(), "grasp_probe_horizon"))
             if privileged_frame_pack is not None:
                 trace_entry.update({k: _jsonable_value(v) for k, v in privileged_frame_pack.items()})
             gripper_trace.append(trace_entry)
