@@ -167,6 +167,16 @@ def _episode_focus_windows(episode_indices: Iterable[int], *, radius: int) -> li
     return windows
 
 
+def _wilson_lower_bound(successes: int, n: int, *, z: float = 1.96) -> float:
+    if n <= 0:
+        return 0.0
+    phat = float(successes) / float(n)
+    denom = 1.0 + (z * z) / float(n)
+    center = phat + (z * z) / (2.0 * float(n))
+    margin = z * ((phat * (1.0 - phat) + (z * z) / (4.0 * float(n))) / float(n)) ** 0.5
+    return float(max((center - margin) / denom, 0.0))
+
+
 def _summarize_sweep_reports(
     chunk_reports: list[dict[str, Any]],
     *,
@@ -224,6 +234,32 @@ def _summarize_sweep_reports(
     else:
         recommended_episode_indices = [int(item["episode_idx"]) for item in ranked_episodes]
 
+    total_active_rows = int(sum(int(report.get("overall", {}).get("active_rows", 0)) for report in chunk_reports))
+    total_yaw_feasible_rows = int(sum(int(report.get("overall", {}).get("yaw_feasible_rows", 0)) for report in chunk_reports))
+    total_horizon_xy_contracted_count = int(sum(int(report.get("overall", {}).get("horizon_xy_contracted_count", 0)) for report in chunk_reports))
+    total_horizon_near_grasp_after_count = int(sum(int(report.get("overall", {}).get("horizon_near_grasp_after_count", 0)) for report in chunk_reports))
+    total_horizon_xy_contraction_lower_ci = _wilson_lower_bound(total_horizon_xy_contracted_count, total_active_rows)
+    total_horizon_near_grasp_after_rate = float(total_horizon_near_grasp_after_count / total_active_rows) if total_active_rows else 0.0
+    collection_target = {
+        "active_rows": total_active_rows,
+        "yaw_feasible_rows": total_yaw_feasible_rows,
+        "horizon_xy_contracted_count": total_horizon_xy_contracted_count,
+        "horizon_xy_contraction_lower_ci": total_horizon_xy_contraction_lower_ci,
+        "horizon_near_grasp_after_rate": total_horizon_near_grasp_after_rate,
+        "meets_target": bool(
+            total_active_rows >= 100
+            and total_yaw_feasible_rows >= 30
+            and total_horizon_xy_contraction_lower_ci > 0.8
+            and total_horizon_near_grasp_after_rate > 0.0
+        ),
+        "thresholds": {
+            "active_rows": 100,
+            "yaw_feasible_rows": 30,
+            "horizon_xy_contraction_lower_ci": 0.8,
+            "horizon_near_grasp_after_rate": 0.0,
+        },
+    }
+
     return {
         "chunk_reports": chunk_reports,
         "episode_rows": episode_rows,
@@ -243,6 +279,7 @@ def _summarize_sweep_reports(
                 for ep in window["episode_indices"]
             }
         ),
+        "collection_target": collection_target,
     }
 
 
@@ -252,8 +289,15 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
         "",
         f"- candidate_episodes: `{summary['candidate_episode_indices_csv']}`",
         f"- chunk_count: `{summary['chunk_count']}`",
+        f"- collection_target_met: `{summary['collection_target']['meets_target']}`",
         f"- shell_hit_episode_count: `{len(summary['shell_hit_episode_indices'])}`",
         f"- shell_hit_failure_bucket_count: `{len(summary['shell_hit_failure_buckets'])}`",
+        "",
+        "## Collection Target",
+        f"- active_rows: `{summary['collection_target']['active_rows']}`",
+        f"- yaw_feasible_rows: `{summary['collection_target']['yaw_feasible_rows']}`",
+        f"- horizon_xy_contraction_lower_ci: `{summary['collection_target']['horizon_xy_contraction_lower_ci']:.3f}`",
+        f"- horizon_near_grasp_after_rate: `{summary['collection_target']['horizon_near_grasp_after_rate']:.3f}`",
         "",
         "## Shell Hit Episodes",
     ]
@@ -347,7 +391,7 @@ def main() -> None:
     ap.add_argument("--c2c_grasp_probe_max_xy_step", type=float, default=0.003)
     ap.add_argument("--c2c_grasp_probe_horizon", type=int, default=3)
     ap.add_argument("--c2c_grasp_probe_window_mode", type=str, default="forced_shell", choices=["stage", "forced_shell"])
-    ap.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="near_yaw_feasible", choices=["off", "near_yaw_feasible"])
+    ap.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="coarse_yaw_feasible", choices=["off", "near_yaw_feasible", "coarse_yaw_feasible"])
     ap.add_argument("--basin_state_calibration_report", type=str, default="runtime_artifacts/coarse2contact_v2/reports/basin_state_calibration/basin_state_calibration.json")
     ap.add_argument("--top_k", type=int, default=8)
     ap.add_argument("--focus_radius", type=int, default=1)

@@ -135,6 +135,14 @@ def _horizon_xy_contraction_rate(rows: list[dict[str, Any]]) -> float:
     return float(np.mean(good)) if good else 0.0
 
 
+def _horizon_xy_contracted(row: Mapping[str, Any]) -> bool:
+    pre = _trace_row_error(row, "grasp_probe_pre_true_error_t")
+    post = _trace_row_post_error(row, horizon=True)
+    if not np.all(np.isfinite(pre[:4])) or not np.all(np.isfinite(post[:4])):
+        return False
+    return bool(_xy_norm(pre[:2]) > _xy_norm(post[:2]) + 1.0e-9)
+
+
 def _mean_step_delta(rows: list[dict[str, Any]], axis: str) -> float:
     if not rows:
         return 0.0
@@ -464,15 +472,21 @@ def _bucket_summary(
         "active_count": int(active_count),
         "xy_contraction_rate": float(active_xy_rate),
         "xy_contraction_lower_ci": float(_wilson_lower_bound(contracted_count, len(active_xy))),
+        "xy_contracted_count": int(contracted_count),
         "micro_entry_ready_after_rate": micro_after,
         "near_grasp_after_rate": near_after,
         "close_ready_after_rate": close_after,
         "overshoot_rate": overshoot,
         "horizon_xy_contraction_rate": _horizon_xy_contraction_rate(active),
+        "horizon_xy_contracted_count": int(sum(_horizon_xy_contracted(r) for r in active)),
         "horizon_micro_entry_ready_after_rate": horizon_micro_after,
+        "horizon_micro_entry_ready_after_count": int(sum(_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in active)),
         "horizon_near_grasp_after_rate": horizon_near_after,
+        "horizon_near_grasp_after_count": int(sum(_probe_bool(r, "near_grasp_after", horizon=True) for r in active)),
         "horizon_close_ready_after_rate": horizon_close_after,
+        "horizon_close_ready_after_count": int(sum(_probe_bool(r, "close_ready_after", horizon=True) for r in active)),
         "horizon_overshoot_rate": horizon_overshoot,
+        "horizon_overshoot_count": int(sum(_probe_bool(r, "overshoot", horizon=True) for r in active)),
         "prior_only_abstain_rate": prior_abstain,
         "mean_delta_dx": _mean_step_delta(active, "x"),
         "mean_delta_dy": _mean_step_delta(active, "y"),
@@ -494,6 +508,9 @@ def _bucket_summary(
         "yaw_observable_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in rows)),
         "horizon_xy_feasible_rows": int(sum(_probe_horizon_xy_feasible(r, near_grasp_xy_threshold=near_grasp_xy_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
         "micro_entry_ready_rows": int(sum(_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in rows)),
+        "horizon_xy_contracted_count": int(sum(_horizon_xy_contracted(r) for r in active)),
+        "horizon_near_grasp_after_count": int(sum(_probe_bool(r, "near_grasp_after", horizon=True) for r in active)),
+        "horizon_micro_entry_ready_after_count": int(sum(_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in active)),
         "max_requested_horizon": int(max([int(r.get("grasp_probe_requested_horizon", 1) or 1) for r in active], default=1)),
         "mean_horizon_steps_executed": float(np.mean([int(r.get("grasp_probe_horizon_steps_executed", 0) or 0) for r in active])) if active else 0.0,
         "yaw_blocked_rate_within_horizon_xy_feasible": _yaw_blocked_rate_within_horizon_xy_feasible(
@@ -614,10 +631,15 @@ def audit(
         "close_ready_after_rate": float(np.mean([bool(r.get("grasp_probe_close_ready_after", False)) for r in active_rows])) if active_rows else 0.0,
         "overshoot_rate": float(np.mean([bool(r.get("grasp_probe_overshoot", False)) for r in active_rows])) if active_rows else 0.0,
         "horizon_xy_contraction_rate": _horizon_xy_contraction_rate(active_rows),
+        "horizon_xy_contracted_count": int(sum(_horizon_xy_contracted(r) for r in active_rows)),
         "horizon_micro_entry_ready_after_rate": float(np.mean([_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in active_rows])) if active_rows else 0.0,
+        "horizon_micro_entry_ready_after_count": int(sum(_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in active_rows)),
         "horizon_near_grasp_after_rate": float(np.mean([_probe_bool(r, "near_grasp_after", horizon=True) for r in active_rows])) if active_rows else 0.0,
+        "horizon_near_grasp_after_count": int(sum(_probe_bool(r, "near_grasp_after", horizon=True) for r in active_rows)),
         "horizon_close_ready_after_rate": float(np.mean([_probe_bool(r, "close_ready_after", horizon=True) for r in active_rows])) if active_rows else 0.0,
+        "horizon_close_ready_after_count": int(sum(_probe_bool(r, "close_ready_after", horizon=True) for r in active_rows)),
         "horizon_overshoot_rate": float(np.mean([_probe_bool(r, "overshoot", horizon=True) for r in active_rows])) if active_rows else 0.0,
+        "horizon_overshoot_count": int(sum(_probe_bool(r, "overshoot", horizon=True) for r in active_rows)),
         "prior_only_abstain_rate": float(np.mean([
             _row_group_value(r, "grasp_probe_reason", "") == "prior_only_abstain"
             for r in probe_rows

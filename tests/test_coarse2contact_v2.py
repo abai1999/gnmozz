@@ -52,6 +52,7 @@ from scripts.audit_c2c_v2_frame_contract_relabel import audit as audit_frame_con
 from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_intervention
 from scripts.run_c2c_v2_grasp_shell_episode_sweep import _summarize_sweep_reports
 from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
+from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_shell_fields
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -490,6 +491,18 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(report["overall"]["coarse_pullback_candidate_rows"], 1)
         self.assertEqual(report["overall"]["yaw_observable_rows"], 1)
 
+    def test_grasp_probe_shell_fields_separate_coarse_and_near_windows(self) -> None:
+        shell_fields = grasp_probe_shell_fields(
+            np.array([0.028, 0.0, 0.0, 0.040], dtype=np.float32),
+            near_grasp_xy_threshold=0.015,
+            near_grasp_yaw_threshold=0.08,
+            max_xy_step=0.003,
+            horizon_steps=3,
+        )
+        self.assertFalse(shell_fields["grasp_probe_near_basin_shell"])
+        self.assertTrue(shell_fields["grasp_probe_yaw_feasible"])
+        self.assertTrue(shell_fields["grasp_probe_coarse_pullback_candidate"])
+
     def test_grasp_intervention_audit_splits_yaw_window_and_queue(self) -> None:
         rows = [
             {
@@ -696,6 +709,27 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(summary["shell_hit_episode_focus_windows"][0]["episode_indices"], [6, 7, 8])
         self.assertEqual(summary["ranked_episodes"][0]["episode_idx"], 7)
         self.assertEqual(summary["ranked_episode_buckets"][0]["failure_bucket"], "small_xy_small_yaw")
+
+    def test_grasp_shell_episode_sweep_reports_collection_target(self) -> None:
+        chunk_reports = [
+            {
+                "chunk_tag": "chunk_000",
+                "overall": {
+                    "active_rows": 120,
+                    "yaw_feasible_rows": 35,
+                    "horizon_xy_contracted_count": 112,
+                    "horizon_near_grasp_after_count": 4,
+                },
+                "by_episode": [],
+                "by_episode_failure_bucket": [],
+            }
+        ]
+        summary = _summarize_sweep_reports(chunk_reports, top_k=4, focus_radius=1)
+        self.assertTrue(summary["collection_target"]["meets_target"])
+        self.assertGreater(summary["collection_target"]["horizon_xy_contraction_lower_ci"], 0.8)
+        self.assertEqual(summary["collection_target"]["active_rows"], 120)
+        self.assertEqual(summary["collection_target"]["yaw_feasible_rows"], 35)
+        self.assertGreater(summary["collection_target"]["horizon_near_grasp_after_rate"], 0.0)
 
     def test_recovery_mainline_points_to_v11(self) -> None:
         self.assertIn("grasp_recovery_head_v11_runtime_failure", str(RECOVERY_MAINLINE_CHECKPOINT))

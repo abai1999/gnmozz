@@ -73,6 +73,7 @@ from scripts.evaluate_c2c_rlbench import (
 )
 from scripts.evaluate_rlbench import resolve_live_target_handle, safe_live_target_pose_7d
 from prismatic.robot.stage_target_provider import apply_yaw_symmetry_to_delta, build_phase1_teacher_targets, load_phase1_grasp_spec, pose_delta_local_between
+from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_inactive_reason, grasp_probe_shell_fields
 from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin, recovery_overshoot_flag
 
 from prismatic.robot.coarse2contact_v2 import BasinRecoveryConfig, PrecisionSkillSupervisor, load_precision_task_spec, load_basin_state_calibration_report
@@ -314,64 +315,6 @@ def _grasp_probe_metric_fields(
     }
 
 
-def _grasp_probe_shell_fields(
-    probe_error: np.ndarray | None,
-    *,
-    near_grasp_xy_threshold: float,
-    near_grasp_yaw_threshold: float,
-    max_xy_step: float,
-    horizon_steps: int,
-) -> dict[str, object]:
-    if probe_error is None:
-        pre = np.full((4,), np.nan, dtype=np.float32)
-    else:
-        pre = np.asarray(probe_error, dtype=np.float32).reshape(-1)
-        pre = np.pad(pre, (0, max(0, 4 - pre.size)), constant_values=np.nan)[:4]
-    pre_xy = float(np.hypot(float(pre[0]), float(pre[1]))) if np.all(np.isfinite(pre[:2])) else float("nan")
-    pre_yaw_abs = float(abs(float(pre[3]))) if np.isfinite(pre[3]) else float("nan")
-    one_step_xy_feasible = bool(np.isfinite(pre_xy) and pre_xy <= float(near_grasp_xy_threshold) + float(max_xy_step) + 1.0e-9)
-    horizon_xy_feasible = bool(
-        np.isfinite(pre_xy)
-        and pre_xy <= float(near_grasp_xy_threshold) + float(max_xy_step) * float(max(1, int(horizon_steps))) + 1.0e-9
-    )
-    yaw_feasible = bool(np.isfinite(pre_yaw_abs) and pre_yaw_abs <= float(near_grasp_yaw_threshold) + 1.0e-9)
-    near_shell = bool(horizon_xy_feasible and yaw_feasible)
-    return {
-        "grasp_probe_pre_xy_error": pre_xy,
-        "grasp_probe_pre_abs_yaw": pre_yaw_abs,
-        "grasp_probe_one_step_xy_feasible": one_step_xy_feasible,
-        "grasp_probe_horizon_xy_feasible": horizon_xy_feasible,
-        "grasp_probe_yaw_feasible": yaw_feasible,
-        "grasp_probe_near_basin_shell": near_shell,
-    }
-
-
-def _grasp_probe_inactive_reason(
-    *,
-    policy: str,
-    stage_ok: bool,
-    visibility_bucket: str,
-    has_error: bool,
-    finite_xy: bool,
-    shell_filter: str,
-    shell_fields: dict[str, object],
-) -> str:
-    if policy == "off":
-        return "off"
-    if not has_error or not finite_xy:
-        return "missing_privileged_error"
-    if str(visibility_bucket) == "prior_only":
-        return "prior_only_abstain"
-    if not stage_ok:
-        return "stage_not_grasp_align"
-    if shell_filter == "near_yaw_feasible":
-        if not bool(shell_fields.get("grasp_probe_horizon_xy_feasible", False)):
-            return "shell_xy_outside_horizon"
-        if not bool(shell_fields.get("grasp_probe_yaw_feasible", False)):
-            return "shell_yaw_blocked"
-    return "inactive"
-
-
 def _nan_grasp_probe_metric_fields() -> dict[str, object]:
     return {
         "grasp_probe_pre_xy_error": float("nan"),
@@ -481,7 +424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2c_grasp_probe_horizon", type=int, default=1)
     parser.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
     parser.add_argument("--c2c_grasp_probe_window_mode", type=str, default="stage", choices=["stage", "forced_shell"])
-    parser.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="off", choices=["off", "near_yaw_feasible"])
+    parser.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="off", choices=["off", "near_yaw_feasible", "coarse_yaw_feasible"])
     parser.add_argument("--near_grasp_xy_threshold", type=float, default=0.015)
     parser.add_argument("--near_grasp_yaw_threshold", type=float, default=0.08)
     parser.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
@@ -773,7 +716,17 @@ def evaluate(args: argparse.Namespace) -> float:
                 )
                 probe_shell_ok = bool(
                     args.c2c_grasp_probe_shell_filter == "off"
-                    or bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                    or (
+                        args.c2c_grasp_probe_shell_filter == "near_yaw_feasible"
+                        and bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                    )
+                    or (
+                        args.c2c_grasp_probe_shell_filter == "coarse_yaw_feasible"
+                        and (
+                            bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                            or bool(probe_shell_fields.get("grasp_probe_coarse_pullback_candidate", False))
+                        )
+                    )
                 )
                 probe_eligible = bool(
                     args.c2c_grasp_probe_policy == "replay_oracle_xy"
