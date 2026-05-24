@@ -219,6 +219,22 @@ def _bounded_xy_oracle_probe_step(error_local_6d: np.ndarray, *, xy_gain: float,
     return correction.astype(np.float32)
 
 
+def _absolute_to_world_delta(abs_action: np.ndarray, current_gripper_pose: np.ndarray) -> np.ndarray:
+    action = np.asarray(abs_action, dtype=np.float32).reshape(-1)
+    pose = np.asarray(current_gripper_pose, dtype=np.float32).reshape(-1)
+    delta = np.zeros(6, dtype=np.float32)
+    if action.size < 7 or pose.size < 7 or not np.all(np.isfinite(action[:7])) or not np.all(np.isfinite(pose[:7])):
+        return delta
+    delta[:3] = action[:3] - pose[:3]
+    try:
+        r_new = Rotation.from_quat(action[3:7])
+        r_cur = Rotation.from_quat(pose[3:7])
+        delta[3:6] = (r_new * r_cur.inv()).as_rotvec().astype(np.float32)
+    except Exception:
+        delta[3:6] = 0.0
+    return delta.astype(np.float32)
+
+
 def _grasp_probe_metric_fields(
     pre_probe: np.ndarray,
     post_probe: np.ndarray,
@@ -296,6 +312,64 @@ def _grasp_probe_metric_fields(
             )
         ),
     }
+
+
+def _grasp_probe_shell_fields(
+    probe_error: np.ndarray | None,
+    *,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float,
+    max_xy_step: float,
+    horizon_steps: int,
+) -> dict[str, object]:
+    if probe_error is None:
+        pre = np.full((4,), np.nan, dtype=np.float32)
+    else:
+        pre = np.asarray(probe_error, dtype=np.float32).reshape(-1)
+        pre = np.pad(pre, (0, max(0, 4 - pre.size)), constant_values=np.nan)[:4]
+    pre_xy = float(np.hypot(float(pre[0]), float(pre[1]))) if np.all(np.isfinite(pre[:2])) else float("nan")
+    pre_yaw_abs = float(abs(float(pre[3]))) if np.isfinite(pre[3]) else float("nan")
+    one_step_xy_feasible = bool(np.isfinite(pre_xy) and pre_xy <= float(near_grasp_xy_threshold) + float(max_xy_step) + 1.0e-9)
+    horizon_xy_feasible = bool(
+        np.isfinite(pre_xy)
+        and pre_xy <= float(near_grasp_xy_threshold) + float(max_xy_step) * float(max(1, int(horizon_steps))) + 1.0e-9
+    )
+    yaw_feasible = bool(np.isfinite(pre_yaw_abs) and pre_yaw_abs <= float(near_grasp_yaw_threshold) + 1.0e-9)
+    near_shell = bool(horizon_xy_feasible and yaw_feasible)
+    return {
+        "grasp_probe_pre_xy_error": pre_xy,
+        "grasp_probe_pre_abs_yaw": pre_yaw_abs,
+        "grasp_probe_one_step_xy_feasible": one_step_xy_feasible,
+        "grasp_probe_horizon_xy_feasible": horizon_xy_feasible,
+        "grasp_probe_yaw_feasible": yaw_feasible,
+        "grasp_probe_near_basin_shell": near_shell,
+    }
+
+
+def _grasp_probe_inactive_reason(
+    *,
+    policy: str,
+    stage_ok: bool,
+    visibility_bucket: str,
+    has_error: bool,
+    finite_xy: bool,
+    shell_filter: str,
+    shell_fields: dict[str, object],
+) -> str:
+    if policy == "off":
+        return "off"
+    if not has_error or not finite_xy:
+        return "missing_privileged_error"
+    if str(visibility_bucket) == "prior_only":
+        return "prior_only_abstain"
+    if not stage_ok:
+        return "stage_not_grasp_align"
+    if shell_filter == "near_yaw_feasible":
+        if not bool(shell_fields.get("grasp_probe_horizon_xy_feasible", False)):
+            return "shell_xy_outside_horizon"
+        if not bool(shell_fields.get("grasp_probe_yaw_feasible", False)):
+            return "shell_yaw_blocked"
+    return "inactive"
 
 
 def _nan_grasp_probe_metric_fields() -> dict[str, object]:
@@ -405,6 +479,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2c_grasp_probe_xy_gain", type=float, default=0.35)
     parser.add_argument("--c2c_grasp_probe_max_xy_step", type=float, default=0.0030)
     parser.add_argument("--c2c_grasp_probe_horizon", type=int, default=1)
+    parser.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
+    parser.add_argument("--c2c_grasp_probe_window_mode", type=str, default="stage", choices=["stage", "forced_shell"])
+    parser.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="off", choices=["off", "near_yaw_feasible"])
     parser.add_argument("--near_grasp_xy_threshold", type=float, default=0.015)
     parser.add_argument("--near_grasp_yaw_threshold", type=float, default=0.08)
     parser.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
@@ -548,6 +625,9 @@ def evaluate(args: argparse.Namespace) -> float:
         "c2c_grasp_probe_xy_gain": float(args.c2c_grasp_probe_xy_gain),
         "c2c_grasp_probe_max_xy_step": float(args.c2c_grasp_probe_max_xy_step),
         "c2c_grasp_probe_horizon": int(args.c2c_grasp_probe_horizon),
+        "c2c_grasp_probe_flush_planner_queue": bool(args.c2c_grasp_probe_flush_planner_queue),
+        "c2c_grasp_probe_window_mode": str(args.c2c_grasp_probe_window_mode),
+        "c2c_grasp_probe_shell_filter": str(args.c2c_grasp_probe_shell_filter),
         "depth_error_trend": [],
     }
 
@@ -675,23 +755,61 @@ def evaluate(args: argparse.Namespace) -> float:
                     trace_entry.get("basin_recovery_visual_evidence_class", trace_entry.get("visual_observability_class", "prior_only"))
                 )
                 probe_stage = str(trace_entry.get("c2c_v2_stage", ""))
+                probe_shell_fields = _grasp_probe_shell_fields(
+                    probe_true_error_before,
+                    near_grasp_xy_threshold=float(args.near_grasp_xy_threshold),
+                    near_grasp_yaw_threshold=float(args.near_grasp_yaw_threshold),
+                    max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
+                    horizon_steps=int(max(1, int(args.c2c_grasp_probe_horizon))),
+                )
+                probe_has_error = bool(probe_true_error_before is not None)
+                probe_finite_xy = bool(
+                    probe_true_error_before is not None
+                    and np.all(np.isfinite(np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:2]))
+                )
+                probe_stage_ok = bool(
+                    probe_stage == "RING_GRASP_ALIGN"
+                    or args.c2c_grasp_probe_window_mode == "forced_shell"
+                )
+                probe_shell_ok = bool(
+                    args.c2c_grasp_probe_shell_filter == "off"
+                    or bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                )
                 probe_eligible = bool(
                     args.c2c_grasp_probe_policy == "replay_oracle_xy"
-                    and probe_stage == "RING_GRASP_ALIGN"
+                    and probe_stage_ok
                     and probe_visibility_bucket != "prior_only"
-                    and probe_true_error_before is not None
-                    and np.all(np.isfinite(np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:2]))
+                    and probe_has_error
+                    and probe_finite_xy
+                    and probe_shell_ok
                 )
                 trace_entry["grasp_probe_policy"] = str(args.c2c_grasp_probe_policy)
                 trace_entry["grasp_probe_visibility_bucket"] = probe_visibility_bucket
                 trace_entry["grasp_probe_active"] = bool(probe_eligible)
-                trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else ("prior_only_abstain" if probe_visibility_bucket == "prior_only" else "inactive")
+                trace_entry["grasp_probe_window_mode"] = str(args.c2c_grasp_probe_window_mode)
+                trace_entry["grasp_probe_shell_filter"] = str(args.c2c_grasp_probe_shell_filter)
+                trace_entry["grasp_probe_stage_ok"] = bool(probe_stage_ok)
+                trace_entry["grasp_probe_stage_source"] = "runtime_stage" if probe_stage == "RING_GRASP_ALIGN" else ("forced_shell" if probe_stage_ok else "not_grasp_align")
+                trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else _grasp_probe_inactive_reason(
+                    policy=str(args.c2c_grasp_probe_policy),
+                    stage_ok=bool(probe_stage_ok),
+                    visibility_bucket=probe_visibility_bucket,
+                    has_error=bool(probe_has_error),
+                    finite_xy=bool(probe_finite_xy),
+                    shell_filter=str(args.c2c_grasp_probe_shell_filter),
+                    shell_fields=probe_shell_fields,
+                )
                 trace_entry["grasp_probe_requested_horizon"] = int(max(1, int(args.c2c_grasp_probe_horizon)))
                 trace_entry["grasp_probe_horizon_steps_executed"] = 0
                 trace_entry["grasp_probe_close_locked"] = bool(probe_eligible)
+                trace_entry["grasp_probe_flush_planner_queue_requested"] = bool(args.c2c_grasp_probe_flush_planner_queue)
+                trace_entry["grasp_probe_queue_len_before"] = int(len(action_queue))
+                trace_entry["grasp_probe_queue_len_after"] = int(len(action_queue))
+                trace_entry["grasp_probe_queue_flushed"] = False
                 trace_entry["grasp_probe_pre_true_error_t"] = _jsonable_value(
                     np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4] if probe_true_error_before is not None else np.full((4,), np.nan, dtype=np.float32)
                 )
+                trace_entry.update(probe_shell_fields)
                 if probe_eligible:
                     probe_correction_local = _bounded_xy_oracle_probe_step(
                         np.asarray(probe_true_error_before, dtype=np.float32),
@@ -716,8 +834,9 @@ def evaluate(args: argparse.Namespace) -> float:
                         trace_entry["grasp_probe_frame_path"] = str(probe_path)
                         probe_frame_saved = True
                 else:
+                    inactive_local_command = world_delta_to_local(np.asarray(delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
                     trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(np.zeros(6, dtype=np.float32))
-                    trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+                    trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(inactive_local_command)
                     trace_entry["grasp_probe_control_gate_axes"] = list(c2c.get_last_trace().get("basin_control_gate_axes", []))
                     trace_entry["grasp_probe_pullback_ready_axes"] = list(c2c.get_last_trace().get("basin_pullback_ready_axes", []))
 
@@ -732,7 +851,9 @@ def evaluate(args: argparse.Namespace) -> float:
             if workspace_violation > 0.0:
                 workspace_violation_count += 1
                 workspace_violation_max = max(workspace_violation_max, float(workspace_violation))
-            trace_entry["pre_clip_action_world_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
+            post_clip_world_delta = _absolute_to_world_delta(abs_action, obs.gripper_pose)
+            trace_entry["pre_clip_action_world_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+            trace_entry["post_clip_action_world_6d"] = _jsonable_value(post_clip_world_delta)
             trace_entry["pre_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
             trace_entry["commanded_action_world_8d"] = _jsonable_value(abs_action.astype(np.float32))
 
@@ -788,8 +909,8 @@ def evaluate(args: argparse.Namespace) -> float:
                                 "raw_wrench": np.asarray(raw_force if raw_force is not None else np.zeros(6, dtype=np.float32), dtype=np.float32),
                                 "filtered_wrench": np.asarray(trace_entry.get("filtered_wrench", np.zeros(6, dtype=np.float32)), dtype=np.float32),
                                 "planner_action_world_6d": np.asarray(base_delta_action[:6], dtype=np.float32),
-                                "pre_clip_action_world_6d": np.asarray(abs_action[:6], dtype=np.float32),
-                                "post_clip_action_world_6d": np.asarray(trace_entry.get("post_clip_action_world_6d", abs_action[:6]), dtype=np.float32),
+                                "pre_clip_action_world_6d": np.asarray(trace_entry.get("pre_clip_action_world_6d", delta_action[:6]), dtype=np.float32),
+                                "post_clip_action_world_6d": np.asarray(trace_entry.get("post_clip_action_world_6d", post_clip_world_delta), dtype=np.float32),
                                 "pre_clip_action_absolute_6d": np.asarray(abs_action[:6], dtype=np.float32),
                                 "post_clip_action_absolute_6d": np.asarray(recovery_abs[:6], dtype=np.float32),
                                 "executed_action_world_6d": np.asarray(executed_action[:6], dtype=np.float32),
@@ -825,8 +946,8 @@ def evaluate(args: argparse.Namespace) -> float:
                             "raw_wrench": np.asarray(raw_force if raw_force is not None else np.zeros(6, dtype=np.float32), dtype=np.float32),
                             "filtered_wrench": np.asarray(trace_entry.get("filtered_wrench", np.zeros(6, dtype=np.float32)), dtype=np.float32),
                             "planner_action_world_6d": np.asarray(base_delta_action[:6], dtype=np.float32),
-                            "pre_clip_action_world_6d": np.asarray(abs_action[:6], dtype=np.float32),
-                            "post_clip_action_world_6d": np.asarray(trace_entry.get("post_clip_action_world_6d", abs_action[:6]), dtype=np.float32),
+                            "pre_clip_action_world_6d": np.asarray(trace_entry.get("pre_clip_action_world_6d", delta_action[:6]), dtype=np.float32),
+                            "post_clip_action_world_6d": np.asarray(trace_entry.get("post_clip_action_world_6d", post_clip_world_delta), dtype=np.float32),
                             "pre_clip_action_absolute_6d": np.asarray(abs_action[:6], dtype=np.float32),
                             "post_clip_action_absolute_6d": np.asarray(abs_action[:6], dtype=np.float32),
                             "executed_action_world_6d": np.asarray(executed_action[:6], dtype=np.float32),
@@ -846,6 +967,16 @@ def evaluate(args: argparse.Namespace) -> float:
 
             trace_entry["reward"] = float(reward)
             trace_entry["terminate"] = bool(terminate)
+            if (
+                bool(trace_entry.get("grasp_probe_active", False))
+                and int(trace_entry.get("grasp_probe_requested_horizon", 1) or 1) > 1
+                and bool(args.c2c_grasp_probe_flush_planner_queue)
+            ):
+                before_flush = int(len(action_queue))
+                action_queue.clear()
+                trace_entry["grasp_probe_queue_len_before"] = int(before_flush)
+                trace_entry["grasp_probe_queue_len_after"] = int(len(action_queue))
+                trace_entry["grasp_probe_queue_flushed"] = bool(before_flush > 0)
             if c2c is not None:
                 last_trace = c2c.get_last_trace()
                 trace_entry["depth_conf"] = float(last_trace.get("localizer_confidence", 0.0))
@@ -862,10 +993,10 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["invalid_action_flag"] = bool(last_trace.get("invalid_action_flag", trace_entry["invalid_action"]))
                 trace_entry["planner_reaches_precontact"] = bool(last_trace.get("planner_reaches_precontact", trace_entry["planner_reaches_precontact"]))
                 trace_entry["planner_reaches_preinsert"] = bool(last_trace.get("planner_reaches_preinsert", trace_entry["planner_reaches_preinsert"]))
-                trace_entry["pre_clip_action_world_6d"] = _jsonable_value(np.asarray(last_trace.get("pre_clip_action_world_6d", abs_action[:6]), dtype=np.float32))
-                trace_entry["post_clip_action_world_6d"] = _jsonable_value(np.asarray(last_trace.get("post_clip_action_world_6d", abs_action[:6]), dtype=np.float32))
+                trace_entry["pre_clip_action_world_6d"] = _jsonable_value(np.asarray(last_trace.get("pre_clip_action_world_6d", delta_action[:6]), dtype=np.float32))
+                trace_entry["post_clip_action_world_6d"] = _jsonable_value(np.asarray(last_trace.get("post_clip_action_world_6d", post_clip_world_delta), dtype=np.float32))
                 trace_entry["pre_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
-                trace_entry["post_clip_action_absolute_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+                trace_entry["post_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
                 trace_entry["executed_action_world_6d"] = _jsonable_value(np.asarray(executed_action[:6], dtype=np.float32))
                 trace_entry["executed_action_world_8d"] = _jsonable_value(np.asarray(executed_action, dtype=np.float32))
                 trace_entry["planner_action_world"] = _jsonable_value(np.asarray(base_delta_action[:6], dtype=np.float32))
@@ -901,7 +1032,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["uses_privileged_label_for_eval"] = bool(args.dump_runtime_obs and args.capture_failure_target_pose)
             else:
                 trace_entry["pre_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
-                trace_entry["post_clip_action_world_6d"] = _jsonable_value(np.asarray(delta_action[:6], dtype=np.float32))
+                trace_entry["post_clip_action_world_6d"] = _jsonable_value(post_clip_world_delta)
                 trace_entry["post_clip_action_absolute_6d"] = _jsonable_value(np.asarray(abs_action[:6], dtype=np.float32))
                 trace_entry["executed_action_world_6d"] = _jsonable_value(np.asarray(executed_action[:6], dtype=np.float32))
                 trace_entry["planner_action_world"] = _jsonable_value(np.asarray(base_delta_action[:6], dtype=np.float32))
@@ -914,10 +1045,14 @@ def evaluate(args: argparse.Namespace) -> float:
                 probe_after_pack = _episode_privileged_frame_pack(task, obs)
                 probe_true_error_after = _grasp_teacher_error_from_pack(probe_after_pack, grasp_spec)
                 trace_entry["grasp_probe_horizon_records"] = []
+                trace_entry["grasp_probe_horizon_stage_sequence"] = []
+                trace_entry["grasp_probe_horizon_owner_sequence"] = []
                 if probe_true_error_after is not None and probe_true_error_before is not None:
                     pre_probe = np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4]
                     post_probe = np.asarray(probe_true_error_after, dtype=np.float32).reshape(-1)[:4]
                     visibility_bucket = str(trace_entry.get("grasp_probe_visibility_bucket", "prior_only"))
+                    horizon_stage = str(trace_entry.get("c2c_v2_stage", "unknown"))
+                    horizon_owner = str(trace_entry.get("phase_owner", trace_entry.get("c2c_v2_owner", "unknown")))
                     metric_fields = _grasp_probe_metric_fields(
                         pre_probe,
                         post_probe,
@@ -930,9 +1065,13 @@ def evaluate(args: argparse.Namespace) -> float:
                     trace_entry["grasp_probe_post_true_error_t"] = _jsonable_value(post_probe)
                     trace_entry.update(metric_fields)
                     trace_entry["grasp_probe_horizon_steps_executed"] = 1
+                    trace_entry["grasp_probe_horizon_stage_sequence"].append(horizon_stage)
+                    trace_entry["grasp_probe_horizon_owner_sequence"].append(horizon_owner)
                     trace_entry["grasp_probe_horizon_records"].append(
                         {
                             "horizon_step": 1,
+                            "stage": horizon_stage,
+                            "owner": horizon_owner,
                             "pre_true_error_t": _jsonable_value(pre_probe),
                             "post_true_error_t": _jsonable_value(post_probe),
                             "applied_xy_step_local_6d": trace_entry.get("grasp_probe_applied_xy_step_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32))),
@@ -1005,9 +1144,13 @@ def evaluate(args: argparse.Namespace) -> float:
                             close_ready_yaw_threshold=float(args.close_ready_yaw_threshold),
                         )
                         trace_entry["grasp_probe_horizon_steps_executed"] = int(trace_entry["grasp_probe_horizon_steps_executed"]) + 1
+                        trace_entry["grasp_probe_horizon_stage_sequence"].append(horizon_stage)
+                        trace_entry["grasp_probe_horizon_owner_sequence"].append(horizon_owner)
                         trace_entry["grasp_probe_horizon_records"].append(
                             {
                                 "horizon_step": int(trace_entry["grasp_probe_horizon_steps_executed"]),
+                                "stage": horizon_stage,
+                                "owner": horizon_owner,
                                 "pre_true_error_t": _jsonable_value(step_pre),
                                 "post_true_error_t": _jsonable_value(step_post),
                                 "applied_xy_step_local_6d": _jsonable_value(step_correction_local),
@@ -1018,9 +1161,9 @@ def evaluate(args: argparse.Namespace) -> float:
                             }
                         )
                         final_probe = step_post.copy()
-                        action_queue.clear()
 
                     trace_entry["grasp_probe_horizon_final_true_error_t"] = _jsonable_value(final_probe)
+                    trace_entry["grasp_probe_queue_len_after"] = int(len(action_queue))
                     trace_entry.update(
                         _prefix_grasp_probe_fields(
                             _grasp_probe_metric_fields(

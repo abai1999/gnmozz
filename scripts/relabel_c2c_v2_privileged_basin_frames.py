@@ -28,6 +28,15 @@ from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basi
 from prismatic.robot.stage_target_provider import apply_yaw_symmetry_to_delta, build_phase1_teacher_targets, load_phase1_grasp_spec, pose_delta_local_between
 from prismatic.robot.residual_transforms import world_delta_to_local
 
+NEAR_GRASP_XY_THRESHOLD = 0.015
+NEAR_GRASP_YAW_THRESHOLD = 0.08
+CLOSE_READY_XY_THRESHOLD = 0.005
+CLOSE_READY_YAW_THRESHOLD = 0.03
+CLOSE_READY_Z_THRESHOLD = 0.010
+DEFAULT_PULLBACK_HORIZON = 3
+DEFAULT_MAX_XY_STEP = 0.003
+COARSE_PULLBACK_XY_THRESHOLD = 0.060
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -110,6 +119,80 @@ def _visual_record(trace_row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _yaw_observability_class(trace_row: Mapping[str, Any], visual_record: Mapping[str, Any]) -> str:
+    """Classify yaw observability from non-privileged runtime evidence only."""
+    if bool(trace_row.get("wrist_is_occluded", False)):
+        return "unobservable"
+    conf = float(visual_record.get("frame_confidence", 0.0) or 0.0)
+    obs = float(visual_record.get("frame_observability", 0.0) or 0.0)
+    axis = float(visual_record.get("frame_axis_strength", 0.0) or 0.0)
+    if conf >= 0.50 and obs >= 0.10 and axis >= 0.80:
+        return "observable"
+    if conf >= 0.05 or obs >= 0.005 or bool(visual_record.get("wide_ring_visible", False)):
+        return "ambiguous"
+    return "unobservable"
+
+
+def _finite_residual(row: Mapping[str, Any]) -> bool:
+    return all(np.isfinite(float(row.get(key, float("nan")))) for key in ("privileged_dx", "privileged_dy", "privileged_dz", "privileged_dyaw"))
+
+
+def _near_basin_shell_from_error(row: Mapping[str, Any]) -> bool:
+    xy = float(row.get("xy_error", float("nan")))
+    yaw = float(row.get("yaw_abs", float("nan")))
+    return bool(
+        np.isfinite(xy)
+        and np.isfinite(yaw)
+        and xy <= NEAR_GRASP_XY_THRESHOLD + DEFAULT_MAX_XY_STEP * DEFAULT_PULLBACK_HORIZON + 1.0e-9
+        and yaw <= NEAR_GRASP_YAW_THRESHOLD + 1.0e-9
+    )
+
+
+def _xy_contracted(row: Mapping[str, Any]) -> bool:
+    xy = float(row.get("xy_error", float("nan")))
+    next_xy = float(row.get("next_xy_error", float("nan")))
+    return bool(np.isfinite(xy) and np.isfinite(next_xy) and next_xy < xy - 1.0e-9)
+
+
+def _overshoot(row: Mapping[str, Any]) -> bool:
+    for key in ("dx", "dy", "dyaw"):
+        now = float(row.get("true_basin_error_t", {}).get(key, float("nan")))
+        nxt = float(row.get("true_basin_error_t_plus_1", {}).get(key, float("nan")))
+        if np.isfinite(now) and np.isfinite(nxt) and np.sign(now) != np.sign(nxt) and abs(nxt) >= abs(now):
+            return True
+    return False
+
+
+def _takeover_tier(row: Mapping[str, Any]) -> str:
+    if not _finite_residual(row):
+        return "invalid"
+    if str(row.get("visual_observability_class", "prior_only")) == "prior_only":
+        return "abstain_prior_only"
+    if bool(row.get("close_ready_ready", False)):
+        return "close_ready"
+    if bool(row.get("micro_entry_ready", False)):
+        return "micro_entry_ready"
+    if bool(row.get("near_basin_shell", False)):
+        return "near_basin_shell"
+    xy = float(row.get("xy_error", float("nan")))
+    if np.isfinite(xy) and xy <= COARSE_PULLBACK_XY_THRESHOLD and _xy_contracted(row):
+        return "coarse_pullback_candidate"
+    return "outside_takeover"
+
+
+def _label_invalid_reason(row: Mapping[str, Any], *, precision_row: bool) -> str:
+    if not precision_row:
+        return "not_precision_stage"
+    if _finite_residual(row):
+        return ""
+    missing = [
+        key
+        for key in ("privileged_dx", "privileged_dy", "privileged_dz", "privileged_dyaw")
+        if not np.isfinite(float(row.get(key, float("nan"))))
+    ]
+    return "missing_" + "+".join(missing)
+
+
 def _normalized_estimated_basin_error(trace_row: Mapping[str, Any]) -> dict[str, Any]:
     est = trace_row.get("estimated_basin_error") or {}
     if not isinstance(est, Mapping):
@@ -188,18 +271,15 @@ def _frame_label_fields(
     privileged_yaw_abs = float(abs(raw_residual[5])) if raw_residual.size >= 6 else float("nan")
     privileged_z = float(raw_residual[2]) if raw_residual.size >= 3 else float("nan")
     z_semantics = "descend_progress_to_grasp_frame" if skill_type == "precision_grasp" else "axis_alignment_depth"
-    visual_obs = classify_visual_evidence_for_basin(_visual_record(trace_row))
+    visual_record = _visual_record(trace_row)
+    visual_obs = classify_visual_evidence_for_basin(visual_record)
+    yaw_obs_class = "unobservable" if visual_obs.value == "prior_only" else _yaw_observability_class(trace_row, visual_record)
     try:
         skill_spec = spec.get_skill(skill_name)
     except Exception:
         skill_spec = None
     requires_yaw_observability = bool(getattr(skill_spec, "requires_yaw_observability", False)) if precision_row else False
-    yaw_observable = bool(
-        precision_row
-        and visual_obs == visual_obs.__class__.VISUAL_OBSERVABLE
-        and np.isfinite(privileged_yaw_abs)
-        and privileged_yaw_abs >= 0.01
-    )
+    yaw_observable = bool(precision_row and yaw_obs_class == "observable")
     reacquire_needed = bool(precision_row and visual_obs == visual_obs.__class__.PRIOR_ONLY)
     pullback_allowed = bool(precision_row and not reacquire_needed)
     axis_gate_policy = {
@@ -208,20 +288,29 @@ def _frame_label_fields(
         "z": "diagnostic_only" if pullback_allowed else "abstain",
         "yaw": "trusted_control" if yaw_observable else "abstain",
     }
+    near_basin_shell = bool(
+        precision_row
+        and not reacquire_needed
+        and np.isfinite(privileged_xy)
+        and np.isfinite(privileged_yaw_abs)
+        and privileged_xy <= NEAR_GRASP_XY_THRESHOLD + DEFAULT_MAX_XY_STEP * DEFAULT_PULLBACK_HORIZON + 1.0e-9
+        and privileged_yaw_abs <= NEAR_GRASP_YAW_THRESHOLD + 1.0e-9
+    )
     micro_entry_ready = bool(
         pullback_allowed
-        and in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))
+        and in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]), xy_threshold=NEAR_GRASP_XY_THRESHOLD, yaw_threshold=NEAR_GRASP_YAW_THRESHOLD)
         and (not requires_yaw_observability or yaw_observable)
     )
     close_ready_ready = bool(
         pullback_allowed
-        and in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))
+        and in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]), xy_threshold=CLOSE_READY_XY_THRESHOLD, yaw_threshold=CLOSE_READY_YAW_THRESHOLD)
+        and abs(float(privileged_z)) <= CLOSE_READY_Z_THRESHOLD
         and (not requires_yaw_observability or yaw_observable)
     )
     micro_entry_block_reason_parts = []
     if precision_row and reacquire_needed:
         micro_entry_block_reason_parts.append("prior_only")
-    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= 0.015):
+    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= NEAR_GRASP_XY_THRESHOLD):
         micro_entry_block_reason_parts.append("xy")
     if precision_row and requires_yaw_observability and not yaw_observable:
         micro_entry_block_reason_parts.append("yaw")
@@ -229,9 +318,9 @@ def _frame_label_fields(
     close_ready_block_reason_parts = []
     if precision_row and reacquire_needed:
         close_ready_block_reason_parts.append("prior_only")
-    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= 0.005):
+    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= CLOSE_READY_XY_THRESHOLD):
         close_ready_block_reason_parts.append("xy")
-    if precision_row and abs(float(privileged_z)) > 0.01:
+    if precision_row and abs(float(privileged_z)) > CLOSE_READY_Z_THRESHOLD:
         close_ready_block_reason_parts.append("z")
     if precision_row and requires_yaw_observability and not yaw_observable:
         close_ready_block_reason_parts.append("yaw")
@@ -256,7 +345,10 @@ def _frame_label_fields(
     }
     failure_bucket = failure_morphology_bucket(bucket_source)
 
-    return {
+    label_valid = bool(precision_row and np.all(np.isfinite(raw_residual[[0, 1, 2, 5]])))
+    label_invalid_reason = "" if label_valid else ("not_precision_stage" if not precision_row else "missing_privileged_residual")
+    record = {
+        "schema_version": "frame_residual_v2",
         "task_name": task_name,
         "frame_contract": {
             "target_frame": target_frame,
@@ -270,9 +362,10 @@ def _frame_label_fields(
             "episode_idx": int(trace_row.get("episode_idx", trace_row.get("episode_index", -1))),
             "step_idx": int(trace_row.get("step", trace_row.get("step_idx", -1))),
             "visual_observability_class": visual_obs.value,
-            "frame_confidence": float(_visual_record(trace_row)["frame_confidence"]),
-            "frame_observability": float(_visual_record(trace_row)["frame_observability"]),
-            "frame_axis_strength": float(_visual_record(trace_row)["frame_axis_strength"]),
+            "frame_confidence": float(visual_record["frame_confidence"]),
+            "frame_observability": float(visual_record["frame_observability"]),
+            "frame_axis_strength": float(visual_record["frame_axis_strength"]),
+            "yaw_observability_class": str(yaw_obs_class),
             "source_phase_owner": str(trace_row.get("phase_owner", trace_row.get("c2c_v2_owner", ""))),
             "source_basin_recovery_mode": str(trace_row.get("basin_recovery_mode", "")),
             "source_localizer_abstained": bool(trace_row.get("localizer_abstained", False)),
@@ -305,8 +398,14 @@ def _frame_label_fields(
         "xy_error": privileged_xy,
         "yaw_abs": privileged_yaw_abs,
         "yaw_observable": bool(yaw_observable),
+        "yaw_observability_class": str(yaw_obs_class),
         "reacquire_needed": bool(reacquire_needed),
         "pullback_allowed": bool(pullback_allowed),
+        "near_basin_shell": bool(near_basin_shell),
+        "coarse_pullback_candidate": False,
+        "takeover_tier": "pending_next_error",
+        "label_valid": bool(label_valid),
+        "label_invalid_reason": str(label_invalid_reason),
         "micro_entry_ready": bool(micro_entry_ready),
         "micro_entry_block_reason": str(micro_entry_block_reason),
         "close_ready_ready": bool(close_ready_ready),
@@ -322,8 +421,8 @@ def _frame_label_fields(
             "local_correction_local_6d": np.asarray(trace_row.get("local_correction_local_6d", local_residual.tolist()), dtype=np.float32).reshape(-1)[:6].tolist(),
             "planner_local_delta_6d": planner_local.tolist(),
         },
-        "near_grasp_basin": bool(in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))),
-        "close_ready_basin": bool(in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]))),
+        "near_grasp_basin": bool(in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]), xy_threshold=NEAR_GRASP_XY_THRESHOLD, yaw_threshold=NEAR_GRASP_YAW_THRESHOLD)),
+        "close_ready_basin": bool(in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]), xy_threshold=CLOSE_READY_XY_THRESHOLD, yaw_threshold=CLOSE_READY_YAW_THRESHOLD)),
         "near_insert_basin": False,
         "true_basin_error_t_plus_1": {
             "dx": float("nan"),
@@ -357,10 +456,16 @@ def _frame_label_fields(
         "source_basin_recovery_mode": str(trace_row.get("basin_recovery_mode", "")),
         "source_c2c_stage": str(trace_row.get("c2c_v2_stage", "")),
         "source_localizer_abstained": bool(trace_row.get("localizer_abstained", False)),
-        "source_frame_confidence": float(_visual_record(trace_row)["frame_confidence"]),
-        "source_frame_observability": float(_visual_record(trace_row)["frame_observability"]),
-        "source_frame_axis_strength": float(_visual_record(trace_row)["frame_axis_strength"]),
+        "source_frame_confidence": float(visual_record["frame_confidence"]),
+        "source_frame_observability": float(visual_record["frame_observability"]),
+        "source_frame_axis_strength": float(visual_record["frame_axis_strength"]),
     }
+    record["takeover_tier"] = _takeover_tier(record)
+    record["coarse_pullback_candidate"] = bool(record["takeover_tier"] == "coarse_pullback_candidate")
+    record["contraction"] = False
+    record["xy_contracted"] = False
+    record["overshoot"] = False
+    return record
 
 
 def _plot_episode(ep_tag: str, rows: list[dict[str, Any]], output_dir: Path) -> None:
@@ -470,6 +575,14 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
                         "dz": float(next_record["privileged_dz"]),
                         "dyaw": float(next_record["privileged_dyaw"]),
                     }
+                record["contraction"] = bool(_xy_contracted(record))
+                record["xy_contracted"] = bool(_xy_contracted(record))
+                record["overshoot"] = bool(_overshoot(record))
+                record["near_basin_shell"] = bool(_near_basin_shell_from_error(record))
+                record["takeover_tier"] = _takeover_tier(record)
+                record["coarse_pullback_candidate"] = bool(record["takeover_tier"] == "coarse_pullback_candidate")
+                record["label_invalid_reason"] = _label_invalid_reason(record, precision_row=bool(record.get("skill_type") in {"precision_grasp", "precision_align"}))
+                record["label_valid"] = bool(record["label_invalid_reason"] == "")
                 all_rows.append(record)
                 key = (str(record["stage_name"]), str(record["skill_name"]), str(record["visual_observability_class"]))
                 per_group[key].append(record)
@@ -479,7 +592,11 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
         raise RuntimeError(f"No relabeled rows found under {eval_root}")
 
     out_jsonl = output_dir / "basin_residual_labels.jsonl"
+    out_v2_jsonl = output_dir / "frame_residual_v2.jsonl"
     with open(out_jsonl, "w", encoding="utf-8") as handle:
+        for row in all_rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    with open(out_v2_jsonl, "w", encoding="utf-8") as handle:
         for row in all_rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
@@ -557,6 +674,10 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
                 "num_rows": len(rows),
                 "near_grasp_rate": float(np.mean([bool(r["near_grasp_basin"]) for r in rows])),
                 "close_ready_rate": float(np.mean([bool(r["close_ready_basin"]) for r in rows])),
+                "near_basin_shell_rate": float(np.mean([bool(r["near_basin_shell"]) for r in rows])),
+                "coarse_pullback_candidate_rate": float(np.mean([bool(r["coarse_pullback_candidate"]) for r in rows])),
+                "takeover_tier_counts": dict(Counter(str(r["takeover_tier"]) for r in rows)),
+                "yaw_observability_counts": dict(Counter(str(r["yaw_observability_class"]) for r in rows)),
                 "mean_xy_error": float(np.mean([float(r["xy_error"]) for r in rows])),
                 "mean_yaw_abs": float(np.mean([float(r["yaw_abs"]) for r in rows])),
             }
@@ -566,6 +687,43 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
     counts["rows"] = len(all_rows)
     counts["near_grasp_hits"] = int(sum(1 for r in all_rows if bool(r["near_grasp_basin"])))
     counts["close_ready_hits"] = int(sum(1 for r in all_rows if bool(r["close_ready_basin"])))
+    counts["near_basin_shell_rows"] = int(sum(1 for r in all_rows if bool(r["near_basin_shell"])))
+    counts["coarse_pullback_candidate_rows"] = int(sum(1 for r in all_rows if bool(r["coarse_pullback_candidate"])))
+    counts["micro_entry_ready_rows"] = int(sum(1 for r in all_rows if bool(r["micro_entry_ready"])))
+    counts["yaw_observable_rows"] = int(sum(1 for r in all_rows if str(r["yaw_observability_class"]) == "observable"))
+    counts["label_valid_rows"] = int(sum(1 for r in all_rows if bool(r["label_valid"])))
+
+    manifest = {
+        "schema_version": "frame_residual_v2",
+        "task_name": task_name,
+        "rows": len(all_rows),
+        "jsonl": str(out_v2_jsonl),
+        "legacy_jsonl": str(out_jsonl),
+        "inputs": {
+            "eval_root": str(eval_root),
+            "trace_dir": str(trace_dir),
+            "runtime_observations_dir": str(obs_dir),
+        },
+        "label_columns": [
+            "frame_contract",
+            "obs_t",
+            "planner_prior",
+            "true_basin_error_t",
+            "true_basin_error_t_plus_1",
+            "yaw_observability_class",
+            "takeover_tier",
+            "contraction",
+            "overshoot",
+        ],
+        "runtime_invariants": {
+            "uses_privileged_target": False,
+            "uses_privileged_runtime": False,
+            "uses_privileged_label": True,
+            "uses_rlbench_mask_runtime": False,
+        },
+    }
+    manifest_path = output_dir / "frame_residual_v2_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
     report = {
         "task_name": task_name,
@@ -573,6 +731,8 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
         "output_dir": str(output_dir),
         "rows": len(all_rows),
         "counts": dict(counts),
+        "frame_residual_v2_jsonl": str(out_v2_jsonl),
+        "frame_residual_v2_manifest": str(manifest_path),
         "axis_summary": axis_summary,
         "group_summary": group_summary,
         "runtime_invariants": {
@@ -605,13 +765,17 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
     for item in group_summary:
         md_lines.append(
             f"- {item['stage_name']} / {item['skill_name']} / {item['visual_observability_class']}: "
-            f"rows={item['num_rows']}, near_grasp={item['near_grasp_rate']:.3f}, close_ready={item['close_ready_rate']:.3f}"
+            f"rows={item['num_rows']}, near_grasp={item['near_grasp_rate']:.3f}, "
+            f"near_shell={item['near_basin_shell_rate']:.3f}, coarse={item['coarse_pullback_candidate_rate']:.3f}, "
+            f"close_ready={item['close_ready_rate']:.3f}"
         )
     out_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
     print(out_json)
     print(out_md)
     print(out_jsonl)
+    print(out_v2_jsonl)
+    print(manifest_path)
     print(json.dumps(report, indent=2, sort_keys=True))
     return report
 

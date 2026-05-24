@@ -220,6 +220,8 @@ def _shell_summary(
             "horizon_near_grasp_after_rate": float(np.mean([_probe_bool(r, "near_grasp_after", horizon=True) for r in subset])) if subset else 0.0,
             "horizon_micro_entry_ready_after_rate": float(np.mean([_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in subset])) if subset else 0.0,
             "horizon_xy_contraction_rate": _horizon_xy_contraction_rate(subset),
+            "one_step_overshoot_rate": float(np.mean([_probe_bool(r, "overshoot") for r in subset])) if subset else 0.0,
+            "horizon_overshoot_rate": float(np.mean([_probe_bool(r, "overshoot", horizon=True) for r in subset])) if subset else 0.0,
             "overshoot_rate": float(np.mean([_probe_bool(r, "overshoot", horizon=True) for r in subset])) if subset else 0.0,
         }
 
@@ -231,11 +233,148 @@ def _shell_summary(
     }
 
 
+def _yaw_blocked_rate_within_horizon_xy_feasible(
+    rows: list[dict[str, Any]],
+    *,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float,
+    max_xy_step: float,
+    horizon_steps: int,
+) -> float:
+    feasible = [
+        r for r in _active_probe_rows(rows)
+        if _xy_feasible(r, near_grasp_xy_threshold=near_grasp_xy_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps)
+    ]
+    if not feasible:
+        return 0.0
+    blocked = [
+        not _yaw_feasible(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold)
+        for r in feasible
+    ]
+    return float(np.mean(blocked)) if blocked else 0.0
+
+
+def _ring_grasp_align_dwell_steps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_episode = _group_rows(rows, ("episode_idx",))
+    dwell = [
+        sum(1 for r in subset if _row_group_value(r, "c2c_v2_stage", "") == "RING_GRASP_ALIGN")
+        for _, subset in by_episode.items()
+    ]
+    return {
+        "total": int(sum(dwell)),
+        "mean_per_episode": float(np.mean(dwell)) if dwell else 0.0,
+        "max_per_episode": int(max(dwell, default=0)),
+    }
+
+
+def _recover_preempt_rate_before_first_probe_step(rows: list[dict[str, Any]]) -> float:
+    by_episode = _group_rows(rows, ("episode_idx",))
+    flags: list[bool] = []
+    for _, subset in by_episode.items():
+        ordered = sorted(subset, key=lambda r: int(r.get("step", r.get("step_idx", -1)) or -1))
+        active_indices = [idx for idx, row in enumerate(ordered) if bool(row.get("grasp_probe_active", False))]
+        limit = active_indices[0] if active_indices else len(ordered)
+        prefix = ordered[:limit]
+        flags.append(any(_row_group_value(r, "c2c_v2_stage", "") == "RECOVER" for r in prefix))
+    return float(np.mean(flags)) if flags else 0.0
+
+
+def _queue_protocol_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    active = _active_probe_rows(rows)
+    flushed = [r for r in active if bool(r.get("grasp_probe_queue_flushed", False))]
+    retained = [r for r in active if not bool(r.get("grasp_probe_queue_flushed", False))]
+    flushed_rate = _horizon_xy_contraction_rate(flushed)
+    retained_rate = _horizon_xy_contraction_rate(retained)
+    return {
+        "queue_flushed_rate": float(len(flushed) / len(active)) if active else 0.0,
+        "mean_queue_len_before": float(np.mean([_safe_float(r.get("grasp_probe_queue_len_before", 0.0)) for r in active])) if active else 0.0,
+        "mean_queue_len_after": float(np.mean([_safe_float(r.get("grasp_probe_queue_len_after", 0.0)) for r in active])) if active else 0.0,
+        "flushed_horizon_xy_contraction_rate": float(flushed_rate),
+        "retained_horizon_xy_contraction_rate": float(retained_rate),
+        "queue_flush_ablation_delta": float(flushed_rate - retained_rate) if flushed and retained else 0.0,
+    }
+
+
 def _row_group_value(row: Mapping[str, Any], key: str, default: str = "") -> str:
     value = row.get(key, default)
     if value is None:
         return default
     return str(value)
+
+
+def _probe_pre_xy(row: Mapping[str, Any]) -> float:
+    if "grasp_probe_pre_xy_error" in row:
+        return _safe_float(row.get("grasp_probe_pre_xy_error", float("nan")), float("nan"))
+    return _xy_norm(_trace_row_error(row, "grasp_probe_pre_true_error_t")[:2])
+
+
+def _probe_yaw_observable(row: Mapping[str, Any], *, near_grasp_yaw_threshold: float) -> bool:
+    if "grasp_probe_yaw_feasible" in row:
+        return bool(row.get("grasp_probe_yaw_feasible", False))
+    return _yaw_feasible(row, near_grasp_yaw_threshold=near_grasp_yaw_threshold)
+
+
+def _probe_horizon_xy_feasible(
+    row: Mapping[str, Any],
+    *,
+    near_grasp_xy_threshold: float,
+    max_xy_step: float,
+    horizon_steps: int,
+) -> bool:
+    if "grasp_probe_horizon_xy_feasible" in row:
+        return bool(row.get("grasp_probe_horizon_xy_feasible", False))
+    return _xy_feasible(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    )
+
+
+def _probe_near_basin_shell(
+    row: Mapping[str, Any],
+    *,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float,
+    max_xy_step: float,
+    horizon_steps: int,
+) -> bool:
+    if "grasp_probe_near_basin_shell" in row:
+        return bool(row.get("grasp_probe_near_basin_shell", False))
+    return bool(
+        _probe_horizon_xy_feasible(
+            row,
+            near_grasp_xy_threshold=near_grasp_xy_threshold,
+            max_xy_step=max_xy_step,
+            horizon_steps=horizon_steps,
+        )
+        and _probe_yaw_observable(row, near_grasp_yaw_threshold=near_grasp_yaw_threshold)
+    )
+
+
+def _probe_coarse_pullback_candidate(
+    row: Mapping[str, Any],
+    *,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float = 0.08,
+    max_xy_step: float,
+    horizon_steps: int,
+) -> bool:
+    if bool(row.get("grasp_probe_coarse_pullback_candidate", False)):
+        return True
+    if _row_group_value(row, "grasp_probe_visibility_bucket", "prior_only") == "prior_only":
+        return False
+    if _probe_near_basin_shell(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    ):
+        return False
+    pre_xy = _probe_pre_xy(row)
+    near_shell_xy = float(near_grasp_xy_threshold) + float(max_xy_step) * float(max(1, int(horizon_steps)))
+    return bool(np.isfinite(pre_xy) and near_shell_xy < pre_xy <= 0.060)
 
 
 def _group_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> dict[tuple[str, ...], list[dict[str, Any]]]:
@@ -349,8 +488,24 @@ def _bucket_summary(
         "partial_observable_count": int(len(partial)),
         "prior_only_count": int(len(prior_only)),
         "active_xy_rows": int(len(active_xy)),
+        "near_basin_shell_rows": int(sum(_probe_near_basin_shell(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
+        "coarse_pullback_candidate_rows": int(sum(_probe_coarse_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
+        "yaw_feasible_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in rows)),
+        "yaw_observable_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in rows)),
+        "horizon_xy_feasible_rows": int(sum(_probe_horizon_xy_feasible(r, near_grasp_xy_threshold=near_grasp_xy_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
+        "micro_entry_ready_rows": int(sum(_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in rows)),
         "max_requested_horizon": int(max([int(r.get("grasp_probe_requested_horizon", 1) or 1) for r in active], default=1)),
         "mean_horizon_steps_executed": float(np.mean([int(r.get("grasp_probe_horizon_steps_executed", 0) or 0) for r in active])) if active else 0.0,
+        "yaw_blocked_rate_within_horizon_xy_feasible": _yaw_blocked_rate_within_horizon_xy_feasible(
+            rows,
+            near_grasp_xy_threshold=near_grasp_xy_threshold,
+            near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+            max_xy_step=max_xy_step,
+            horizon_steps=horizon_steps,
+        ),
+        "recover_preempt_rate_before_first_probe_step": _recover_preempt_rate_before_first_probe_step(rows),
+        "ring_grasp_align_dwell_steps": _ring_grasp_align_dwell_steps(rows),
+        "queue_protocol": _queue_protocol_summary(rows),
         "feasible_shells": _shell_summary(
             rows,
             near_grasp_xy_threshold=near_grasp_xy_threshold,
@@ -360,6 +515,7 @@ def _bucket_summary(
         ),
         "active_gate_axes_hist": dict(Counter(_hist_key(r.get("grasp_probe_control_gate_axes", [])) for r in active)),
         "active_pullback_axes_hist": dict(Counter(_hist_key(r.get("grasp_probe_pullback_ready_axes", [])) for r in active)),
+        "stage_source_counts": dict(Counter(_row_group_value(r, "grasp_probe_stage_source", "") for r in rows)),
         "reason_counts": dict(Counter(_row_group_value(r, "grasp_probe_reason", "") for r in rows)),
     }
 
@@ -423,6 +579,27 @@ def audit(
             ),
         })
 
+    by_episode_failure_bucket: list[dict[str, Any]] = []
+    episode_bucket_groups = list(_group_rows(probe_rows, ("episode_idx", "failure_bucket")).items())
+    episode_bucket_groups.sort(
+        key=lambda item: (
+            int(item[0][0]) if str(item[0][0]).lstrip("-").isdigit() else -1,
+            str(item[0][1]),
+        )
+    )
+    for key, subset in episode_bucket_groups:
+        by_episode_failure_bucket.append({
+            "episode_idx": int(key[0]) if str(key[0]).lstrip("-").isdigit() else -1,
+            "failure_bucket": key[1],
+            **_bucket_summary(
+                subset,
+                near_grasp_xy_threshold=near_grasp_xy_threshold,
+                near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+                max_xy_step=max_xy_step,
+                horizon_steps=horizon_steps,
+            ),
+        })
+
     overall = {
         "num_rows": int(len(rows)),
         "probe_rows": int(len(probe_rows)),
@@ -449,6 +626,22 @@ def audit(
         "reacquire_rate": float(np.mean([_row_group_value(r, "grasp_probe_reason", "") == "prior_only_abstain" or _row_group_value(r, "grasp_probe_reason", "") == "inactive" for r in probe_rows])) if probe_rows else 0.0,
         "max_requested_horizon": int(max([int(r.get("grasp_probe_requested_horizon", 1) or 1) for r in active_rows], default=1)),
         "mean_horizon_steps_executed": float(np.mean([int(r.get("grasp_probe_horizon_steps_executed", 0) or 0) for r in active_rows])) if active_rows else 0.0,
+        "near_basin_shell_rows": int(sum(_probe_near_basin_shell(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
+        "coarse_pullback_candidate_rows": int(sum(_probe_coarse_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
+        "yaw_feasible_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in probe_rows)),
+        "yaw_observable_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in probe_rows)),
+        "horizon_xy_feasible_rows": int(sum(_probe_horizon_xy_feasible(r, near_grasp_xy_threshold=near_grasp_xy_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
+        "micro_entry_ready_rows": int(sum(_probe_bool(r, "micro_entry_ready_after", horizon=True) for r in probe_rows)),
+        "yaw_blocked_rate_within_horizon_xy_feasible": _yaw_blocked_rate_within_horizon_xy_feasible(
+            probe_rows,
+            near_grasp_xy_threshold=near_grasp_xy_threshold,
+            near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+            max_xy_step=max_xy_step,
+            horizon_steps=horizon_steps,
+        ),
+        "recover_preempt_rate_before_first_probe_step": _recover_preempt_rate_before_first_probe_step(probe_rows),
+        "ring_grasp_align_dwell_steps": _ring_grasp_align_dwell_steps(probe_rows),
+        "queue_protocol": _queue_protocol_summary(probe_rows),
         "feasible_shells": _shell_summary(
             probe_rows,
             near_grasp_xy_threshold=near_grasp_xy_threshold,
@@ -469,6 +662,7 @@ def audit(
             "dyaw": _mean_step_delta(active_rows, "yaw"),
         },
         "reason_counts": dict(Counter(_row_group_value(r, "grasp_probe_reason", "") for r in probe_rows)),
+        "stage_source_counts": dict(Counter(_row_group_value(r, "grasp_probe_stage_source", "") for r in probe_rows)),
     }
 
     return {
@@ -482,6 +676,7 @@ def audit(
         "by_failure_bucket": by_bucket,
         "by_visibility_bucket": by_visual,
         "by_episode": by_episode,
+        "by_episode_failure_bucket": by_episode_failure_bucket,
         "runtime_invariants": {
             "uses_privileged_target": False,
             "uses_privileged_runtime": False,
@@ -593,7 +788,18 @@ def main() -> None:
         f"- horizon_near_grasp_after_rate: `{report['overall']['horizon_near_grasp_after_rate']:.3f}`",
         f"- horizon_overshoot_rate: `{report['overall']['horizon_overshoot_rate']:.3f}`",
         f"- mean_horizon_steps_executed: `{report['overall']['mean_horizon_steps_executed']:.2f}`",
+        f"- coarse_pullback_candidate_rows: `{report['overall']['coarse_pullback_candidate_rows']}`",
+        f"- near_basin_shell_rows: `{report['overall']['near_basin_shell_rows']}`",
+        f"- horizon_xy_feasible_rows: `{report['overall']['horizon_xy_feasible_rows']}`",
+        f"- yaw_feasible_rows: `{report['overall']['yaw_feasible_rows']}`",
+        f"- yaw_observable_rows: `{report['overall']['yaw_observable_rows']}`",
+        f"- micro_entry_ready_rows: `{report['overall']['micro_entry_ready_rows']}`",
+        f"- yaw_blocked_rate_within_horizon_xy_feasible: `{report['overall']['yaw_blocked_rate_within_horizon_xy_feasible']:.3f}`",
+        f"- recover_preempt_rate_before_first_probe_step: `{report['overall']['recover_preempt_rate_before_first_probe_step']:.3f}`",
         f"- prior_only_abstain_rate: `{report['overall']['prior_only_abstain_rate']:.3f}`",
+        f"- ring_grasp_align_dwell_total: `{report['overall']['ring_grasp_align_dwell_steps']['total']}`",
+        f"- queue_flushed_rate: `{report['overall']['queue_protocol']['queue_flushed_rate']:.3f}`",
+        f"- queue_flush_ablation_delta: `{report['overall']['queue_protocol']['queue_flush_ablation_delta']:.3f}`",
         "",
         "## Feasible Shells",
     ]
@@ -629,6 +835,20 @@ def main() -> None:
             "  - axis_abs_contraction_rate: "
             + ", ".join(f"{axis}={float(val):.3f}" for axis, val in item["axis_abs_contraction_rate"].items())
         )
+    md_lines.append("")
+    md_lines.append("## Episode Buckets")
+    for item in report["by_episode_failure_bucket"]:
+        md_lines.append(f"- `ep{int(item['episode_idx']):03d}` / `{item['failure_bucket']}`")
+        md_lines.append(f"  - count: `{item['count']}`")
+        md_lines.append(f"  - active_count: `{item['active_count']}`")
+        md_lines.append(f"  - coarse_pullback_candidate_rows: `{item['coarse_pullback_candidate_rows']}`")
+        md_lines.append(f"  - near_basin_shell_rows: `{item['near_basin_shell_rows']}`")
+        md_lines.append(f"  - yaw_feasible_rows: `{item['yaw_feasible_rows']}`")
+        md_lines.append(f"  - yaw_observable_rows: `{item['yaw_observable_rows']}`")
+        md_lines.append(f"  - micro_entry_ready_rows: `{item['micro_entry_ready_rows']}`")
+        md_lines.append(f"  - horizon_xy_feasible_rows: `{item['horizon_xy_feasible_rows']}`")
+        md_lines.append(f"  - horizon_near_grasp_after_rate: `{item['horizon_near_grasp_after_rate']:.3f}`")
+        md_lines.append(f"  - queue_flush_ablation_delta: `{item['queue_protocol']['queue_flush_ablation_delta']:.3f}`")
     md_lines.append("")
     md_lines.append("## Visibility Buckets")
     for item in report["by_visibility_bucket"]:

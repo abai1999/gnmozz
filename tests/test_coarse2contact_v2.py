@@ -48,7 +48,9 @@ from prismatic.robot.coarse2contact_v2.basin_recovery import BasinStateEstimator
 from prismatic.robot.coarse2contact_v2.basin_state import BasinAxisCalibration, BasinStateCalibration, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, load_basin_state_calibration_report
 from prismatic.robot.residual_safety import ResidualSafety
 from prismatic.robot.residual_transforms import local_delta_to_world, world_delta_to_local
+from scripts.audit_c2c_v2_frame_contract_relabel import audit as audit_frame_contract_relabel
 from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_intervention
+from scripts.run_c2c_v2_grasp_shell_episode_sweep import _summarize_sweep_reports
 from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
 
 
@@ -168,6 +170,103 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertIn("local_delta_6d", row["planner_prior"])
         self.assertIn("local_correction_local_6d", row["action_t"])
         self.assertEqual(row["obs_t"]["visual_observability_class"], row["visual_observability_class"])
+        self.assertEqual(row["schema_version"], "frame_residual_v2")
+        self.assertIn(row["yaw_observability_class"], {"observable", "ambiguous", "unobservable"})
+        self.assertIn(row["takeover_tier"], {"near_basin_shell", "micro_entry_ready", "close_ready", "outside_takeover", "abstain_prior_only", "invalid"})
+        self.assertTrue(row["label_valid"])
+
+    def test_frame_relabel_yaw_observability_and_tiers_are_separate(self) -> None:
+        gripper_pose = np.array([0.0, 0.0, 0.50, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        ring_pose = np.array([0.020, 0.0, 0.42, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        spoke_pose = np.array([0.05, 0.03, 0.40, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        observable_row = _frame_label_fields(
+            task_name="insert_onto_square_peg",
+            trace_row={
+                "c2c_v2_skill_type": "precision_grasp",
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "local_geometry_error": {
+                    "grasp": {"confidence": 0.9, "observability": 0.2, "fit_residual": 0.01}
+                },
+            },
+            gripper_pose=gripper_pose,
+            ring_pose=ring_pose,
+            spoke_pose=spoke_pose,
+        )
+        self.assertEqual(observable_row["yaw_observability_class"], "observable")
+        self.assertTrue(observable_row["yaw_observable"])
+        self.assertIn(observable_row["takeover_tier"], {"near_basin_shell", "micro_entry_ready", "close_ready"})
+
+        far_row = _frame_label_fields(
+            task_name="insert_onto_square_peg",
+            trace_row={
+                "c2c_v2_skill_type": "precision_grasp",
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "local_geometry_error": {
+                    "grasp": {"confidence": 0.9, "observability": 0.2, "fit_residual": 0.01}
+                },
+            },
+            gripper_pose=gripper_pose,
+            ring_pose=np.array([0.070, 0.0, 0.42, 1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            spoke_pose=spoke_pose,
+        )
+        self.assertFalse(far_row["near_basin_shell"])
+        self.assertNotEqual(far_row["takeover_tier"], "near_basin_shell")
+
+    def test_frame_contract_audit_splits_yaw_and_takeover_tiers(self) -> None:
+        base = {
+            "episode_idx": 1,
+            "step_idx": 1,
+            "stage_name": "RING_GRASP_ALIGN",
+            "skill_name": "precision_grasp_ring",
+            "skill_type": "precision_grasp",
+            "schema_version": "frame_residual_v2",
+            "visual_observability_class": "visual_observable",
+            "yaw_observability_class": "observable",
+            "yaw_observable": True,
+            "label_valid": True,
+            "near_grasp_basin": False,
+            "close_ready_basin": False,
+            "micro_entry_ready": False,
+            "axis_gate_policy": {"x": "trusted_control", "y": "trusted_control", "z": "diagnostic_only", "yaw": "abstain"},
+            "proxy_local_geometry_error": {"dx": 0.03, "dy": 0.0, "dz": 0.02, "dyaw": 0.0},
+            "estimated_basin_error": {"dx": 0.03, "dy": 0.0, "dz": 0.02, "dyaw": 0.0},
+            "planner_prior": {"local_delta_6d": [0.0] * 6},
+            "action_t": {"local_correction_local_6d": [0.0] * 6},
+            "true_basin_error_t": {"dx": 0.030, "dy": 0.0, "dz": 0.020, "dyaw": 0.0},
+            "true_basin_error_t_plus_1": {"dx": 0.026, "dy": 0.0, "dz": 0.019, "dyaw": 0.0},
+            "privileged_dx": 0.030,
+            "privileged_dy": 0.0,
+            "privileged_dz": 0.020,
+            "privileged_dyaw": 0.0,
+            "next_privileged_dx": 0.026,
+            "next_privileged_dy": 0.0,
+            "next_privileged_dz": 0.019,
+            "next_privileged_dyaw": 0.0,
+            "xy_error": 0.030,
+            "next_xy_error": 0.026,
+            "yaw_abs": 0.0,
+            "takeover_tier": "coarse_pullback_candidate",
+            "coarse_pullback_candidate": True,
+            "overshoot": False,
+        }
+        blocked = dict(base)
+        blocked.update({
+            "episode_idx": 2,
+            "yaw_observability_class": "unobservable",
+            "yaw_observable": False,
+            "visual_observability_class": "prior_only",
+            "takeover_tier": "abstain_prior_only",
+            "coarse_pullback_candidate": False,
+            "axis_gate_policy": {"x": "abstain", "y": "abstain", "z": "abstain", "yaw": "abstain"},
+        })
+        report = audit_frame_contract_relabel([base, blocked])
+        self.assertEqual(report["overall"]["schema_version_counts"]["frame_residual_v2"], 2)
+        self.assertEqual(report["overall"]["coarse_pullback_candidate_rows"], 1)
+        self.assertEqual(report["overall"]["yaw_observability_counts"]["observable"], 1)
+        self.assertEqual(report["overall"]["yaw_observability_counts"]["unobservable"], 1)
+        tiers = {item["takeover_tier"]: item for item in report["by_takeover_tier"]}
+        self.assertIn("coarse_pullback_candidate", tiers)
+        self.assertIn("abstain_prior_only", tiers)
 
     def test_replay_basin_estimator_and_grasp_only_pullback_policy(self) -> None:
         gripper_pose = np.array([0.0, 0.0, 0.50, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -326,12 +425,16 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             {
                 "episode_idx": 8,
                 "step": 58,
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
                 "grasp_probe_policy": "replay_oracle_xy",
                 "grasp_probe_active": True,
                 "grasp_probe_reason": "replay_oracle_xy",
                 "grasp_probe_visibility_bucket": "visual_observable",
                 "grasp_probe_requested_horizon": 3,
                 "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_queue_len_before": 2,
+                "grasp_probe_queue_len_after": 0,
+                "grasp_probe_queue_flushed": True,
                 "grasp_probe_pre_true_error_t": [0.023, 0.0, 0.0, 0.040],
                 "grasp_probe_post_true_error_t": [0.020, 0.0, 0.0, 0.040],
                 "grasp_probe_horizon_final_true_error_t": [0.014, 0.0, 0.0, 0.040],
@@ -353,6 +456,179 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(shells["horizon_xy_and_yaw_feasible"]["count"], 1)
         self.assertEqual(shells["horizon_xy_and_yaw_feasible"]["horizon_near_grasp_after_rate"], 1.0)
         self.assertEqual(report["overall"]["horizon_xy_contraction_rate"], 1.0)
+        self.assertEqual(report["overall"]["yaw_blocked_rate_within_horizon_xy_feasible"], 0.0)
+        self.assertEqual(report["overall"]["ring_grasp_align_dwell_steps"]["total"], 1)
+        self.assertEqual(report["overall"]["queue_protocol"]["queue_flushed_rate"], 1.0)
+        self.assertEqual(report["overall"]["yaw_observable_rows"], 1)
+        self.assertEqual(report["overall"]["micro_entry_ready_rows"], 1)
+
+    def test_grasp_intervention_audit_counts_coarse_pullback_candidates(self) -> None:
+        rows = [
+            {
+                "episode_idx": 9,
+                "step": 44,
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": False,
+                "grasp_probe_reason": "inactive",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_near_basin_shell": False,
+                "grasp_probe_horizon_xy_feasible": False,
+                "grasp_probe_yaw_feasible": True,
+                "grasp_probe_pre_true_error_t": [0.040, 0.0, 0.0, 0.040],
+                "grasp_probe_post_true_error_t": [0.038, 0.0, 0.0, 0.040],
+            }
+        ]
+        report = audit_grasp_intervention(
+            rows,
+            near_grasp_xy_threshold=0.015,
+            near_grasp_yaw_threshold=0.08,
+            max_xy_step=0.003,
+            horizon_steps=3,
+        )
+        self.assertEqual(report["overall"]["near_basin_shell_rows"], 0)
+        self.assertEqual(report["overall"]["coarse_pullback_candidate_rows"], 1)
+        self.assertEqual(report["overall"]["yaw_observable_rows"], 1)
+
+    def test_grasp_intervention_audit_splits_yaw_window_and_queue(self) -> None:
+        rows = [
+            {
+                "episode_idx": 3,
+                "step": 1,
+                "c2c_v2_stage": "RECOVER",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": False,
+                "grasp_probe_reason": "inactive",
+                "grasp_probe_visibility_bucket": "visual_observable",
+            },
+            {
+                "episode_idx": 3,
+                "step": 2,
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": True,
+                "grasp_probe_reason": "replay_oracle_xy",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_requested_horizon": 3,
+                "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_queue_len_before": 4,
+                "grasp_probe_queue_len_after": 0,
+                "grasp_probe_queue_flushed": True,
+                "grasp_probe_pre_true_error_t": [0.020, 0.0, 0.0, 0.12],
+                "grasp_probe_post_true_error_t": [0.018, 0.0, 0.0, 0.12],
+                "grasp_probe_horizon_final_true_error_t": [0.014, 0.0, 0.0, 0.12],
+                "grasp_probe_horizon_overshoot": False,
+            },
+            {
+                "episode_idx": 4,
+                "step": 2,
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": True,
+                "grasp_probe_reason": "replay_oracle_xy",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_requested_horizon": 3,
+                "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_queue_len_before": 4,
+                "grasp_probe_queue_len_after": 4,
+                "grasp_probe_queue_flushed": False,
+                "grasp_probe_pre_true_error_t": [0.020, 0.0, 0.0, 0.04],
+                "grasp_probe_post_true_error_t": [0.021, 0.0, 0.0, 0.04],
+                "grasp_probe_horizon_final_true_error_t": [0.021, 0.0, 0.0, 0.04],
+                "grasp_probe_horizon_overshoot": True,
+            },
+        ]
+        report = audit_grasp_intervention(
+            rows,
+            near_grasp_xy_threshold=0.015,
+            near_grasp_yaw_threshold=0.08,
+            max_xy_step=0.003,
+            horizon_steps=3,
+        )
+        self.assertEqual(report["overall"]["yaw_blocked_rate_within_horizon_xy_feasible"], 0.5)
+        self.assertEqual(report["overall"]["recover_preempt_rate_before_first_probe_step"], 0.5)
+        self.assertEqual(report["overall"]["ring_grasp_align_dwell_steps"]["total"], 2)
+        self.assertEqual(report["overall"]["queue_protocol"]["queue_flushed_rate"], 0.5)
+        self.assertGreater(report["overall"]["queue_protocol"]["queue_flush_ablation_delta"], 0.0)
+
+    def test_forced_shell_candidates_are_counted_separately_from_runtime_stage(self) -> None:
+        rows = [
+            {
+                "episode_idx": 7,
+                "step": 12,
+                "c2c_v2_stage": "RECOVER",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": True,
+                "grasp_probe_reason": "replay_oracle_xy",
+                "grasp_probe_stage_source": "forced_shell",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_near_basin_shell": True,
+                "grasp_probe_horizon_xy_feasible": True,
+                "grasp_probe_yaw_feasible": True,
+                "grasp_probe_requested_horizon": 3,
+                "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_pre_true_error_t": [0.023, 0.0, 0.0, 0.04],
+                "grasp_probe_post_true_error_t": [0.020, 0.0, 0.0, 0.04],
+                "grasp_probe_horizon_final_true_error_t": [0.014, 0.0, 0.0, 0.04],
+                "grasp_probe_horizon_near_grasp_after": True,
+            }
+        ]
+        report = audit_grasp_intervention(rows)
+        self.assertEqual(report["overall"]["active_rows"], 1)
+        self.assertEqual(report["overall"]["near_basin_shell_rows"], 1)
+        self.assertEqual(report["overall"]["stage_source_counts"]["forced_shell"], 1)
+
+    def test_grasp_intervention_audit_includes_episode_bucket_shell_hits(self) -> None:
+        rows = [
+            {
+                "episode_idx": 2,
+                "step": 10,
+                "failure_bucket": "small_xy_small_yaw",
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": True,
+                "grasp_probe_reason": "replay_oracle_xy",
+                "grasp_probe_stage_source": "forced_shell",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_near_basin_shell": True,
+                "grasp_probe_yaw_feasible": True,
+                "grasp_probe_horizon_xy_feasible": True,
+                "grasp_probe_requested_horizon": 3,
+                "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_pre_true_error_t": [0.021, 0.0, 0.0, 0.04],
+                "grasp_probe_post_true_error_t": [0.018, 0.0, 0.0, 0.04],
+                "grasp_probe_horizon_final_true_error_t": [0.014, 0.0, 0.0, 0.04],
+                "grasp_probe_horizon_near_grasp_after": True,
+            },
+            {
+                "episode_idx": 2,
+                "step": 11,
+                "failure_bucket": "large_xy_small_yaw",
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "grasp_probe_policy": "replay_oracle_xy",
+                "grasp_probe_active": True,
+                "grasp_probe_reason": "replay_oracle_xy",
+                "grasp_probe_stage_source": "forced_shell",
+                "grasp_probe_visibility_bucket": "visual_observable",
+                "grasp_probe_near_basin_shell": False,
+                "grasp_probe_yaw_feasible": False,
+                "grasp_probe_horizon_xy_feasible": False,
+                "grasp_probe_requested_horizon": 3,
+                "grasp_probe_horizon_steps_executed": 3,
+                "grasp_probe_pre_true_error_t": [0.030, 0.0, 0.0, 0.12],
+                "grasp_probe_post_true_error_t": [0.028, 0.0, 0.0, 0.12],
+                "grasp_probe_horizon_final_true_error_t": [0.025, 0.0, 0.0, 0.12],
+                "grasp_probe_horizon_near_grasp_after": False,
+            },
+        ]
+        report = audit_grasp_intervention(rows)
+        hits = [
+            item for item in report["by_episode_failure_bucket"]
+            if item["near_basin_shell_rows"] > 0
+        ]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["episode_idx"], 2)
+        self.assertEqual(hits[0]["failure_bucket"], "small_xy_small_yaw")
 
     def test_prior_only_probe_rows_remain_abstain_in_audit(self) -> None:
         rows = [
@@ -370,6 +646,56 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         report = audit_grasp_intervention(rows)
         self.assertEqual(report["overall"]["active_rows"], 0)
         self.assertEqual(report["overall"]["prior_only_abstain_rate"], 1.0)
+
+    def test_grasp_shell_episode_sweep_ranks_shell_hits(self) -> None:
+        chunk_reports = [
+            {
+                "chunk_tag": "chunk_000",
+                "by_episode": [
+                    {
+                        "episode_idx": 2,
+                        "near_basin_shell_rows": 0,
+                        "horizon_xy_feasible_rows": 1,
+                        "yaw_feasible_rows": 0,
+                        "active_count": 2,
+                    },
+                    {
+                        "episode_idx": 7,
+                        "near_basin_shell_rows": 3,
+                        "horizon_xy_feasible_rows": 4,
+                        "yaw_feasible_rows": 2,
+                        "active_count": 5,
+                    },
+                ],
+                "by_episode_failure_bucket": [
+                    {
+                        "episode_idx": 2,
+                        "failure_bucket": "large_xy_small_yaw",
+                        "near_basin_shell_rows": 0,
+                        "horizon_xy_feasible_rows": 1,
+                        "yaw_feasible_rows": 0,
+                        "active_count": 2,
+                    },
+                    {
+                        "episode_idx": 7,
+                        "failure_bucket": "small_xy_small_yaw",
+                        "near_basin_shell_rows": 3,
+                        "horizon_xy_feasible_rows": 4,
+                        "yaw_feasible_rows": 2,
+                        "active_count": 5,
+                    },
+                ],
+            }
+        ]
+        summary = _summarize_sweep_reports(chunk_reports, top_k=4, focus_radius=1)
+        self.assertEqual(summary["shell_hit_episode_indices"], [7])
+        self.assertEqual(summary["shell_hit_failure_buckets"], ["small_xy_small_yaw"])
+        self.assertEqual(summary["recommended_next_episode_indices"], [7])
+        self.assertEqual(summary["recommended_focus_episode_indices"], [6, 7, 8])
+        self.assertEqual(summary["shell_hit_episode_focus_windows"][0]["center_episode_idx"], 7)
+        self.assertEqual(summary["shell_hit_episode_focus_windows"][0]["episode_indices"], [6, 7, 8])
+        self.assertEqual(summary["ranked_episodes"][0]["episode_idx"], 7)
+        self.assertEqual(summary["ranked_episode_buckets"][0]["failure_bucket"], "small_xy_small_yaw")
 
     def test_recovery_mainline_points_to_v11(self) -> None:
         self.assertIn("grasp_recovery_head_v11_runtime_failure", str(RECOVERY_MAINLINE_CHECKPOINT))

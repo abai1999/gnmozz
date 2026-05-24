@@ -183,6 +183,101 @@ def _micro_entry_block_reason(row: Mapping[str, Any]) -> str:
     return "+".join(parts) if parts else "blocked"
 
 
+def _yaw_observability_class(row: Mapping[str, Any]) -> str:
+    value = str(row.get("yaw_observability_class", ""))
+    if value in {"observable", "ambiguous", "unobservable"}:
+        return value
+    if bool(row.get("yaw_observable", False)):
+        return "observable"
+    if str(row.get("visual_observability_class", "")) == "prior_only":
+        return "unobservable"
+    return "ambiguous"
+
+
+def _takeover_tier(row: Mapping[str, Any]) -> str:
+    value = str(row.get("takeover_tier", ""))
+    if value:
+        return value
+    if str(row.get("visual_observability_class", "")) == "prior_only":
+        return "abstain_prior_only"
+    if bool(row.get("close_ready_ready", False)):
+        return "close_ready"
+    if bool(row.get("micro_entry_ready", False)):
+        return "micro_entry_ready"
+    if bool(row.get("near_basin_shell", False)):
+        return "near_basin_shell"
+    if bool(row.get("coarse_pullback_candidate", False)):
+        return "coarse_pullback_candidate"
+    return "outside_takeover"
+
+
+def _xy_contracted(row: Mapping[str, Any]) -> bool:
+    xy = _safe_float(row.get("xy_error", float("nan")), float("nan"))
+    nxt = _safe_float(row.get("next_xy_error", float("nan")), float("nan"))
+    return bool(np.isfinite(xy) and np.isfinite(nxt) and nxt < xy - 1.0e-9)
+
+
+def _row_overshoot(row: Mapping[str, Any]) -> bool:
+    if "overshoot" in row:
+        return bool(row.get("overshoot", False))
+    for axis in ("x", "y", "yaw"):
+        now = _value(row, axis, source="privileged")
+        nxt = _value(row, axis, source="next_privileged")
+        if np.isfinite(now) and np.isfinite(nxt) and np.sign(now) != np.sign(nxt) and abs(nxt) >= abs(now):
+            return True
+    return False
+
+
+def _yaw_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    classes = Counter(_yaw_observability_class(r) for r in rows)
+    observable = [r for r in rows if _yaw_observability_class(r) == "observable"]
+    unobservable = [r for r in rows if _yaw_observability_class(r) == "unobservable"]
+    proxy = [_value(r, "yaw", source="proxy") for r in rows]
+    priv = [_value(r, "yaw", source="privileged") for r in rows]
+    abstain_correct = [
+        _axis_gate_policy(r, "yaw") == "abstain"
+        for r in rows
+        if _yaw_observability_class(r) != "observable"
+    ]
+    return {
+        "yaw_observability_counts": dict(classes),
+        "yaw_observable_rate": float(len(observable) / len(rows)) if rows else 0.0,
+        "yaw_blocked_rate": float(1.0 - len(observable) / len(rows)) if rows else 0.0,
+        "yaw_proxy_vs_privileged_error": float(np.nanmean(np.abs(np.asarray(proxy, dtype=np.float32) - np.asarray(priv, dtype=np.float32)))) if rows else 0.0,
+        "yaw_proxy_priv_corr": _corr(proxy, priv),
+        "yaw_abstain_correct_rate": float(np.mean(abstain_correct)) if abstain_correct else 1.0,
+        "unobservable_rows": int(len(unobservable)),
+    }
+
+
+def _tier_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    tiers = Counter(_takeover_tier(r) for r in rows)
+    out: dict[str, Any] = {
+        "takeover_tier_counts": dict(tiers),
+        "coarse_pullback_candidate_rows": int(tiers.get("coarse_pullback_candidate", 0)),
+        "near_basin_shell_rows": int(tiers.get("near_basin_shell", 0)),
+        "micro_entry_ready_rows": int(tiers.get("micro_entry_ready", 0)),
+        "close_ready_rows": int(tiers.get("close_ready", 0)),
+    }
+    by_tier: list[dict[str, Any]] = []
+    for key, subset in sorted(_group_rows(rows, ("takeover_tier",)).items()):
+        tier_rows = subset
+        if key[0] == "":
+            tier_rows = [r for r in rows if _takeover_tier(r) == "outside_takeover"]
+        by_tier.append(
+            {
+                "takeover_tier": key[0] or "outside_takeover",
+                "num_rows": int(len(tier_rows)),
+                "xy_contraction_rate": float(np.mean([_xy_contracted(r) for r in tier_rows])) if tier_rows else 0.0,
+                "overshoot_rate": float(np.mean([_row_overshoot(r) for r in tier_rows])) if tier_rows else 0.0,
+                "near_grasp_rate": float(np.mean([bool(r.get("near_grasp_basin", False)) for r in tier_rows])) if tier_rows else 0.0,
+                "prior_only_abstain_rate": float(np.mean([str(r.get("visual_observability_class", "")) == "prior_only" and _axis_gate_policy(r, "x") == "abstain" for r in tier_rows])) if tier_rows else 0.0,
+            }
+        )
+    out["by_takeover_tier"] = by_tier
+    return out
+
+
 def _axis_stats(rows: list[dict[str, Any]], axis: str) -> dict[str, Any]:
     proxy = np.asarray([_value(r, axis, source="proxy") for r in rows], dtype=np.float32)
     est = np.asarray([_value(r, axis, source="estimated") for r in rows], dtype=np.float32)
@@ -269,6 +364,8 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     axis_summary = {axis: _axis_stats(rows, axis) for axis in ["x", "y", "z", "yaw"]}
 
     micro_entry_reasons = Counter(_micro_entry_block_reason(r) for r in rows)
+    yaw_summary = _yaw_audit(rows)
+    tier_summary = _tier_summary(rows)
 
     by_stage = []
     for key, subset in sorted(_group_rows(rows, ("stage_name",)).items()):
@@ -314,6 +411,34 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
             }
         )
 
+    by_yaw_observability = []
+    for key, subset in sorted(_group_rows(rows, ("yaw_observability_class",)).items()):
+        cls = key[0] or "unknown"
+        by_yaw_observability.append(
+            {
+                "yaw_observability_class": cls,
+                "num_rows": len(subset),
+                "axis_summary": {axis: _axis_stats(subset, axis) for axis in ["x", "y", "z", "yaw"]},
+                "takeover_tier_counts": dict(Counter(_takeover_tier(r) for r in subset)),
+            }
+        )
+
+    by_takeover_tier = []
+    tier_groups: dict[tuple[str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        tier_groups[(_takeover_tier(row),)].append(row)
+    for key, subset in sorted(tier_groups.items()):
+        by_takeover_tier.append(
+            {
+                "takeover_tier": key[0],
+                "num_rows": len(subset),
+                "axis_summary": {axis: _axis_stats(subset, axis) for axis in ["x", "y", "z", "yaw"]},
+                "xy_contraction_rate": float(np.mean([_xy_contracted(r) for r in subset])) if subset else 0.0,
+                "overshoot_rate": float(np.mean([_row_overshoot(r) for r in subset])) if subset else 0.0,
+                "yaw_observability_counts": dict(Counter(_yaw_observability_class(r) for r in subset)),
+            }
+        )
+
     overall = {
         "num_rows": len(rows),
         "near_grasp_rate": float(np.mean([bool(r.get("near_grasp_basin", False)) for r in rows])) if rows else 0.0,
@@ -322,6 +447,10 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "prior_only_rate": float(np.mean([str(r.get("visual_observability_class", "")) == "prior_only" for r in rows])) if rows else 0.0,
         "micro_entry_ready_rate": float(np.mean([_micro_entry_ready(r) for r in rows])) if rows else 0.0,
         "micro_entry_block_reason_counts": dict(micro_entry_reasons),
+        "schema_version_counts": dict(Counter(str(r.get("schema_version", "legacy")) for r in rows)),
+        "label_valid_rate": float(np.mean([bool(r.get("label_valid", True)) for r in rows])) if rows else 0.0,
+        **yaw_summary,
+        **{k: v for k, v in tier_summary.items() if k != "by_takeover_tier"},
     }
 
     return {
@@ -330,6 +459,8 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "by_stage": by_stage,
         "by_skill": by_skill,
         "by_visual_observability": by_visual,
+        "by_yaw_observability": by_yaw_observability,
+        "by_takeover_tier": by_takeover_tier,
         "by_failure_bucket": by_bucket,
         "runtime_invariants": {
             "uses_privileged_target": False,
@@ -376,6 +507,14 @@ def main() -> None:
         f"- visual_observable_rate: `{report['overall']['visual_observable_rate']:.3f}`",
         f"- prior_only_rate: `{report['overall']['prior_only_rate']:.3f}`",
         f"- micro_entry_ready_rate: `{report['overall']['micro_entry_ready_rate']:.3f}`",
+        f"- label_valid_rate: `{report['overall']['label_valid_rate']:.3f}`",
+        f"- yaw_observable_rate: `{report['overall']['yaw_observable_rate']:.3f}`",
+        f"- yaw_blocked_rate: `{report['overall']['yaw_blocked_rate']:.3f}`",
+        f"- yaw_abstain_correct_rate: `{report['overall']['yaw_abstain_correct_rate']:.3f}`",
+        f"- coarse_pullback_candidate_rows: `{report['overall']['coarse_pullback_candidate_rows']}`",
+        f"- near_basin_shell_rows: `{report['overall']['near_basin_shell_rows']}`",
+        f"- micro_entry_ready_rows: `{report['overall']['micro_entry_ready_rows']}`",
+        f"- close_ready_rows: `{report['overall']['close_ready_rows']}`",
         "",
         "## Axis Summary",
     ]
@@ -385,6 +524,19 @@ def main() -> None:
             f"contract={stats['contraction_rate']:.3f}, trusted_contract={stats['trusted_contraction_rate']:.3f}, "
             f"proxy_corr={stats['proxy_priv_corr']:.3f}, action_corr={stats['action_priv_corr']:.3f}, "
             f"monotonic={stats['monotonic_prefix_rate']:.3f}, two_step={stats['two_step_monotonic_prefix_rate']:.3f}"
+        )
+    md_lines.append("")
+    md_lines.append("## Yaw Observability")
+    for item in report["by_yaw_observability"]:
+        md_lines.append(
+            f"- `{item['yaw_observability_class']}`: rows={item['num_rows']}, tiers={item['takeover_tier_counts']}"
+        )
+    md_lines.append("")
+    md_lines.append("## Takeover Tiers")
+    for item in report["by_takeover_tier"]:
+        md_lines.append(
+            f"- `{item['takeover_tier']}`: rows={item['num_rows']}, xy_contract={item['xy_contraction_rate']:.3f}, "
+            f"overshoot={item['overshoot_rate']:.3f}, yaw={item['yaw_observability_counts']}"
         )
     md_lines.append("")
     md_lines.append("## Failure Buckets")
