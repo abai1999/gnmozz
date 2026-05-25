@@ -185,6 +185,7 @@ def _summarize_sweep_reports(
 ) -> dict[str, Any]:
     episode_rows: list[dict[str, Any]] = []
     episode_bucket_rows: list[dict[str, Any]] = []
+    frame_reports: list[dict[str, Any]] = []
     shell_episode_counter: Counter[int] = Counter()
     shell_bucket_counter: Counter[str] = Counter()
     selected_episode_indices: set[int] = set()
@@ -208,6 +209,8 @@ def _summarize_sweep_reports(
                 shell_episode_counter[int(row.get("episode_idx", -1))] += int(row.get("near_basin_shell_rows", 0))
                 shell_bucket_counter[str(row.get("failure_bucket", ""))] += int(row.get("near_basin_shell_rows", 0))
                 selected_failure_buckets.add(str(row.get("failure_bucket", "")))
+        if isinstance(chunk_report.get("frame_contract_report"), dict):
+            frame_reports.append(dict(chunk_report["frame_contract_report"]))
 
     ranked_episodes = _top_hits(
         episode_rows,
@@ -240,6 +243,29 @@ def _summarize_sweep_reports(
     total_horizon_near_grasp_after_count = int(sum(int(report.get("overall", {}).get("horizon_near_grasp_after_count", 0)) for report in chunk_reports))
     total_horizon_xy_contraction_lower_ci = _wilson_lower_bound(total_horizon_xy_contracted_count, total_active_rows)
     total_horizon_near_grasp_after_rate = float(total_horizon_near_grasp_after_count / total_active_rows) if total_active_rows else 0.0
+
+    tier_rows_total: Counter[str] = Counter()
+    tier_xy_contracted: Counter[str] = Counter()
+    for report in frame_reports:
+        for item in report.get("by_takeover_tier", []):
+            tier = str(item.get("takeover_tier", "outside_takeover"))
+            tier_rows_total[tier] += int(item.get("num_rows", 0))
+            tier_xy_contracted[tier] += int(item.get("xy_contracted_count", round(float(item.get("xy_contraction_rate", 0.0)) * float(item.get("num_rows", 0)))))
+    contraction_lower_ci_by_tier = {
+        tier: _wilson_lower_bound(int(tier_xy_contracted[tier]), int(tier_rows_total[tier]))
+        for tier in sorted(tier_rows_total.keys())
+    }
+    contraction_rate_by_tier = {
+        tier: float(tier_xy_contracted[tier] / tier_rows_total[tier]) if tier_rows_total[tier] else 0.0
+        for tier in sorted(tier_rows_total.keys())
+    }
+
+    total_coarse_pullback_candidate_rows = int(sum(int(report.get("overall", {}).get("coarse_pullback_candidate_rows", 0)) for report in frame_reports))
+    total_near_basin_shell_rows = int(sum(int(report.get("overall", {}).get("near_basin_shell_rows", 0)) for report in frame_reports))
+    total_micro_entry_ready_rows = int(sum(int(report.get("overall", {}).get("micro_entry_ready_rows", 0)) for report in frame_reports))
+    total_close_ready_rows = int(sum(int(report.get("overall", {}).get("close_ready_rows", 0)) for report in frame_reports))
+    total_yaw_observable_rows = int(sum(int(report.get("overall", {}).get("yaw_observable_rows", 0)) for report in frame_reports))
+    total_yaw_blocked_rows = int(sum(int(report.get("overall", {}).get("yaw_blocked_rows", max(0, report.get("overall", {}).get("num_rows", 0) - report.get("overall", {}).get("yaw_observable_rows", 0)))) for report in frame_reports))
     collection_target = {
         "active_rows": total_active_rows,
         "yaw_feasible_rows": total_yaw_feasible_rows,
@@ -280,6 +306,17 @@ def _summarize_sweep_reports(
             }
         ),
         "collection_target": collection_target,
+        "frame_contract_summary": {
+            "coarse_pullback_candidate_rows": total_coarse_pullback_candidate_rows,
+            "near_basin_shell_rows": total_near_basin_shell_rows,
+            "micro_entry_ready_rows": total_micro_entry_ready_rows,
+            "close_ready_rows": total_close_ready_rows,
+            "yaw_observable_rows": total_yaw_observable_rows,
+            "yaw_blocked_rows": total_yaw_blocked_rows,
+            "contraction_lower_ci_by_tier": contraction_lower_ci_by_tier,
+            "contraction_rate_by_tier": contraction_rate_by_tier,
+            "frame_contract_report_count": int(len(frame_reports)),
+        },
     }
 
 
@@ -298,6 +335,17 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
         f"- yaw_feasible_rows: `{summary['collection_target']['yaw_feasible_rows']}`",
         f"- horizon_xy_contraction_lower_ci: `{summary['collection_target']['horizon_xy_contraction_lower_ci']:.3f}`",
         f"- horizon_near_grasp_after_rate: `{summary['collection_target']['horizon_near_grasp_after_rate']:.3f}`",
+        "",
+        "## Frame Contract Summary",
+        f"- coarse_pullback_candidate_rows: `{summary['frame_contract_summary']['coarse_pullback_candidate_rows']}`",
+        f"- near_basin_shell_rows: `{summary['frame_contract_summary']['near_basin_shell_rows']}`",
+        f"- micro_entry_ready_rows: `{summary['frame_contract_summary']['micro_entry_ready_rows']}`",
+        f"- close_ready_rows: `{summary['frame_contract_summary']['close_ready_rows']}`",
+        f"- yaw_observable_rows: `{summary['frame_contract_summary']['yaw_observable_rows']}`",
+        f"- yaw_blocked_rows: `{summary['frame_contract_summary']['yaw_blocked_rows']}`",
+        f"- frame_contract_report_count: `{summary['frame_contract_summary']['frame_contract_report_count']}`",
+        f"- contraction_lower_ci_by_tier: `{summary['frame_contract_summary']['contraction_lower_ci_by_tier']}`",
+        f"- contraction_rate_by_tier: `{summary['frame_contract_summary']['contraction_rate_by_tier']}`",
         "",
         "## Shell Hit Episodes",
     ]
@@ -390,8 +438,14 @@ def main() -> None:
     ap.add_argument("--c2c_grasp_probe_xy_gain", type=float, default=0.35)
     ap.add_argument("--c2c_grasp_probe_max_xy_step", type=float, default=0.003)
     ap.add_argument("--c2c_grasp_probe_horizon", type=int, default=3)
+    ap.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
     ap.add_argument("--c2c_grasp_probe_window_mode", type=str, default="forced_shell", choices=["stage", "forced_shell"])
-    ap.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="coarse_yaw_feasible", choices=["off", "near_yaw_feasible", "coarse_yaw_feasible"])
+    ap.add_argument(
+        "--c2c_grasp_probe_shell_filter",
+        type=str,
+        default="coarse_yaw_feasible",
+        choices=["off", "near_yaw_feasible", "tight_near_yaw_feasible", "coarse_yaw_feasible"],
+    )
     ap.add_argument("--basin_state_calibration_report", type=str, default="runtime_artifacts/coarse2contact_v2/reports/basin_state_calibration/basin_state_calibration.json")
     ap.add_argument("--top_k", type=int, default=8)
     ap.add_argument("--focus_radius", type=int, default=1)
@@ -461,6 +515,11 @@ def main() -> None:
             str(args.c2c_grasp_probe_max_xy_step),
             "--c2c_grasp_probe_horizon",
             str(args.c2c_grasp_probe_horizon),
+            *(
+                ["--c2c_grasp_probe_flush_planner_queue"]
+                if bool(args.c2c_grasp_probe_flush_planner_queue)
+                else []
+            ),
             "--c2c_grasp_probe_window_mode",
             args.c2c_grasp_probe_window_mode,
             "--c2c_grasp_probe_shell_filter",
@@ -506,6 +565,35 @@ def main() -> None:
         ]
         _run_with_optional_xvfb(audit_cmd, cwd=ROOT, env=env, log_path=audit_log)
 
+        relabel_output_root = chunk_dir / "frame_contract_relabel"
+        relabel_log = chunk_dir / "frame_contract_relabel.log"
+        relabel_cmd = [
+            python_bin,
+            "-u",
+            "scripts/relabel_c2c_v2_privileged_basin_frames.py",
+            "--eval_root",
+            str(eval_output_root),
+            "--task_name",
+            args.task_name,
+            "--output_dir",
+            str(relabel_output_root),
+        ]
+        _run_with_optional_xvfb(relabel_cmd, cwd=ROOT, env=env, log_path=relabel_log)
+
+        relabel_jsonl = relabel_output_root / "frame_residual_v2.jsonl"
+        frame_contract_audit_output_root = chunk_dir / "frame_contract_audit"
+        frame_contract_audit_log = chunk_dir / "frame_contract_audit.log"
+        frame_contract_audit_cmd = [
+            python_bin,
+            "-u",
+            "scripts/audit_c2c_v2_frame_contract_relabel.py",
+            "--relabel_jsonl",
+            str(relabel_jsonl),
+            "--output_dir",
+            str(frame_contract_audit_output_root),
+        ]
+        _run_with_optional_xvfb(frame_contract_audit_cmd, cwd=ROOT, env=env, log_path=frame_contract_audit_log)
+
         report_path = audit_output_root / "grasp_probe_intervention_audit.json"
         report = _read_json(report_path)
         report["chunk_tag"] = chunk_tag
@@ -515,6 +603,15 @@ def main() -> None:
         report["trace_dir"] = str(trace_dir)
         report["evaluate_log"] = str(eval_log)
         report["audit_log"] = str(audit_log)
+        report["relabel_output_root"] = str(relabel_output_root)
+        report["relabel_log"] = str(relabel_log)
+        report["frame_contract_audit_output_root"] = str(frame_contract_audit_output_root)
+        report["frame_contract_audit_log"] = str(frame_contract_audit_log)
+        frame_contract_report_path = frame_contract_audit_output_root / "frame_contract_audit.json"
+        if frame_contract_report_path.exists():
+            report["frame_contract_report"] = _read_json(frame_contract_report_path)
+            report["frame_contract_report_path"] = str(frame_contract_report_path)
+            report["frame_residual_manifest_path"] = report["frame_contract_report"].get("takeover_manifest_path", str((ROOT / "runtime_artifacts/coarse2contact_v2/datasets/frame_residual_takeover_manifest.jsonl").resolve()))
         chunk_reports.append(report)
 
         if args.stop_after_first_hit:
@@ -545,6 +642,7 @@ def main() -> None:
                 "c2c_grasp_probe_window_mode": args.c2c_grasp_probe_window_mode,
                 "c2c_grasp_probe_shell_filter": args.c2c_grasp_probe_shell_filter,
                 "c2c_grasp_probe_horizon": int(args.c2c_grasp_probe_horizon),
+                "c2c_grasp_probe_flush_planner_queue": bool(args.c2c_grasp_probe_flush_planner_queue),
                 "c2c_grasp_probe_xy_gain": float(args.c2c_grasp_probe_xy_gain),
                 "c2c_grasp_probe_max_xy_step": float(args.c2c_grasp_probe_max_xy_step),
                 "focus_radius": int(args.focus_radius),

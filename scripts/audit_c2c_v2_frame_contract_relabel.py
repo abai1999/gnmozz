@@ -11,6 +11,14 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from prismatic.robot.coarse2contact_v2.takeover_contract import (
+    FrameResidual,
+    ObservabilityDecision,
+    TakeoverThresholds,
+    classify_yaw_observability,
+    decide_takeover_tier,
+)
+
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -40,6 +48,16 @@ def _corr(a: Iterable[float], b: Iterable[float]) -> float:
     if np.std(aa) <= 1e-9 or np.std(bb) <= 1e-9:
         return 0.0
     return float(np.corrcoef(aa, bb)[0, 1])
+
+
+def _wilson_lower_bound(successes: int, n: int, *, z: float = 1.96) -> float:
+    if n <= 0:
+        return 0.0
+    phat = float(successes) / float(n)
+    denom = 1.0 + (z * z) / float(n)
+    center = phat + (z * z) / (2.0 * float(n))
+    margin = z * ((phat * (1.0 - phat) + (z * z) / (4.0 * float(n))) / float(n)) ** 0.5
+    return float(max((center - margin) / denom, 0.0))
 
 
 def _axis_key(axis: str) -> str:
@@ -146,6 +164,43 @@ def _two_step_monotonic_prefix_rate(rows: list[dict[str, Any]], axis: str) -> fl
     return float(np.mean(episode_rates)) if episode_rates else 0.0
 
 
+def _finite_residual(row: Mapping[str, Any]) -> bool:
+    return FrameResidual.from_mapping(row, source="audit_row").finite
+
+
+def _visual_record_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    obs = row.get("obs_t") if isinstance(row.get("obs_t"), Mapping) else {}
+    return {
+        "frame_confidence": float(obs.get("frame_confidence", row.get("source_frame_confidence", 0.0)) or 0.0),
+        "frame_observability": float(obs.get("frame_observability", row.get("source_frame_observability", 0.0)) or 0.0),
+        "frame_axis_strength": float(obs.get("frame_axis_strength", row.get("source_frame_axis_strength", 0.0)) or 0.0),
+        "wide_ring_visible": bool(obs.get("wide_ring_visible", row.get("wide_ring_visible", False))),
+    }
+
+
+def _observability_decision(row: Mapping[str, Any]) -> ObservabilityDecision:
+    visual_class = str(row.get("visual_observability_class", row.get("obs_t", {}).get("visual_observability_class", "prior_only")))
+    return classify_yaw_observability(
+        row,
+        _visual_record_from_row(row),
+        visual_observability_class=visual_class,
+    )
+
+
+def _takeover_decision(row: Mapping[str, Any]) -> tuple[FrameResidual, ObservabilityDecision, Any]:
+    residual = FrameResidual.from_mapping(row, source="audit_row")
+    observability = _observability_decision(row)
+    decision = decide_takeover_tier(
+        residual,
+        observability,
+        precision_row=bool(str(row.get("skill_type", "")) in {"precision_grasp", "precision_align"}),
+        requires_yaw_observability=bool(row.get("requires_yaw_observability", row.get("frame_contract", {}).get("requires_yaw_observability", False))),
+        xy_contracted=_xy_contracted(row),
+        thresholds=TakeoverThresholds(),
+    )
+    return residual, observability, decision
+
+
 def _axis_gate_policy(row: Mapping[str, Any], axis: str) -> str:
     policy = _row_mapping(row, "axis_gate_policy")
     if policy:
@@ -162,57 +217,33 @@ def _axis_gate_policy(row: Mapping[str, Any], axis: str) -> str:
 def _micro_entry_ready(row: Mapping[str, Any]) -> bool:
     if "micro_entry_ready" in row:
         return bool(row.get("micro_entry_ready", False))
-    visual = str(row.get("visual_observability_class", "prior_only"))
-    if visual == "prior_only":
-        return False
-    return bool(bool(row.get("near_grasp_basin", False)) and (not bool(row.get("requires_yaw_observability", False)) or bool(row.get("yaw_observable", False))))
+    _, _, decision = _takeover_decision(row)
+    return bool(decision.micro_entry_ready)
 
 
 def _micro_entry_block_reason(row: Mapping[str, Any]) -> str:
     if "micro_entry_block_reason" in row:
         return str(row.get("micro_entry_block_reason", ""))
-    if _micro_entry_ready(row):
-        return "ready"
-    parts: list[str] = []
-    if str(row.get("visual_observability_class", "prior_only")) == "prior_only":
-        parts.append("prior_only")
-    if not bool(row.get("near_grasp_basin", False)):
-        parts.append("xy")
-    if bool(row.get("requires_yaw_observability", False)) and not bool(row.get("yaw_observable", False)):
-        parts.append("yaw")
-    return "+".join(parts) if parts else "blocked"
+    _, _, decision = _takeover_decision(row)
+    return str(decision.micro_entry_block_reason)
 
 
 def _yaw_observability_class(row: Mapping[str, Any]) -> str:
     value = str(row.get("yaw_observability_class", ""))
     if value in {"observable", "ambiguous", "unobservable"}:
         return value
-    if bool(row.get("yaw_observable", False)):
-        return "observable"
-    if str(row.get("visual_observability_class", "")) == "prior_only":
-        return "unobservable"
-    return "ambiguous"
+    return str(_observability_decision(row).yaw_observability_class)
 
 
 def _takeover_tier(row: Mapping[str, Any]) -> str:
     value = str(row.get("takeover_tier", ""))
     if value:
         return value
-    if str(row.get("visual_observability_class", "")) == "prior_only":
-        return "abstain_prior_only"
-    if bool(row.get("close_ready_ready", False)):
-        return "close_ready"
-    if bool(row.get("micro_entry_ready", False)):
-        return "micro_entry_ready"
-    if bool(row.get("near_basin_shell", False)):
-        return "near_basin_shell"
-    if bool(row.get("coarse_pullback_candidate", False)):
-        return "coarse_pullback_candidate"
-    return "outside_takeover"
+    return str(_takeover_decision(row)[2].takeover_tier)
 
 
 def _xy_contracted(row: Mapping[str, Any]) -> bool:
-    xy = _safe_float(row.get("xy_error", float("nan")), float("nan"))
+    xy = _safe_float(row.get("xy_error", FrameResidual.from_mapping(row, source="audit_row").xy_error), float("nan"))
     nxt = _safe_float(row.get("next_xy_error", float("nan")), float("nan"))
     return bool(np.isfinite(xy) and np.isfinite(nxt) and nxt < xy - 1.0e-9)
 
@@ -252,23 +283,29 @@ def _yaw_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _tier_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tiers = Counter(_takeover_tier(r) for r in rows)
+    contracted_total = int(sum(_xy_contracted(r) for r in rows))
     out: dict[str, Any] = {
         "takeover_tier_counts": dict(tiers),
         "coarse_pullback_candidate_rows": int(tiers.get("coarse_pullback_candidate", 0)),
         "near_basin_shell_rows": int(tiers.get("near_basin_shell", 0)),
         "micro_entry_ready_rows": int(tiers.get("micro_entry_ready", 0)),
         "close_ready_rows": int(tiers.get("close_ready", 0)),
+        "xy_contracted_count": int(contracted_total),
+        "xy_contraction_lower_ci": float(_wilson_lower_bound(contracted_total, len(rows))),
     }
     by_tier: list[dict[str, Any]] = []
     for key, subset in sorted(_group_rows(rows, ("takeover_tier",)).items()):
         tier_rows = subset
         if key[0] == "":
             tier_rows = [r for r in rows if _takeover_tier(r) == "outside_takeover"]
+        contracted_count = int(sum(_xy_contracted(r) for r in tier_rows))
         by_tier.append(
             {
                 "takeover_tier": key[0] or "outside_takeover",
                 "num_rows": int(len(tier_rows)),
+                "xy_contracted_count": int(contracted_count),
                 "xy_contraction_rate": float(np.mean([_xy_contracted(r) for r in tier_rows])) if tier_rows else 0.0,
+                "xy_contraction_lower_ci": float(_wilson_lower_bound(contracted_count, len(tier_rows))),
                 "overshoot_rate": float(np.mean([_row_overshoot(r) for r in tier_rows])) if tier_rows else 0.0,
                 "near_grasp_rate": float(np.mean([bool(r.get("near_grasp_basin", False)) for r in tier_rows])) if tier_rows else 0.0,
                 "prior_only_abstain_rate": float(np.mean([str(r.get("visual_observability_class", "")) == "prior_only" and _axis_gate_policy(r, "x") == "abstain" for r in tier_rows])) if tier_rows else 0.0,
@@ -339,6 +376,23 @@ def _group_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> dict[tuple
     return groups
 
 
+def _window_protocol_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    window = row.get("window_protocol") if isinstance(row.get("window_protocol"), Mapping) else {}
+    if window:
+        return (
+            str(window.get("window_mode", "")),
+            str(window.get("shell_filter", "")),
+            "true" if bool(window.get("queue_flushed", False)) else "false",
+            str(window.get("requested_horizon", "")),
+        )
+    return (
+        str(row.get("grasp_probe_window_mode", row.get("c2c_grasp_probe_window_mode", ""))),
+        str(row.get("grasp_probe_shell_filter", row.get("c2c_grasp_probe_shell_filter", ""))),
+        "true" if bool(row.get("grasp_probe_queue_flushed", False)) else "false",
+        str(row.get("grasp_probe_requested_horizon", row.get("c2c_grasp_probe_horizon", ""))),
+    )
+
+
 def _plot_overview(report: dict[str, Any], output_dir: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -366,6 +420,20 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     micro_entry_reasons = Counter(_micro_entry_block_reason(r) for r in rows)
     yaw_summary = _yaw_audit(rows)
     tier_summary = _tier_summary(rows)
+
+    by_episode = []
+    for key, subset in sorted(_group_rows(rows, ("episode_idx",)).items(), key=lambda item: int(item[0][0]) if str(item[0][0]).lstrip("-").isdigit() else -1):
+        by_episode.append(
+            {
+                "episode_idx": int(key[0]) if str(key[0]).lstrip("-").isdigit() else -1,
+                "num_rows": len(subset),
+                "axis_summary": {axis: _axis_stats(subset, axis) for axis in ["x", "y", "z", "yaw"]},
+                "micro_entry_ready_rate": float(np.mean([_micro_entry_ready(r) for r in subset])) if subset else 0.0,
+                "takeover_tier_counts": dict(Counter(_takeover_tier(r) for r in subset)),
+                "yaw_observability_counts": dict(Counter(_yaw_observability_class(r) for r in subset)),
+                "failure_bucket_counts": dict(Counter(str(r.get("failure_bucket", "")) for r in subset)),
+            }
+        )
 
     by_stage = []
     for key, subset in sorted(_group_rows(rows, ("stage_name",)).items()):
@@ -428,14 +496,35 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in rows:
         tier_groups[(_takeover_tier(row),)].append(row)
     for key, subset in sorted(tier_groups.items()):
+        contracted_count = int(sum(_xy_contracted(r) for r in subset))
         by_takeover_tier.append(
             {
                 "takeover_tier": key[0],
                 "num_rows": len(subset),
+                "xy_contracted_count": int(contracted_count),
                 "axis_summary": {axis: _axis_stats(subset, axis) for axis in ["x", "y", "z", "yaw"]},
                 "xy_contraction_rate": float(np.mean([_xy_contracted(r) for r in subset])) if subset else 0.0,
+                "xy_contraction_lower_ci": float(_wilson_lower_bound(contracted_count, len(subset))),
                 "overshoot_rate": float(np.mean([_row_overshoot(r) for r in subset])) if subset else 0.0,
                 "yaw_observability_counts": dict(Counter(_yaw_observability_class(r) for r in subset)),
+            }
+        )
+
+    by_window_protocol = []
+    window_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        window_groups[_window_protocol_key(row)].append(row)
+    for key, subset in sorted(window_groups.items()):
+        by_window_protocol.append(
+            {
+                "window_mode": key[0],
+                "shell_filter": key[1] if len(key) > 1 else "",
+                "queue_flushed": key[2] if len(key) > 2 else "",
+                "requested_horizon": key[3] if len(key) > 3 else "",
+                "num_rows": len(subset),
+                "axis_summary": {axis: _axis_stats(subset, axis) for axis in ["x", "y", "z", "yaw"]},
+                "micro_entry_ready_rate": float(np.mean([_micro_entry_ready(r) for r in subset])) if subset else 0.0,
+                "takeover_tier_counts": dict(Counter(_takeover_tier(r) for r in subset)),
             }
         )
 
@@ -449,6 +538,10 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "micro_entry_block_reason_counts": dict(micro_entry_reasons),
         "schema_version_counts": dict(Counter(str(r.get("schema_version", "legacy")) for r in rows)),
         "label_valid_rate": float(np.mean([bool(r.get("label_valid", True)) for r in rows])) if rows else 0.0,
+        "yaw_observable_rows": int(sum(1 for r in rows if str(r.get("yaw_observability_class", _observability_decision(r).yaw_observability_class)) == "observable")),
+        "yaw_blocked_rows": int(sum(1 for r in rows if str(r.get("yaw_observability_class", _observability_decision(r).yaw_observability_class)) != "observable")),
+        "xy_contracted_count": int(sum(_xy_contracted(r) for r in rows)),
+        "xy_contraction_lower_ci": float(_wilson_lower_bound(int(sum(_xy_contracted(r) for r in rows)), len(rows))),
         **yaw_summary,
         **{k: v for k, v in tier_summary.items() if k != "by_takeover_tier"},
     }
@@ -456,12 +549,14 @@ def audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "overall": overall,
         "axis_summary": axis_summary,
+        "by_episode": by_episode,
         "by_stage": by_stage,
         "by_skill": by_skill,
         "by_visual_observability": by_visual,
         "by_yaw_observability": by_yaw_observability,
         "by_takeover_tier": by_takeover_tier,
         "by_failure_bucket": by_bucket,
+        "by_window_protocol": by_window_protocol,
         "runtime_invariants": {
             "uses_privileged_target": False,
             "uses_privileged_runtime": False,
@@ -511,6 +606,8 @@ def main() -> None:
         f"- yaw_observable_rate: `{report['overall']['yaw_observable_rate']:.3f}`",
         f"- yaw_blocked_rate: `{report['overall']['yaw_blocked_rate']:.3f}`",
         f"- yaw_abstain_correct_rate: `{report['overall']['yaw_abstain_correct_rate']:.3f}`",
+        f"- xy_contracted_count: `{report['overall']['xy_contracted_count']}`",
+        f"- xy_contraction_lower_ci: `{report['overall']['xy_contraction_lower_ci']:.3f}`",
         f"- coarse_pullback_candidate_rows: `{report['overall']['coarse_pullback_candidate_rows']}`",
         f"- near_basin_shell_rows: `{report['overall']['near_basin_shell_rows']}`",
         f"- micro_entry_ready_rows: `{report['overall']['micro_entry_ready_rows']}`",
@@ -537,6 +634,21 @@ def main() -> None:
         md_lines.append(
             f"- `{item['takeover_tier']}`: rows={item['num_rows']}, xy_contract={item['xy_contraction_rate']:.3f}, "
             f"overshoot={item['overshoot_rate']:.3f}, yaw={item['yaw_observability_counts']}"
+        )
+        md_lines.append(f"  - xy_contraction_lower_ci: `{item['xy_contraction_lower_ci']:.3f}`")
+    md_lines.append("")
+    md_lines.append("## Episodes")
+    for item in report["by_episode"]:
+        md_lines.append(
+            f"- `ep{int(item['episode_idx']):03d}`: rows={item['num_rows']}, micro_entry={item['micro_entry_ready_rate']:.3f}, "
+            f"tiers={item['takeover_tier_counts']}, yaw={item['yaw_observability_counts']}"
+        )
+    md_lines.append("")
+    md_lines.append("## Window Protocols")
+    for item in report["by_window_protocol"]:
+        md_lines.append(
+            f"- mode={item['window_mode']}, shell={item['shell_filter']}, flush={item['queue_flushed']}, horizon={item['requested_horizon']}: "
+            f"rows={item['num_rows']}, micro_entry={item['micro_entry_ready_rate']:.3f}, tiers={item['takeover_tier_counts']}"
         )
     md_lines.append("")
     md_lines.append("## Failure Buckets")

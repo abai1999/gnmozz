@@ -41,6 +41,7 @@ from .recovery_augmentation import (
     select_focus_trajectories_by_bucket,
 )
 from .basin_state import BasinAxisCalibration, BasinStateCalibration, BasinStateEstimator, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, ReplayBasinResult, load_basin_state_calibration_report
+from .takeover_contract import FrameResidual, ObservabilityDecision, TakeoverThresholds, TakeoverTierDecision, classify_yaw_observability, decide_takeover_tier
 from .localizers import LocalGeometryError, RingGraspLocalizer, RingSpokeAlignLocalizer
 from .mainline import (
     BASIN_RECOVERY_CLOSED_LOOP_REPORT,
@@ -94,6 +95,12 @@ __all__ = [
     "FrameRelabelBasinEstimator",
     "ReplayBasinEstimator",
     "ReplayBasinResult",
+    "FrameResidual",
+    "ObservabilityDecision",
+    "TakeoverThresholds",
+    "TakeoverTierDecision",
+    "classify_yaw_observability",
+    "decide_takeover_tier",
     "load_basin_state_calibration_report",
     "VisualEvidenceClass",
     "basin_recovery_feature_vector",

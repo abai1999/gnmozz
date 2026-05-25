@@ -46,6 +46,7 @@ from prismatic.robot.coarse2contact_v2.recovery_augmentation import failure_morp
 from prismatic.robot.coarse2contact_v2.learned_localizer import GraspSkillHeadNet
 from prismatic.robot.coarse2contact_v2.basin_recovery import BasinStateEstimatorNet, BasinPullbackPolicyNet, GraspOnlyBasinPullbackPolicy
 from prismatic.robot.coarse2contact_v2.basin_state import BasinAxisCalibration, BasinStateCalibration, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, load_basin_state_calibration_report
+from prismatic.robot.coarse2contact_v2.takeover_contract import FrameResidual, TakeoverThresholds, classify_yaw_observability, decide_takeover_tier
 from prismatic.robot.residual_safety import ResidualSafety
 from prismatic.robot.residual_transforms import local_delta_to_world, world_delta_to_local
 from scripts.audit_c2c_v2_frame_contract_relabel import audit as audit_frame_contract_relabel
@@ -53,6 +54,7 @@ from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_interve
 from scripts.run_c2c_v2_grasp_shell_episode_sweep import _summarize_sweep_reports
 from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_shell_fields
+from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_inactive_reason
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -249,6 +251,12 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             "takeover_tier": "coarse_pullback_candidate",
             "coarse_pullback_candidate": True,
             "overshoot": False,
+            "window_protocol": {
+                "window_mode": "stage",
+                "shell_filter": "tight_near_yaw_feasible",
+                "queue_flushed": True,
+                "requested_horizon": 5,
+            },
         }
         blocked = dict(base)
         blocked.update({
@@ -259,15 +267,89 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             "takeover_tier": "abstain_prior_only",
             "coarse_pullback_candidate": False,
             "axis_gate_policy": {"x": "abstain", "y": "abstain", "z": "abstain", "yaw": "abstain"},
+            "next_privileged_dx": 0.033,
+            "next_privileged_dy": 0.0,
+            "next_privileged_dz": 0.021,
+            "next_privileged_dyaw": 0.0,
+            "next_xy_error": 0.033,
+            "true_basin_error_t_plus_1": {"dx": 0.033, "dy": 0.0, "dz": 0.021, "dyaw": 0.0},
         })
         report = audit_frame_contract_relabel([base, blocked])
         self.assertEqual(report["overall"]["schema_version_counts"]["frame_residual_v2"], 2)
+        self.assertEqual(report["overall"]["xy_contracted_count"], 1)
+        self.assertIn("by_episode", report)
+        self.assertIn("by_window_protocol", report)
         self.assertEqual(report["overall"]["coarse_pullback_candidate_rows"], 1)
         self.assertEqual(report["overall"]["yaw_observability_counts"]["observable"], 1)
         self.assertEqual(report["overall"]["yaw_observability_counts"]["unobservable"], 1)
         tiers = {item["takeover_tier"]: item for item in report["by_takeover_tier"]}
         self.assertIn("coarse_pullback_candidate", tiers)
         self.assertIn("abstain_prior_only", tiers)
+        self.assertGreaterEqual(tiers["coarse_pullback_candidate"]["xy_contraction_lower_ci"], 0.0)
+
+    def test_takeover_contract_prior_only_abstains(self) -> None:
+        residual = FrameResidual(dx=0.004, dy=0.0, dz=0.002, dyaw=0.01)
+        obs = classify_yaw_observability({}, {}, visual_observability_class="prior_only")
+        decision = decide_takeover_tier(
+            residual,
+            obs,
+            precision_row=True,
+            requires_yaw_observability=True,
+            xy_contracted=True,
+            thresholds=TakeoverThresholds(),
+        )
+        self.assertEqual(decision.takeover_tier, "abstain_prior_only")
+        self.assertFalse(decision.pullback_allowed)
+        self.assertEqual(decision.axis_gate_policy["x"], "abstain")
+        self.assertEqual(decision.axis_gate_policy["yaw"], "abstain")
+
+    def test_takeover_contract_yaw_observable_controls_yaw_axis_only(self) -> None:
+        residual = FrameResidual(dx=0.010, dy=0.0, dz=0.004, dyaw=0.03)
+        obs = classify_yaw_observability(
+            {},
+            {"frame_confidence": 0.9, "frame_observability": 0.2, "frame_axis_strength": 0.95},
+            visual_observability_class="visual_observable",
+        )
+        decision = decide_takeover_tier(
+            residual,
+            obs,
+            precision_row=True,
+            requires_yaw_observability=True,
+            xy_contracted=True,
+            thresholds=TakeoverThresholds(),
+        )
+        self.assertEqual(obs.yaw_observability_class, "observable")
+        self.assertEqual(decision.axis_gate_policy["x"], "trusted_control")
+        self.assertEqual(decision.axis_gate_policy["y"], "trusted_control")
+        self.assertEqual(decision.axis_gate_policy["z"], "diagnostic_only")
+        self.assertEqual(decision.axis_gate_policy["yaw"], "trusted_control")
+        self.assertIn(decision.takeover_tier, {"near_basin_shell", "micro_entry_ready"})
+
+    def test_takeover_contract_coarse_candidate_requires_contraction(self) -> None:
+        residual = FrameResidual(dx=0.040, dy=0.0, dz=0.020, dyaw=0.04)
+        obs = classify_yaw_observability(
+            {},
+            {"frame_confidence": 0.9, "frame_observability": 0.2, "frame_axis_strength": 0.95},
+            visual_observability_class="visual_observable",
+        )
+        no_contraction = decide_takeover_tier(
+            residual,
+            obs,
+            precision_row=True,
+            requires_yaw_observability=True,
+            xy_contracted=False,
+            thresholds=TakeoverThresholds(),
+        )
+        contraction = decide_takeover_tier(
+            residual,
+            obs,
+            precision_row=True,
+            requires_yaw_observability=True,
+            xy_contracted=True,
+            thresholds=TakeoverThresholds(),
+        )
+        self.assertEqual(no_contraction.takeover_tier, "outside_takeover")
+        self.assertEqual(contraction.takeover_tier, "coarse_pullback_candidate")
 
     def test_replay_basin_estimator_and_grasp_only_pullback_policy(self) -> None:
         gripper_pose = np.array([0.0, 0.0, 0.50, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -503,6 +585,18 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertTrue(shell_fields["grasp_probe_yaw_feasible"])
         self.assertTrue(shell_fields["grasp_probe_coarse_pullback_candidate"])
 
+    def test_grasp_probe_shell_fields_track_tight_near_shell(self) -> None:
+        shell_fields = grasp_probe_shell_fields(
+            np.array([0.017, 0.0, 0.0, 0.040], dtype=np.float32),
+            near_grasp_xy_threshold=0.015,
+            near_grasp_yaw_threshold=0.08,
+            max_xy_step=0.003,
+            horizon_steps=5,
+        )
+        self.assertTrue(shell_fields["grasp_probe_one_step_xy_feasible"])
+        self.assertTrue(shell_fields["grasp_probe_tight_near_basin_shell"])
+        self.assertTrue(shell_fields["grasp_probe_near_basin_shell"])
+
     def test_grasp_intervention_audit_splits_yaw_window_and_queue(self) -> None:
         rows = [
             {
@@ -563,6 +657,25 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(report["overall"]["ring_grasp_align_dwell_steps"]["total"], 2)
         self.assertEqual(report["overall"]["queue_protocol"]["queue_flushed_rate"], 0.5)
         self.assertGreater(report["overall"]["queue_protocol"]["queue_flush_ablation_delta"], 0.0)
+
+    def test_grasp_probe_inactive_reason_handles_tight_near_shell(self) -> None:
+        shell_fields = grasp_probe_shell_fields(
+            np.array([0.017, 0.0, 0.0, 0.120], dtype=np.float32),
+            near_grasp_xy_threshold=0.015,
+            near_grasp_yaw_threshold=0.08,
+            max_xy_step=0.003,
+            horizon_steps=5,
+        )
+        reason = grasp_probe_inactive_reason(
+            policy="replay_oracle_xy",
+            stage_ok=True,
+            visibility_bucket="visual_observable",
+            has_error=True,
+            finite_xy=True,
+            shell_filter="tight_near_yaw_feasible",
+            shell_fields=shell_fields,
+        )
+        self.assertEqual(reason, "shell_yaw_blocked")
 
     def test_forced_shell_candidates_are_counted_separately_from_runtime_stage(self) -> None:
         rows = [

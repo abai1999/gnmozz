@@ -424,7 +424,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2c_grasp_probe_horizon", type=int, default=1)
     parser.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
     parser.add_argument("--c2c_grasp_probe_window_mode", type=str, default="stage", choices=["stage", "forced_shell"])
-    parser.add_argument("--c2c_grasp_probe_shell_filter", type=str, default="off", choices=["off", "near_yaw_feasible", "coarse_yaw_feasible"])
+    parser.add_argument(
+        "--c2c_grasp_probe_shell_filter",
+        type=str,
+        default="off",
+        choices=["off", "near_yaw_feasible", "tight_near_yaw_feasible", "coarse_yaw_feasible"],
+    )
     parser.add_argument("--near_grasp_xy_threshold", type=float, default=0.015)
     parser.add_argument("--near_grasp_yaw_threshold", type=float, default=0.08)
     parser.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
@@ -698,7 +703,7 @@ def evaluate(args: argparse.Namespace) -> float:
                     trace_entry.get("basin_recovery_visual_evidence_class", trace_entry.get("visual_observability_class", "prior_only"))
                 )
                 probe_stage = str(trace_entry.get("c2c_v2_stage", ""))
-                probe_shell_fields = _grasp_probe_shell_fields(
+                probe_shell_fields = grasp_probe_shell_fields(
                     probe_true_error_before,
                     near_grasp_xy_threshold=float(args.near_grasp_xy_threshold),
                     near_grasp_yaw_threshold=float(args.near_grasp_yaw_threshold),
@@ -717,14 +722,18 @@ def evaluate(args: argparse.Namespace) -> float:
                 probe_shell_ok = bool(
                     args.c2c_grasp_probe_shell_filter == "off"
                     or (
-                        args.c2c_grasp_probe_shell_filter == "near_yaw_feasible"
-                        and bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
-                    )
-                    or (
-                        args.c2c_grasp_probe_shell_filter == "coarse_yaw_feasible"
-                        and (
-                            bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
-                            or bool(probe_shell_fields.get("grasp_probe_coarse_pullback_candidate", False))
+                    args.c2c_grasp_probe_shell_filter == "near_yaw_feasible"
+                    and bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                )
+                or (
+                    args.c2c_grasp_probe_shell_filter == "tight_near_yaw_feasible"
+                    and bool(probe_shell_fields.get("grasp_probe_tight_near_basin_shell", False))
+                )
+                or (
+                    args.c2c_grasp_probe_shell_filter == "coarse_yaw_feasible"
+                    and (
+                        bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                        or bool(probe_shell_fields.get("grasp_probe_coarse_pullback_candidate", False))
                         )
                     )
                 )
@@ -743,7 +752,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_shell_filter"] = str(args.c2c_grasp_probe_shell_filter)
                 trace_entry["grasp_probe_stage_ok"] = bool(probe_stage_ok)
                 trace_entry["grasp_probe_stage_source"] = "runtime_stage" if probe_stage == "RING_GRASP_ALIGN" else ("forced_shell" if probe_stage_ok else "not_grasp_align")
-                trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else _grasp_probe_inactive_reason(
+                trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else grasp_probe_inactive_reason(
                     policy=str(args.c2c_grasp_probe_policy),
                     stage_ok=bool(probe_stage_ok),
                     visibility_bucket=probe_visibility_bucket,

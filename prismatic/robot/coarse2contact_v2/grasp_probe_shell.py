@@ -27,6 +27,7 @@ def grasp_probe_shell_fields(
         and pre_xy <= float(near_grasp_xy_threshold) + float(max_xy_step) * float(max(1, int(horizon_steps))) + 1.0e-9
     )
     yaw_feasible = bool(np.isfinite(pre_yaw_abs) and pre_yaw_abs <= float(near_grasp_yaw_threshold) + 1.0e-9)
+    tight_near_shell = bool(one_step_xy_feasible and yaw_feasible)
     near_shell = bool(horizon_xy_feasible and yaw_feasible)
     coarse_pullback_candidate = bool(
         np.isfinite(pre_xy)
@@ -41,6 +42,7 @@ def grasp_probe_shell_fields(
         "grasp_probe_one_step_xy_feasible": one_step_xy_feasible,
         "grasp_probe_horizon_xy_feasible": horizon_xy_feasible,
         "grasp_probe_yaw_feasible": yaw_feasible,
+        "grasp_probe_tight_near_basin_shell": tight_near_shell,
         "grasp_probe_near_basin_shell": near_shell,
         "grasp_probe_coarse_pullback_candidate": coarse_pullback_candidate,
     }
@@ -67,6 +69,11 @@ def grasp_probe_inactive_reason(
     if shell_filter == "near_yaw_feasible":
         if not bool(shell_fields.get("grasp_probe_horizon_xy_feasible", False)):
             return "shell_xy_outside_horizon"
+        if not bool(shell_fields.get("grasp_probe_yaw_feasible", False)):
+            return "shell_yaw_blocked"
+    if shell_filter == "tight_near_yaw_feasible":
+        if not bool(shell_fields.get("grasp_probe_one_step_xy_feasible", False)):
+            return "shell_xy_outside_one_step"
         if not bool(shell_fields.get("grasp_probe_yaw_feasible", False)):
             return "shell_yaw_blocked"
     if shell_filter == "coarse_yaw_feasible":

@@ -23,19 +23,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from prismatic.robot.coarse2contact_v2.basin_recovery import classify_visual_evidence_for_basin
+from prismatic.robot.coarse2contact_v2.takeover_contract import (
+    CLOSE_READY_XY_THRESHOLD,
+    CLOSE_READY_YAW_THRESHOLD,
+    CLOSE_READY_Z_THRESHOLD,
+    COARSE_PULLBACK_XY_THRESHOLD,
+    DEFAULT_MAX_XY_STEP,
+    DEFAULT_PULLBACK_HORIZON,
+    NEAR_GRASP_XY_THRESHOLD,
+    NEAR_GRASP_YAW_THRESHOLD,
+    FrameResidual,
+    ObservabilityDecision,
+    TakeoverThresholds,
+    classify_yaw_observability,
+    decide_takeover_tier,
+)
 from prismatic.robot.coarse2contact_v2.recovery_augmentation import failure_morphology_bucket
 from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin
 from prismatic.robot.stage_target_provider import apply_yaw_symmetry_to_delta, build_phase1_teacher_targets, load_phase1_grasp_spec, pose_delta_local_between
 from prismatic.robot.residual_transforms import world_delta_to_local
-
-NEAR_GRASP_XY_THRESHOLD = 0.015
-NEAR_GRASP_YAW_THRESHOLD = 0.08
-CLOSE_READY_XY_THRESHOLD = 0.005
-CLOSE_READY_YAW_THRESHOLD = 0.03
-CLOSE_READY_Z_THRESHOLD = 0.010
-DEFAULT_PULLBACK_HORIZON = 3
-DEFAULT_MAX_XY_STEP = 0.003
-COARSE_PULLBACK_XY_THRESHOLD = 0.060
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -120,17 +126,13 @@ def _visual_record(trace_row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _yaw_observability_class(trace_row: Mapping[str, Any], visual_record: Mapping[str, Any]) -> str:
-    """Classify yaw observability from non-privileged runtime evidence only."""
-    if bool(trace_row.get("wrist_is_occluded", False)):
-        return "unobservable"
-    conf = float(visual_record.get("frame_confidence", 0.0) or 0.0)
-    obs = float(visual_record.get("frame_observability", 0.0) or 0.0)
-    axis = float(visual_record.get("frame_axis_strength", 0.0) or 0.0)
-    if conf >= 0.50 and obs >= 0.10 and axis >= 0.80:
-        return "observable"
-    if conf >= 0.05 or obs >= 0.005 or bool(visual_record.get("wide_ring_visible", False)):
-        return "ambiguous"
-    return "unobservable"
+    """Compatibility wrapper for older tests/scripts."""
+    visual_obs = classify_visual_evidence_for_basin(visual_record)
+    return classify_yaw_observability(
+        trace_row,
+        visual_record,
+        visual_observability_class=visual_obs.value,
+    ).yaw_observability_class
 
 
 def _finite_residual(row: Mapping[str, Any]) -> bool:
@@ -138,14 +140,24 @@ def _finite_residual(row: Mapping[str, Any]) -> bool:
 
 
 def _near_basin_shell_from_error(row: Mapping[str, Any]) -> bool:
-    xy = float(row.get("xy_error", float("nan")))
-    yaw = float(row.get("yaw_abs", float("nan")))
-    return bool(
-        np.isfinite(xy)
-        and np.isfinite(yaw)
-        and xy <= NEAR_GRASP_XY_THRESHOLD + DEFAULT_MAX_XY_STEP * DEFAULT_PULLBACK_HORIZON + 1.0e-9
-        and yaw <= NEAR_GRASP_YAW_THRESHOLD + 1.0e-9
+    residual = FrameResidual.from_mapping(row, source="relabel_row")
+    visual_class = str(row.get("visual_observability_class", "prior_only"))
+    yaw_class = str(row.get("yaw_observability_class", "unobservable"))
+    observability = ObservabilityDecision(
+        visual_observability_class=visual_class,
+        yaw_observability_class=yaw_class,
+        yaw_observable=bool(row.get("yaw_observable", yaw_class == "observable")),
+        reacquire_needed=bool(row.get("reacquire_needed", visual_class == "prior_only")),
+        reason="from_relabel_row",
     )
+    decision = decide_takeover_tier(
+        residual,
+        observability,
+        precision_row=True,
+        requires_yaw_observability=False,
+        thresholds=TakeoverThresholds(),
+    )
+    return bool(decision.near_basin_shell)
 
 
 def _xy_contracted(row: Mapping[str, Any]) -> bool:
@@ -164,20 +176,26 @@ def _overshoot(row: Mapping[str, Any]) -> bool:
 
 
 def _takeover_tier(row: Mapping[str, Any]) -> str:
-    if not _finite_residual(row):
-        return "invalid"
-    if str(row.get("visual_observability_class", "prior_only")) == "prior_only":
-        return "abstain_prior_only"
-    if bool(row.get("close_ready_ready", False)):
-        return "close_ready"
-    if bool(row.get("micro_entry_ready", False)):
-        return "micro_entry_ready"
-    if bool(row.get("near_basin_shell", False)):
-        return "near_basin_shell"
-    xy = float(row.get("xy_error", float("nan")))
-    if np.isfinite(xy) and xy <= COARSE_PULLBACK_XY_THRESHOLD and _xy_contracted(row):
-        return "coarse_pullback_candidate"
-    return "outside_takeover"
+    residual = FrameResidual.from_mapping(row, source="relabel_row")
+    frame_contract = row.get("frame_contract") if isinstance(row.get("frame_contract"), Mapping) else {}
+    visual_class = str(row.get("visual_observability_class", "prior_only"))
+    yaw_class = str(row.get("yaw_observability_class", "unobservable"))
+    observability = ObservabilityDecision(
+        visual_observability_class=visual_class,
+        yaw_observability_class=yaw_class,
+        yaw_observable=bool(row.get("yaw_observable", yaw_class == "observable")),
+        reacquire_needed=bool(row.get("reacquire_needed", visual_class == "prior_only")),
+        reason="from_relabel_row",
+    )
+    decision = decide_takeover_tier(
+        residual,
+        observability,
+        precision_row=bool(row.get("skill_type") in {"precision_grasp", "precision_align"}),
+        requires_yaw_observability=bool(row.get("requires_yaw_observability", frame_contract.get("requires_yaw_observability", False))),
+        xy_contracted=_xy_contracted(row),
+        thresholds=TakeoverThresholds(),
+    )
+    return str(decision.takeover_tier)
 
 
 def _label_invalid_reason(row: Mapping[str, Any], *, precision_row: bool) -> str:
@@ -273,62 +291,44 @@ def _frame_label_fields(
     z_semantics = "descend_progress_to_grasp_frame" if skill_type == "precision_grasp" else "axis_alignment_depth"
     visual_record = _visual_record(trace_row)
     visual_obs = classify_visual_evidence_for_basin(visual_record)
-    yaw_obs_class = "unobservable" if visual_obs.value == "prior_only" else _yaw_observability_class(trace_row, visual_record)
+    observability_decision = classify_yaw_observability(
+        trace_row,
+        visual_record,
+        visual_observability_class=visual_obs.value,
+    )
+    yaw_obs_class = observability_decision.yaw_observability_class
     try:
         skill_spec = spec.get_skill(skill_name)
     except Exception:
         skill_spec = None
     requires_yaw_observability = bool(getattr(skill_spec, "requires_yaw_observability", False)) if precision_row else False
-    yaw_observable = bool(precision_row and yaw_obs_class == "observable")
-    reacquire_needed = bool(precision_row and visual_obs == visual_obs.__class__.PRIOR_ONLY)
-    pullback_allowed = bool(precision_row and not reacquire_needed)
-    axis_gate_policy = {
-        "x": "trusted_control" if pullback_allowed else "abstain",
-        "y": "trusted_control" if pullback_allowed else "abstain",
-        "z": "diagnostic_only" if pullback_allowed else "abstain",
-        "yaw": "trusted_control" if yaw_observable else "abstain",
-    }
-    near_basin_shell = bool(
-        precision_row
-        and not reacquire_needed
-        and np.isfinite(privileged_xy)
-        and np.isfinite(privileged_yaw_abs)
-        and privileged_xy <= NEAR_GRASP_XY_THRESHOLD + DEFAULT_MAX_XY_STEP * DEFAULT_PULLBACK_HORIZON + 1.0e-9
-        and privileged_yaw_abs <= NEAR_GRASP_YAW_THRESHOLD + 1.0e-9
+    residual_contract = FrameResidual(
+        dx=float(raw_residual[0]) if raw_residual.size >= 1 else float("nan"),
+        dy=float(raw_residual[1]) if raw_residual.size >= 2 else float("nan"),
+        dz=privileged_z,
+        dyaw=float(raw_residual[5]) if raw_residual.size >= 6 else float("nan"),
+        reference_frame=reference_frame,
+        target_frame=target_frame,
+        z_semantics=z_semantics,
+        source="privileged_pose_offline",
     )
-    micro_entry_ready = bool(
-        pullback_allowed
-        and in_near_grasp_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]), xy_threshold=NEAR_GRASP_XY_THRESHOLD, yaw_threshold=NEAR_GRASP_YAW_THRESHOLD)
-        and (not requires_yaw_observability or yaw_observable)
+    takeover_decision = decide_takeover_tier(
+        residual_contract,
+        observability_decision,
+        precision_row=precision_row,
+        requires_yaw_observability=requires_yaw_observability,
+        xy_contracted=False,
+        thresholds=TakeoverThresholds(),
     )
-    close_ready_ready = bool(
-        pullback_allowed
-        and in_close_ready_basin(float(raw_residual[0]), float(raw_residual[1]), float(raw_residual[5]), xy_threshold=CLOSE_READY_XY_THRESHOLD, yaw_threshold=CLOSE_READY_YAW_THRESHOLD)
-        and abs(float(privileged_z)) <= CLOSE_READY_Z_THRESHOLD
-        and (not requires_yaw_observability or yaw_observable)
-    )
-    micro_entry_block_reason_parts = []
-    if precision_row and reacquire_needed:
-        micro_entry_block_reason_parts.append("prior_only")
-    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= NEAR_GRASP_XY_THRESHOLD):
-        micro_entry_block_reason_parts.append("xy")
-    if precision_row and requires_yaw_observability and not yaw_observable:
-        micro_entry_block_reason_parts.append("yaw")
-    micro_entry_block_reason = "+".join(micro_entry_block_reason_parts) if micro_entry_block_reason_parts else "ready"
-    close_ready_block_reason_parts = []
-    if precision_row and reacquire_needed:
-        close_ready_block_reason_parts.append("prior_only")
-    if precision_row and not (float(np.hypot(float(raw_residual[0]), float(raw_residual[1]))) <= CLOSE_READY_XY_THRESHOLD):
-        close_ready_block_reason_parts.append("xy")
-    if precision_row and abs(float(privileged_z)) > CLOSE_READY_Z_THRESHOLD:
-        close_ready_block_reason_parts.append("z")
-    if precision_row and requires_yaw_observability and not yaw_observable:
-        close_ready_block_reason_parts.append("yaw")
-    if not precision_row:
-        micro_entry_block_reason_parts = ["not_precision"]
-        close_ready_block_reason_parts = ["not_precision"]
-        micro_entry_block_reason = "not_precision"
-    close_ready_block_reason = "+".join(close_ready_block_reason_parts) if close_ready_block_reason_parts else "ready"
+    yaw_observable = bool(precision_row and observability_decision.yaw_observable)
+    reacquire_needed = bool(precision_row and observability_decision.reacquire_needed)
+    pullback_allowed = bool(takeover_decision.pullback_allowed)
+    axis_gate_policy = dict(takeover_decision.axis_gate_policy)
+    near_basin_shell = bool(takeover_decision.near_basin_shell)
+    micro_entry_ready = bool(takeover_decision.micro_entry_ready)
+    close_ready_ready = bool(takeover_decision.close_ready_ready)
+    micro_entry_block_reason = str(takeover_decision.micro_entry_block_reason)
+    close_ready_block_reason = str(takeover_decision.close_ready_block_reason)
 
     estimated = trace_row.get("estimated_basin_error", {}) or {}
     proxy = trace_row.get("local_geometry_error", {}) or {}
@@ -350,6 +350,13 @@ def _frame_label_fields(
     record = {
         "schema_version": "frame_residual_v2",
         "task_name": task_name,
+        "window_protocol": {
+            "window_mode": str(trace_row.get("grasp_probe_window_mode", trace_row.get("c2c_grasp_probe_window_mode", ""))),
+            "shell_filter": str(trace_row.get("grasp_probe_shell_filter", trace_row.get("c2c_grasp_probe_shell_filter", ""))),
+            "queue_flushed": bool(trace_row.get("grasp_probe_queue_flushed", False)),
+            "requested_horizon": int(trace_row.get("grasp_probe_requested_horizon", trace_row.get("c2c_grasp_probe_horizon", 0)) or 0),
+            "stage_source": str(trace_row.get("grasp_probe_stage_source", "")),
+        },
         "frame_contract": {
             "target_frame": target_frame,
             "reference_frame": reference_frame,
@@ -403,13 +410,30 @@ def _frame_label_fields(
         "pullback_allowed": bool(pullback_allowed),
         "near_basin_shell": bool(near_basin_shell),
         "coarse_pullback_candidate": False,
-        "takeover_tier": "pending_next_error",
+        "takeover_tier": str(takeover_decision.takeover_tier),
         "label_valid": bool(label_valid),
         "label_invalid_reason": str(label_invalid_reason),
         "micro_entry_ready": bool(micro_entry_ready),
         "micro_entry_block_reason": str(micro_entry_block_reason),
         "close_ready_ready": bool(close_ready_ready),
         "close_ready_block_reason": str(close_ready_block_reason),
+        "abstain_reason": str(
+            "prior_only"
+            if reacquire_needed
+            else (
+                "invalid_residual"
+                if not label_valid
+                else (
+                    micro_entry_block_reason
+                    if not micro_entry_ready
+                    else (
+                        close_ready_block_reason
+                        if not close_ready_ready
+                        else ""
+                    )
+                )
+            )
+        ),
         "axis_gate_policy": axis_gate_policy,
         "true_basin_error_t": {
             "dx": float(raw_residual[0]) if raw_residual.size >= 1 else float("nan"),
@@ -724,6 +748,53 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
     }
     manifest_path = output_dir / "frame_residual_v2_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    dataset_dir = ROOT / "runtime_artifacts" / "coarse2contact_v2" / "datasets"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    takeover_manifest_path = dataset_dir / "frame_residual_takeover_manifest.jsonl"
+    with open(takeover_manifest_path, "w", encoding="utf-8") as handle:
+        for row in all_rows:
+            handle.write(
+                json.dumps(
+                    {
+                        "schema_version": "frame_residual_takeover_manifest_v1",
+                        "task_name": task_name,
+                        "episode_idx": int(row.get("episode_idx", -1)),
+                        "step_idx": int(row.get("step_idx", -1)),
+                        "obs_pointer": {
+                            "runtime_obs_path": str(row.get("source_runtime_obs_path", "")),
+                            "trace_path": str(row.get("source_trace_path", "")),
+                            "episode_idx": int(row.get("episode_idx", -1)),
+                            "step_idx": int(row.get("step_idx", -1)),
+                        },
+                        "planner_prior": row.get("planner_prior", {}),
+                        "frame_contract": row.get("frame_contract", {}),
+                        "true_residual": row.get("true_basin_error_t", {}),
+                        "yaw_label": {
+                            "visual_observability_class": str(row.get("visual_observability_class", "")),
+                            "yaw_observability_class": str(row.get("yaw_observability_class", "")),
+                            "yaw_observable": bool(row.get("yaw_observable", False)),
+                            "requires_yaw_observability": bool(row.get("frame_contract", {}).get("requires_yaw_observability", False)),
+                        },
+                        "takeover_tier": str(row.get("takeover_tier", "outside_takeover")),
+                        "next_error_outcome": {
+                            "true_basin_error_t_plus_1": row.get("true_basin_error_t_plus_1", {}),
+                            "next_privileged_dx": row.get("next_privileged_dx", float("nan")),
+                            "next_privileged_dy": row.get("next_privileged_dy", float("nan")),
+                            "next_privileged_dz": row.get("next_privileged_dz", float("nan")),
+                            "next_privileged_dyaw": row.get("next_privileged_dyaw", float("nan")),
+                            "next_xy_error": row.get("next_xy_error", float("nan")),
+                            "next_yaw_abs": row.get("next_yaw_abs", float("nan")),
+                            "contraction": bool(row.get("contraction", False)),
+                            "overshoot": bool(row.get("overshoot", False)),
+                        },
+                        "abstain_reason": str(row.get("abstain_reason", "")),
+                        "label_source": str(row.get("label_source", "privileged_pose_offline")),
+                        "window_protocol": row.get("window_protocol", {}),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
     report = {
         "task_name": task_name,
@@ -735,6 +806,7 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
         "frame_residual_v2_manifest": str(manifest_path),
         "axis_summary": axis_summary,
         "group_summary": group_summary,
+        "takeover_manifest_path": str(takeover_manifest_path),
         "runtime_invariants": {
             "uses_privileged_target": False,
             "uses_privileged_runtime": False,
@@ -751,6 +823,7 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
         f"- task: `{task_name}`",
         f"- eval_root: `{eval_root}`",
         f"- rows: `{len(all_rows)}`",
+        f"- takeover_manifest_path: `{takeover_manifest_path}`",
         "",
         "## Axis Summary",
     ]
