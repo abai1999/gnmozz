@@ -32,6 +32,8 @@ Not part of the VLA2 mainline:
 - `configs/coarse2contact/tasks/` contains task-level precision contracts
 - `docs/C2C_V2_PROJECT_STATUS.md` summarizes the current C2C v2 design,
   status, and known blockers for future analysis
+- `docs/AI_REVIEW_GUIDE.md` is the short entry point for external AI reviewers
+  that only have git access
 
 ## Quick start
 

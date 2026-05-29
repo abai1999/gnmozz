@@ -6,6 +6,9 @@ conversation. It is intentionally candid: the scaffold is useful, but the
 current local skill layer does not yet solve the real failure-tail recovery
 problem.
 
+For a shorter external-review entry point, see
+[`docs/AI_REVIEW_GUIDE.md`](AI_REVIEW_GUIDE.md).
+
 ## Goal
 
 Coarse2Contact v2 is intended to become a task-general precision local skill
