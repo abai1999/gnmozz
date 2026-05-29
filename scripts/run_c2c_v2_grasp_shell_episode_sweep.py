@@ -27,6 +27,7 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PYTHON = Path("/home/guoning/my_conda_envs/vla-adapter/bin/python")
+HARD_FAILURE_BUCKETS = {"large_xy_large_yaw", "large_xy_small_yaw", "small_xy_large_yaw"}
 
 
 def _python_bin() -> str:
@@ -188,6 +189,10 @@ def _summarize_sweep_reports(
     frame_reports: list[dict[str, Any]] = []
     shell_episode_counter: Counter[int] = Counter()
     shell_bucket_counter: Counter[str] = Counter()
+    hard_support_episode_counter: Counter[int] = Counter()
+    hard_support_bucket_counter: Counter[str] = Counter()
+    hard_support_bucket_episode_counter: Counter[tuple[int, str]] = Counter()
+    blocked_reason_bucket_counter: Counter[tuple[str, str]] = Counter()
     selected_episode_indices: set[int] = set()
     selected_failure_buckets: set[str] = set()
 
@@ -209,18 +214,36 @@ def _summarize_sweep_reports(
                 shell_episode_counter[int(row.get("episode_idx", -1))] += int(row.get("near_basin_shell_rows", 0))
                 shell_bucket_counter[str(row.get("failure_bucket", ""))] += int(row.get("near_basin_shell_rows", 0))
                 selected_failure_buckets.add(str(row.get("failure_bucket", "")))
+            failure_bucket = str(row.get("failure_bucket", ""))
+            if failure_bucket in HARD_FAILURE_BUCKETS:
+                hard_support_rows = (
+                    int(row.get("near_basin_shell_rows", 0))
+                    + int(row.get("coarse_pullback_candidate_rows", 0))
+                    + int(row.get("outer_pullback_candidate_rows", 0))
+                    + int(row.get("frontier_pullback_candidate_rows", 0))
+                )
+                if hard_support_rows > 0:
+                    episode_idx = int(row.get("episode_idx", -1))
+                    hard_support_episode_counter[episode_idx] += hard_support_rows
+                    hard_support_bucket_counter[failure_bucket] += hard_support_rows
+                    hard_support_bucket_episode_counter[(episode_idx, failure_bucket)] += hard_support_rows
         if isinstance(chunk_report.get("frame_contract_report"), dict):
             frame_reports.append(dict(chunk_report["frame_contract_report"]))
+        if isinstance(chunk_report.get("failure_tail_report"), dict):
+            for item in chunk_report["failure_tail_report"].get("by_failure_bucket", []):
+                bucket = str(item.get("failure_bucket", ""))
+                for reason, count in dict(item.get("blocked_reason_counts", {})).items():
+                    blocked_reason_bucket_counter[(bucket, str(reason))] += int(count)
 
     ranked_episodes = _top_hits(
         episode_rows,
         limit=top_k,
-        keys=("near_basin_shell_rows", "coarse_pullback_candidate_rows", "horizon_xy_feasible_rows", "yaw_observable_rows", "yaw_feasible_rows", "active_count"),
+        keys=("near_basin_shell_rows", "coarse_pullback_candidate_rows", "outer_pullback_candidate_rows", "frontier_pullback_candidate_rows", "horizon_xy_feasible_rows", "yaw_observable_rows", "yaw_feasible_rows", "active_count"),
     )
     ranked_episode_buckets = _top_hits(
         episode_bucket_rows,
         limit=top_k,
-        keys=("near_basin_shell_rows", "coarse_pullback_candidate_rows", "horizon_xy_feasible_rows", "yaw_observable_rows", "yaw_feasible_rows", "active_count"),
+        keys=("near_basin_shell_rows", "coarse_pullback_candidate_rows", "outer_pullback_candidate_rows", "frontier_pullback_candidate_rows", "horizon_xy_feasible_rows", "yaw_observable_rows", "yaw_feasible_rows", "active_count"),
     )
 
     if selected_episode_indices:
@@ -229,6 +252,8 @@ def _summarize_sweep_reports(
             key=lambda ep: (
                 -int(shell_episode_counter.get(ep, 0)),
                 -max((int(item.get("coarse_pullback_candidate_rows", 0)) for item in episode_rows if int(item.get("episode_idx", -1)) == ep), default=0),
+                -max((int(item.get("outer_pullback_candidate_rows", 0)) for item in episode_rows if int(item.get("episode_idx", -1)) == ep), default=0),
+                -max((int(item.get("frontier_pullback_candidate_rows", 0)) for item in episode_rows if int(item.get("episode_idx", -1)) == ep), default=0),
                 -max((int(item.get("horizon_xy_feasible_rows", 0)) for item in episode_rows if int(item.get("episode_idx", -1)) == ep), default=0),
                 -max((int(item.get("yaw_observable_rows", item.get("yaw_feasible_rows", 0))) for item in episode_rows if int(item.get("episode_idx", -1)) == ep), default=0),
                 ep,
@@ -236,6 +261,26 @@ def _summarize_sweep_reports(
         )
     else:
         recommended_episode_indices = [int(item["episode_idx"]) for item in ranked_episodes]
+
+    hard_support_episode_indices = [
+        ep
+        for ep, _ in sorted(
+            hard_support_episode_counter.items(),
+            key=lambda item: (-int(item[1]), int(item[0])),
+        )
+    ]
+    hard_support_episode_focus_windows = _episode_focus_windows(hard_support_episode_indices, radius=focus_radius)
+    hard_support_bucket_episode_rows = [
+        {
+            "episode_idx": int(ep),
+            "failure_bucket": bucket,
+            "hard_support_rows": int(rows),
+        }
+        for (ep, bucket), rows in sorted(
+            hard_support_bucket_episode_counter.items(),
+            key=lambda item: (-int(item[1]), int(item[0][0]), item[0][1]),
+        )
+    ]
 
     total_active_rows = int(sum(int(report.get("overall", {}).get("active_rows", 0)) for report in chunk_reports))
     total_yaw_feasible_rows = int(sum(int(report.get("overall", {}).get("yaw_feasible_rows", 0)) for report in chunk_reports))
@@ -261,11 +306,17 @@ def _summarize_sweep_reports(
     }
 
     total_coarse_pullback_candidate_rows = int(sum(int(report.get("overall", {}).get("coarse_pullback_candidate_rows", 0)) for report in frame_reports))
+    total_outer_pullback_candidate_rows = int(sum(int(report.get("overall", {}).get("outer_pullback_candidate_rows", 0)) for report in frame_reports))
+    total_frontier_pullback_candidate_rows = int(sum(int(report.get("overall", {}).get("frontier_pullback_candidate_rows", 0)) for report in frame_reports))
     total_near_basin_shell_rows = int(sum(int(report.get("overall", {}).get("near_basin_shell_rows", 0)) for report in frame_reports))
     total_micro_entry_ready_rows = int(sum(int(report.get("overall", {}).get("micro_entry_ready_rows", 0)) for report in frame_reports))
     total_close_ready_rows = int(sum(int(report.get("overall", {}).get("close_ready_rows", 0)) for report in frame_reports))
     total_yaw_observable_rows = int(sum(int(report.get("overall", {}).get("yaw_observable_rows", 0)) for report in frame_reports))
     total_yaw_blocked_rows = int(sum(int(report.get("overall", {}).get("yaw_blocked_rows", max(0, report.get("overall", {}).get("num_rows", 0) - report.get("overall", {}).get("yaw_observable_rows", 0)))) for report in frame_reports))
+    blocked_reason_counts_by_failure_bucket = {
+        bucket: {reason: int(count) for (bucket_key, reason), count in sorted(blocked_reason_bucket_counter.items()) if bucket_key == bucket}
+        for bucket in sorted({bucket for bucket, _ in blocked_reason_bucket_counter.keys()})
+    }
     collection_target = {
         "active_rows": total_active_rows,
         "yaw_feasible_rows": total_yaw_feasible_rows,
@@ -297,6 +348,12 @@ def _summarize_sweep_reports(
         "shell_hit_episode_counts": dict(sorted(shell_episode_counter.items())),
         "shell_hit_bucket_counts": dict(sorted(shell_bucket_counter.items())),
         "shell_hit_episode_focus_windows": _episode_focus_windows(selected_episode_indices, radius=focus_radius),
+        "hard_support_episode_indices": hard_support_episode_indices,
+        "hard_support_failure_buckets": sorted(hard_support_bucket_counter.keys()),
+        "hard_support_episode_counts": dict(sorted(hard_support_episode_counter.items())),
+        "hard_support_bucket_counts": dict(sorted(hard_support_bucket_counter.items())),
+        "hard_support_episode_focus_windows": hard_support_episode_focus_windows,
+        "hard_support_episode_bucket_rows": hard_support_bucket_episode_rows,
         "recommended_next_episode_indices": recommended_episode_indices[: max(1, int(top_k))],
         "recommended_focus_episode_indices": sorted(
             {
@@ -308,11 +365,14 @@ def _summarize_sweep_reports(
         "collection_target": collection_target,
         "frame_contract_summary": {
             "coarse_pullback_candidate_rows": total_coarse_pullback_candidate_rows,
+            "outer_pullback_candidate_rows": total_outer_pullback_candidate_rows,
+            "frontier_pullback_candidate_rows": total_frontier_pullback_candidate_rows,
             "near_basin_shell_rows": total_near_basin_shell_rows,
             "micro_entry_ready_rows": total_micro_entry_ready_rows,
             "close_ready_rows": total_close_ready_rows,
             "yaw_observable_rows": total_yaw_observable_rows,
             "yaw_blocked_rows": total_yaw_blocked_rows,
+            "blocked_reason_counts_by_failure_bucket": blocked_reason_counts_by_failure_bucket,
             "contraction_lower_ci_by_tier": contraction_lower_ci_by_tier,
             "contraction_rate_by_tier": contraction_rate_by_tier,
             "frame_contract_report_count": int(len(frame_reports)),
@@ -338,6 +398,8 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
         "",
         "## Frame Contract Summary",
         f"- coarse_pullback_candidate_rows: `{summary['frame_contract_summary']['coarse_pullback_candidate_rows']}`",
+        f"- outer_pullback_candidate_rows: `{summary['frame_contract_summary']['outer_pullback_candidate_rows']}`",
+        f"- frontier_pullback_candidate_rows: `{summary['frame_contract_summary']['frontier_pullback_candidate_rows']}`",
         f"- near_basin_shell_rows: `{summary['frame_contract_summary']['near_basin_shell_rows']}`",
         f"- micro_entry_ready_rows: `{summary['frame_contract_summary']['micro_entry_ready_rows']}`",
         f"- close_ready_rows: `{summary['frame_contract_summary']['close_ready_rows']}`",
@@ -347,8 +409,18 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
         f"- contraction_lower_ci_by_tier: `{summary['frame_contract_summary']['contraction_lower_ci_by_tier']}`",
         f"- contraction_rate_by_tier: `{summary['frame_contract_summary']['contraction_rate_by_tier']}`",
         "",
-        "## Shell Hit Episodes",
+        "## Blocked Reasons By Failure Bucket",
     ]
+    blocked_reason_counts = summary["frame_contract_summary"].get("blocked_reason_counts_by_failure_bucket", {})
+    if blocked_reason_counts:
+        for bucket, counts in blocked_reason_counts.items():
+            lines.append(f"- `{bucket}`: `{counts}`")
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "## Shell Hit Episodes",
+    ])
     if summary["shell_hit_episode_indices"]:
         for ep in summary["shell_hit_episode_indices"]:
             lines.append(f"- `ep{int(ep):03d}`")
@@ -365,12 +437,30 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
         lines.append("- none")
     lines.extend([
         "",
+        "## Hard Support Surface",
+    ])
+    if summary["hard_support_failure_buckets"]:
+        for bucket in summary["hard_support_failure_buckets"]:
+            lines.append(f"- `{bucket}`: `{summary['hard_support_bucket_counts'].get(bucket, 0)}`")
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
+        "## Hard Support Episodes",
+    ])
+    if summary["hard_support_episode_indices"]:
+        for ep in summary["hard_support_episode_indices"]:
+            lines.append(f"- `ep{int(ep):03d}`: `{summary['hard_support_episode_counts'].get(ep, 0)}`")
+    else:
+        lines.append("- none")
+    lines.extend([
+        "",
         "## Top Episodes",
     ])
     for item in summary["ranked_episodes"]:
         lines.append(
             f"- `ep{int(item['episode_idx']):03d}`: shell={int(item['near_basin_shell_rows'])}, "
-            f"coarse={int(item.get('coarse_pullback_candidate_rows', 0))}, active={int(item['active_count'])}, "
+            f"coarse={int(item.get('coarse_pullback_candidate_rows', 0))}, outer={int(item.get('outer_pullback_candidate_rows', 0))}, frontier={int(item.get('frontier_pullback_candidate_rows', 0))}, active={int(item['active_count'])}, "
             f"horizon_xy={int(item['horizon_xy_feasible_rows'])}, yaw={int(item.get('yaw_observable_rows', item.get('yaw_feasible_rows', 0)))}"
         )
     lines.extend([
@@ -380,7 +470,7 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
     for item in summary["ranked_episode_buckets"]:
         lines.append(
             f"- `ep{int(item['episode_idx']):03d}` / `{item['failure_bucket']}`: shell={int(item['near_basin_shell_rows'])}, "
-            f"coarse={int(item.get('coarse_pullback_candidate_rows', 0))}, active={int(item['active_count'])}, "
+            f"coarse={int(item.get('coarse_pullback_candidate_rows', 0))}, outer={int(item.get('outer_pullback_candidate_rows', 0))}, frontier={int(item.get('frontier_pullback_candidate_rows', 0))}, active={int(item['active_count'])}, "
             f"horizon_xy={int(item['horizon_xy_feasible_rows'])}, yaw={int(item.get('yaw_observable_rows', item.get('yaw_feasible_rows', 0)))}"
         )
     lines.extend([
@@ -441,11 +531,21 @@ def main() -> None:
     ap.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
     ap.add_argument("--c2c_grasp_probe_window_mode", type=str, default="forced_shell", choices=["stage", "forced_shell"])
     ap.add_argument(
+        "--c2c_grasp_probe_candidate_jsonl",
+        type=str,
+        default="",
+        help="Optional grasp failure-tail candidate JSONL used to restrict probe activation.",
+    )
+    ap.add_argument(
         "--c2c_grasp_probe_shell_filter",
         type=str,
-        default="coarse_yaw_feasible",
-        choices=["off", "near_yaw_feasible", "tight_near_yaw_feasible", "coarse_yaw_feasible"],
+        default="frontier_pullback_feasible",
+        choices=["off", "near_yaw_feasible", "tight_near_yaw_feasible", "coarse_yaw_feasible", "frontier_pullback_feasible", "small_xy_large_yaw_frontier_feasible"],
     )
+    ap.add_argument("--c2c_grasp_probe_outer_pullback_xy_threshold", type=float, default=0.120)
+    ap.add_argument("--c2c_grasp_probe_frontier_pullback_xy_threshold", type=float, default=0.180)
+    ap.add_argument("--c2c_grasp_probe_small_xy_large_yaw_xy_threshold", type=float, default=0.060)
+    ap.add_argument("--c2c_grasp_probe_relax_small_xy_large_yaw_candidate", action="store_true", default=False)
     ap.add_argument("--basin_state_calibration_report", type=str, default="runtime_artifacts/coarse2contact_v2/reports/basin_state_calibration/basin_state_calibration.json")
     ap.add_argument("--top_k", type=int, default=8)
     ap.add_argument("--focus_radius", type=int, default=1)
@@ -522,8 +622,24 @@ def main() -> None:
             ),
             "--c2c_grasp_probe_window_mode",
             args.c2c_grasp_probe_window_mode,
+            *(
+                ["--c2c_grasp_probe_candidate_jsonl", str(args.c2c_grasp_probe_candidate_jsonl)]
+                if str(args.c2c_grasp_probe_candidate_jsonl)
+                else []
+            ),
             "--c2c_grasp_probe_shell_filter",
             args.c2c_grasp_probe_shell_filter,
+            "--c2c_grasp_probe_outer_pullback_xy_threshold",
+            str(args.c2c_grasp_probe_outer_pullback_xy_threshold),
+            "--c2c_grasp_probe_frontier_pullback_xy_threshold",
+            str(args.c2c_grasp_probe_frontier_pullback_xy_threshold),
+            "--c2c_grasp_probe_small_xy_large_yaw_xy_threshold",
+            str(args.c2c_grasp_probe_small_xy_large_yaw_xy_threshold),
+            *(
+                ["--c2c_grasp_probe_relax_small_xy_large_yaw_candidate"]
+                if bool(args.c2c_grasp_probe_relax_small_xy_large_yaw_candidate)
+                else []
+            ),
             "--near_grasp_xy_threshold",
             str(args.near_grasp_xy_threshold),
             "--near_grasp_yaw_threshold",
@@ -565,6 +681,23 @@ def main() -> None:
         ]
         _run_with_optional_xvfb(audit_cmd, cwd=ROOT, env=env, log_path=audit_log)
 
+        failure_tail_audit_output_root = chunk_dir / "failure_tail_audit"
+        failure_tail_audit_log = chunk_dir / "failure_tail_audit.log"
+        failure_tail_report_path = failure_tail_audit_output_root / "grasp_failure_tail_intervention_audit.json"
+        if str(args.c2c_grasp_probe_candidate_jsonl):
+            failure_tail_audit_cmd = [
+                python_bin,
+                "-u",
+                "scripts/audit_c2c_v2_grasp_failure_tail_intervention.py",
+                "--candidate_jsonl",
+                str(args.c2c_grasp_probe_candidate_jsonl),
+                "--trace_dir",
+                str(trace_dir),
+                "--output_dir",
+                str(failure_tail_audit_output_root),
+            ]
+            _run_with_optional_xvfb(failure_tail_audit_cmd, cwd=ROOT, env=env, log_path=failure_tail_audit_log)
+
         relabel_output_root = chunk_dir / "frame_contract_relabel"
         relabel_log = chunk_dir / "frame_contract_relabel.log"
         relabel_cmd = [
@@ -603,6 +736,11 @@ def main() -> None:
         report["trace_dir"] = str(trace_dir)
         report["evaluate_log"] = str(eval_log)
         report["audit_log"] = str(audit_log)
+        report["failure_tail_audit_output_root"] = str(failure_tail_audit_output_root)
+        report["failure_tail_audit_log"] = str(failure_tail_audit_log)
+        if failure_tail_report_path.exists():
+            report["failure_tail_report"] = _read_json(failure_tail_report_path)
+            report["failure_tail_report_path"] = str(failure_tail_report_path)
         report["relabel_output_root"] = str(relabel_output_root)
         report["relabel_log"] = str(relabel_log)
         report["frame_contract_audit_output_root"] = str(frame_contract_audit_output_root)
@@ -631,7 +769,8 @@ def main() -> None:
             "chunk_dirs": [str(path) for path in chunk_dirs],
             "sweep_output_root": str(sweep_dir),
             "task_name": args.task_name,
-            "checkpoint_dir": str(args.checkpoint_dir.resolve()),
+            "checkpoint_dir": str(args.checkpoint_dir),
+            "checkpoint_dir_resolved": str(args.checkpoint_dir.resolve()),
             "mode": args.mode,
             "episode_range": {
                 "start": int(args.episode_start),
@@ -641,10 +780,15 @@ def main() -> None:
             "sweep_config": {
                 "c2c_grasp_probe_window_mode": args.c2c_grasp_probe_window_mode,
                 "c2c_grasp_probe_shell_filter": args.c2c_grasp_probe_shell_filter,
+                "c2c_grasp_probe_candidate_jsonl": str(args.c2c_grasp_probe_candidate_jsonl),
                 "c2c_grasp_probe_horizon": int(args.c2c_grasp_probe_horizon),
                 "c2c_grasp_probe_flush_planner_queue": bool(args.c2c_grasp_probe_flush_planner_queue),
                 "c2c_grasp_probe_xy_gain": float(args.c2c_grasp_probe_xy_gain),
                 "c2c_grasp_probe_max_xy_step": float(args.c2c_grasp_probe_max_xy_step),
+                "c2c_grasp_probe_outer_pullback_xy_threshold": float(args.c2c_grasp_probe_outer_pullback_xy_threshold),
+                "c2c_grasp_probe_frontier_pullback_xy_threshold": float(args.c2c_grasp_probe_frontier_pullback_xy_threshold),
+                "c2c_grasp_probe_small_xy_large_yaw_xy_threshold": float(args.c2c_grasp_probe_small_xy_large_yaw_xy_threshold),
+                "c2c_grasp_probe_relax_small_xy_large_yaw_candidate": bool(args.c2c_grasp_probe_relax_small_xy_large_yaw_candidate),
                 "focus_radius": int(args.focus_radius),
                 "near_grasp_xy_threshold": float(args.near_grasp_xy_threshold),
                 "near_grasp_yaw_threshold": float(args.near_grasp_yaw_threshold),

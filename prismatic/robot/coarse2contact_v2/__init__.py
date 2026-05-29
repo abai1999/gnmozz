@@ -16,6 +16,15 @@ from .basin_recovery import (
     classify_visual_evidence_for_basin,
 )
 from .datasets import DepthLocalizerJsonlDataset, ForceContactJsonlDataset, build_vocab as build_c2c_vocab
+from .frame_yaw_estimator import (
+    FRAME_YAW_FEATURE_NAMES,
+    FrameYawEstimate,
+    FrameYawEstimatorNet,
+    frame_yaw_feature_vector,
+    frame_yaw_label_from_row,
+    load_frame_yaw_checkpoint,
+    save_frame_yaw_checkpoint,
+)
 from .learned_force import ForceContactClassifierNet, LearnedForceClassifierAdapter, load_force_classifier_checkpoint
 from .learned_localizer import (
     DepthGeometryLocalizerNet,
@@ -109,6 +118,13 @@ __all__ = [
     "DepthLocalizerJsonlDataset",
     "ForceContactJsonlDataset",
     "build_c2c_vocab",
+    "FRAME_YAW_FEATURE_NAMES",
+    "FrameYawEstimate",
+    "FrameYawEstimatorNet",
+    "frame_yaw_feature_vector",
+    "frame_yaw_label_from_row",
+    "load_frame_yaw_checkpoint",
+    "save_frame_yaw_checkpoint",
     "DepthGeometryLocalizerNet",
     "RingFrameLocalizerNet",
     "RingFramePrediction",

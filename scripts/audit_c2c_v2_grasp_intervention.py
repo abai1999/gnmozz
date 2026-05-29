@@ -18,6 +18,8 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from prismatic.robot.coarse2contact_v2.takeover_contract import COARSE_PULLBACK_XY_THRESHOLD, OUTER_PULLBACK_XY_THRESHOLD
+
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -219,6 +221,26 @@ def _shell_summary(
         r for r in horizon_xy
         if _yaw_feasible(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold)
     ]
+    outer_pullback = [
+        r for r in active
+        if _probe_outer_pullback_candidate(
+            r,
+            near_grasp_xy_threshold=near_grasp_xy_threshold,
+            near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+            max_xy_step=max_xy_step,
+            horizon_steps=horizon_steps,
+        )
+    ]
+    frontier_pullback = [
+        r for r in active
+        if _probe_frontier_pullback_candidate(
+            r,
+            near_grasp_xy_threshold=near_grasp_xy_threshold,
+            near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+            max_xy_step=max_xy_step,
+            horizon_steps=horizon_steps,
+        )
+    ]
 
     def _summary(subset: list[dict[str, Any]]) -> dict[str, Any]:
         return {
@@ -238,6 +260,8 @@ def _shell_summary(
         "horizon_xy_feasible": _summary(horizon_xy),
         "yaw_feasible": _summary(yaw),
         "horizon_xy_and_yaw_feasible": _summary(horizon_xy_yaw),
+        "outer_pullback_candidate": _summary(outer_pullback),
+        "frontier_pullback_candidate": _summary(frontier_pullback),
     }
 
 
@@ -385,6 +409,80 @@ def _probe_coarse_pullback_candidate(
     return bool(np.isfinite(pre_xy) and near_shell_xy < pre_xy <= 0.060)
 
 
+def _probe_outer_pullback_candidate(
+    row: Mapping[str, Any],
+    *,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float,
+    max_xy_step: float,
+    horizon_steps: int,
+) -> bool:
+    if bool(row.get("grasp_probe_outer_pullback_candidate", False)):
+        return True
+    if _row_group_value(row, "grasp_probe_visibility_bucket", "prior_only") == "prior_only":
+        return False
+    if _probe_near_basin_shell(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    ):
+        return False
+    if _probe_coarse_pullback_candidate(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    ):
+        return False
+    pre_xy = _probe_pre_xy(row)
+    near_shell_xy = float(near_grasp_xy_threshold) + float(max_xy_step) * float(max(1, int(horizon_steps)))
+    return bool(np.isfinite(pre_xy) and near_shell_xy < pre_xy <= float(OUTER_PULLBACK_XY_THRESHOLD))
+
+
+def _probe_frontier_pullback_candidate(
+    row: Mapping[str, Any],
+    *,
+    near_grasp_xy_threshold: float,
+    near_grasp_yaw_threshold: float,
+    max_xy_step: float,
+    horizon_steps: int,
+    frontier_pullback_xy_threshold: float = 0.180,
+) -> bool:
+    if bool(row.get("grasp_probe_frontier_pullback_candidate", False)):
+        return True
+    if _row_group_value(row, "grasp_probe_visibility_bucket", "prior_only") == "prior_only":
+        return False
+    if _probe_near_basin_shell(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    ):
+        return False
+    if _probe_coarse_pullback_candidate(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    ):
+        return False
+    if _probe_outer_pullback_candidate(
+        row,
+        near_grasp_xy_threshold=near_grasp_xy_threshold,
+        near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+        max_xy_step=max_xy_step,
+        horizon_steps=horizon_steps,
+    ):
+        return False
+    pre_xy = _probe_pre_xy(row)
+    return bool(np.isfinite(pre_xy) and float(OUTER_PULLBACK_XY_THRESHOLD) < pre_xy <= float(frontier_pullback_xy_threshold))
+
+
 def _group_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> dict[tuple[str, ...], list[dict[str, Any]]]:
     groups: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -473,6 +571,7 @@ def _bucket_summary(
         "xy_contraction_rate": float(active_xy_rate),
         "xy_contraction_lower_ci": float(_wilson_lower_bound(contracted_count, len(active_xy))),
         "xy_contracted_count": int(contracted_count),
+        "outer_pullback_candidate_rows": int(sum(_probe_outer_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
         "micro_entry_ready_after_rate": micro_after,
         "near_grasp_after_rate": near_after,
         "close_ready_after_rate": close_after,
@@ -504,6 +603,8 @@ def _bucket_summary(
         "active_xy_rows": int(len(active_xy)),
         "near_basin_shell_rows": int(sum(_probe_near_basin_shell(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
         "coarse_pullback_candidate_rows": int(sum(_probe_coarse_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
+        "outer_pullback_candidate_rows": int(sum(_probe_outer_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
+        "frontier_pullback_candidate_rows": int(sum(_probe_frontier_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
         "yaw_feasible_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in rows)),
         "yaw_observable_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in rows)),
         "horizon_xy_feasible_rows": int(sum(_probe_horizon_xy_feasible(r, near_grasp_xy_threshold=near_grasp_xy_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in rows)),
@@ -650,6 +751,8 @@ def audit(
         "mean_horizon_steps_executed": float(np.mean([int(r.get("grasp_probe_horizon_steps_executed", 0) or 0) for r in active_rows])) if active_rows else 0.0,
         "near_basin_shell_rows": int(sum(_probe_near_basin_shell(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
         "coarse_pullback_candidate_rows": int(sum(_probe_coarse_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
+        "outer_pullback_candidate_rows": int(sum(_probe_outer_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
+        "frontier_pullback_candidate_rows": int(sum(_probe_frontier_pullback_candidate(r, near_grasp_xy_threshold=near_grasp_xy_threshold, near_grasp_yaw_threshold=near_grasp_yaw_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
         "yaw_feasible_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in probe_rows)),
         "yaw_observable_rows": int(sum(_probe_yaw_observable(r, near_grasp_yaw_threshold=near_grasp_yaw_threshold) for r in probe_rows)),
         "horizon_xy_feasible_rows": int(sum(_probe_horizon_xy_feasible(r, near_grasp_xy_threshold=near_grasp_xy_threshold, max_xy_step=max_xy_step, horizon_steps=horizon_steps) for r in probe_rows)),
@@ -811,6 +914,7 @@ def main() -> None:
         f"- horizon_overshoot_rate: `{report['overall']['horizon_overshoot_rate']:.3f}`",
         f"- mean_horizon_steps_executed: `{report['overall']['mean_horizon_steps_executed']:.2f}`",
         f"- coarse_pullback_candidate_rows: `{report['overall']['coarse_pullback_candidate_rows']}`",
+        f"- outer_pullback_candidate_rows: `{report['overall']['outer_pullback_candidate_rows']}`",
         f"- near_basin_shell_rows: `{report['overall']['near_basin_shell_rows']}`",
         f"- horizon_xy_feasible_rows: `{report['overall']['horizon_xy_feasible_rows']}`",
         f"- yaw_feasible_rows: `{report['overall']['yaw_feasible_rows']}`",
@@ -846,6 +950,7 @@ def main() -> None:
         md_lines.append(f"  - active_count: `{item['active_count']}`")
         md_lines.append(f"  - xy_contraction_rate: `{item['xy_contraction_rate']:.3f}`")
         md_lines.append(f"  - xy_contraction_lower_ci: `{item['xy_contraction_lower_ci']:.3f}`")
+        md_lines.append(f"  - outer_pullback_candidate_rows: `{item['outer_pullback_candidate_rows']}`")
         md_lines.append(f"  - micro_entry_ready_after_rate: `{item['micro_entry_ready_after_rate']:.3f}`")
         md_lines.append(f"  - near_grasp_after_rate: `{item['near_grasp_after_rate']:.3f}`")
         md_lines.append(f"  - close_ready_after_rate: `{item['close_ready_after_rate']:.3f}`")

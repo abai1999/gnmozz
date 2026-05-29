@@ -35,7 +35,9 @@ from prismatic.robot.coarse2contact_v2.takeover_contract import (
     FrameResidual,
     ObservabilityDecision,
     TakeoverThresholds,
+    TIER_OUTER_PULLBACK,
     classify_yaw_observability,
+    explain_yaw_observability,
     decide_takeover_tier,
 )
 from prismatic.robot.coarse2contact_v2.recovery_augmentation import failure_morphology_bucket
@@ -143,10 +145,11 @@ def _near_basin_shell_from_error(row: Mapping[str, Any]) -> bool:
     residual = FrameResidual.from_mapping(row, source="relabel_row")
     visual_class = str(row.get("visual_observability_class", "prior_only"))
     yaw_class = str(row.get("yaw_observability_class", "unobservable"))
+    frame_contract = row.get("frame_contract") if isinstance(row.get("frame_contract"), Mapping) else {}
     observability = ObservabilityDecision(
         visual_observability_class=visual_class,
         yaw_observability_class=yaw_class,
-        yaw_observable=bool(row.get("yaw_observable", yaw_class == "observable")),
+        yaw_observable=bool(row.get("yaw_control_observable", row.get("yaw_observable", yaw_class == "observable"))),
         reacquire_needed=bool(row.get("reacquire_needed", visual_class == "prior_only")),
         reason="from_relabel_row",
     )
@@ -154,7 +157,7 @@ def _near_basin_shell_from_error(row: Mapping[str, Any]) -> bool:
         residual,
         observability,
         precision_row=True,
-        requires_yaw_observability=False,
+        requires_yaw_observability=bool(row.get("requires_yaw_observability", frame_contract.get("requires_yaw_observability", False))),
         thresholds=TakeoverThresholds(),
     )
     return bool(decision.near_basin_shell)
@@ -183,7 +186,7 @@ def _takeover_tier(row: Mapping[str, Any]) -> str:
     observability = ObservabilityDecision(
         visual_observability_class=visual_class,
         yaw_observability_class=yaw_class,
-        yaw_observable=bool(row.get("yaw_observable", yaw_class == "observable")),
+        yaw_observable=bool(row.get("yaw_control_observable", row.get("yaw_observable", yaw_class == "observable"))),
         reacquire_needed=bool(row.get("reacquire_needed", visual_class == "prior_only")),
         reason="from_relabel_row",
     )
@@ -296,6 +299,11 @@ def _frame_label_fields(
         visual_record,
         visual_observability_class=visual_obs.value,
     )
+    yaw_observability_explainer = explain_yaw_observability(
+        trace_row,
+        visual_record,
+        visual_observability_class=visual_obs.value,
+    )
     yaw_obs_class = observability_decision.yaw_observability_class
     try:
         skill_spec = spec.get_skill(skill_name)
@@ -324,9 +332,13 @@ def _frame_label_fields(
     reacquire_needed = bool(precision_row and observability_decision.reacquire_needed)
     pullback_allowed = bool(takeover_decision.pullback_allowed)
     axis_gate_policy = dict(takeover_decision.axis_gate_policy)
+    yaw_entry_feasible = bool(takeover_decision.yaw_entry_feasible)
+    yaw_control_observable = bool(takeover_decision.yaw_control_observable)
     near_basin_shell = bool(takeover_decision.near_basin_shell)
     micro_entry_ready = bool(takeover_decision.micro_entry_ready)
     close_ready_ready = bool(takeover_decision.close_ready_ready)
+    yaw_entry_block_reason = str(takeover_decision.yaw_entry_block_reason)
+    yaw_control_block_reason = str(takeover_decision.yaw_control_block_reason)
     micro_entry_block_reason = str(takeover_decision.micro_entry_block_reason)
     close_ready_block_reason = str(takeover_decision.close_ready_block_reason)
 
@@ -373,6 +385,8 @@ def _frame_label_fields(
             "frame_observability": float(visual_record["frame_observability"]),
             "frame_axis_strength": float(visual_record["frame_axis_strength"]),
             "yaw_observability_class": str(yaw_obs_class),
+            "yaw_entry_feasible": bool(yaw_entry_feasible),
+            "yaw_control_observable": bool(yaw_control_observable),
             "source_phase_owner": str(trace_row.get("phase_owner", trace_row.get("c2c_v2_owner", ""))),
             "source_basin_recovery_mode": str(trace_row.get("basin_recovery_mode", "")),
             "source_localizer_abstained": bool(trace_row.get("localizer_abstained", False)),
@@ -405,11 +419,25 @@ def _frame_label_fields(
         "xy_error": privileged_xy,
         "yaw_abs": privileged_yaw_abs,
         "yaw_observable": bool(yaw_observable),
+        "yaw_entry_feasible": bool(yaw_entry_feasible),
+        "yaw_control_observable": bool(yaw_control_observable),
+        "yaw_entry_block_reason": str(yaw_entry_block_reason),
+        "yaw_control_block_reason": str(yaw_control_block_reason),
         "yaw_observability_class": str(yaw_obs_class),
+        "yaw_observability_reason": str(observability_decision.reason),
+        "yaw_observability_blocker_combo": str(yaw_observability_explainer["blocker_combo"]),
+        "yaw_observability_primary_blocker": str(yaw_observability_explainer["primary_blocker"]),
+        "yaw_observability_gate_passes": dict(yaw_observability_explainer["gate_passes"]),
+        "yaw_observability_frame_confidence": float(visual_record["frame_confidence"]),
+        "yaw_observability_frame_observability": float(visual_record["frame_observability"]),
+        "yaw_observability_frame_axis_strength": float(visual_record["frame_axis_strength"]),
+        "yaw_observability_wide_ring_visible": bool(visual_record["wide_ring_visible"]),
+        "yaw_observability_wrist_occluded": bool(trace_row.get("wrist_is_occluded", False)),
         "reacquire_needed": bool(reacquire_needed),
         "pullback_allowed": bool(pullback_allowed),
         "near_basin_shell": bool(near_basin_shell),
         "coarse_pullback_candidate": False,
+        "outer_pullback_candidate": False,
         "takeover_tier": str(takeover_decision.takeover_tier),
         "label_valid": bool(label_valid),
         "label_invalid_reason": str(label_invalid_reason),
@@ -486,6 +514,7 @@ def _frame_label_fields(
     }
     record["takeover_tier"] = _takeover_tier(record)
     record["coarse_pullback_candidate"] = bool(record["takeover_tier"] == "coarse_pullback_candidate")
+    record["outer_pullback_candidate"] = bool(record["takeover_tier"] == TIER_OUTER_PULLBACK)
     record["contraction"] = False
     record["xy_contracted"] = False
     record["overshoot"] = False
@@ -605,6 +634,7 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
                 record["near_basin_shell"] = bool(_near_basin_shell_from_error(record))
                 record["takeover_tier"] = _takeover_tier(record)
                 record["coarse_pullback_candidate"] = bool(record["takeover_tier"] == "coarse_pullback_candidate")
+                record["outer_pullback_candidate"] = bool(record["takeover_tier"] == TIER_OUTER_PULLBACK)
                 record["label_invalid_reason"] = _label_invalid_reason(record, precision_row=bool(record.get("skill_type") in {"precision_grasp", "precision_align"}))
                 record["label_valid"] = bool(record["label_invalid_reason"] == "")
                 all_rows.append(record)
@@ -700,6 +730,7 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
                 "close_ready_rate": float(np.mean([bool(r["close_ready_basin"]) for r in rows])),
                 "near_basin_shell_rate": float(np.mean([bool(r["near_basin_shell"]) for r in rows])),
                 "coarse_pullback_candidate_rate": float(np.mean([bool(r["coarse_pullback_candidate"]) for r in rows])),
+                "outer_pullback_candidate_rate": float(np.mean([bool(r["outer_pullback_candidate"]) for r in rows])),
                 "takeover_tier_counts": dict(Counter(str(r["takeover_tier"]) for r in rows)),
                 "yaw_observability_counts": dict(Counter(str(r["yaw_observability_class"]) for r in rows)),
                 "mean_xy_error": float(np.mean([float(r["xy_error"]) for r in rows])),
@@ -712,9 +743,22 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
     counts["near_grasp_hits"] = int(sum(1 for r in all_rows if bool(r["near_grasp_basin"])))
     counts["close_ready_hits"] = int(sum(1 for r in all_rows if bool(r["close_ready_basin"])))
     counts["near_basin_shell_rows"] = int(sum(1 for r in all_rows if bool(r["near_basin_shell"])))
+    counts["near_basin_shell_yaw_entry_feasible_rows"] = int(sum(1 for r in all_rows if bool(r["near_basin_shell"]) and bool(r.get("yaw_entry_feasible", False))))
+    counts["near_basin_shell_yaw_entry_blocked_rows"] = int(sum(1 for r in all_rows if bool(r["near_basin_shell"]) and not bool(r.get("yaw_entry_feasible", False))))
+    counts["near_basin_shell_yaw_control_observable_rows"] = int(sum(1 for r in all_rows if bool(r["near_basin_shell"]) and bool(r.get("yaw_control_observable", r.get("yaw_observable", False)))))
+    counts["near_basin_shell_yaw_control_blocked_rows"] = int(sum(1 for r in all_rows if bool(r["near_basin_shell"]) and not bool(r.get("yaw_control_observable", r.get("yaw_observable", False)))))
+    counts["near_basin_shell_yaw_observable_rows"] = int(counts["near_basin_shell_yaw_control_observable_rows"])
+    counts["near_basin_shell_yaw_blocked_rows"] = int(counts["near_basin_shell_yaw_control_blocked_rows"])
+    counts["near_basin_shell_yaw_observable_rate"] = float(
+        np.mean([bool(r.get("yaw_control_observable", r.get("yaw_observable", False))) for r in all_rows if bool(r["near_basin_shell"])])
+    ) if any(bool(r["near_basin_shell"]) for r in all_rows) else 0.0
+    counts["yaw_entry_feasible_rows"] = int(sum(1 for r in all_rows if bool(r.get("yaw_entry_feasible", False))))
+    counts["yaw_entry_blocked_rows"] = int(sum(1 for r in all_rows if not bool(r.get("yaw_entry_feasible", False))))
     counts["coarse_pullback_candidate_rows"] = int(sum(1 for r in all_rows if bool(r["coarse_pullback_candidate"])))
+    counts["outer_pullback_candidate_rows"] = int(sum(1 for r in all_rows if bool(r["outer_pullback_candidate"])))
     counts["micro_entry_ready_rows"] = int(sum(1 for r in all_rows if bool(r["micro_entry_ready"])))
     counts["yaw_observable_rows"] = int(sum(1 for r in all_rows if str(r["yaw_observability_class"]) == "observable"))
+    counts["yaw_control_observable_rows"] = int(sum(1 for r in all_rows if bool(r.get("yaw_control_observable", r.get("yaw_observable", False)))))
     counts["label_valid_rows"] = int(sum(1 for r in all_rows if bool(r["label_valid"])))
 
     manifest = {
@@ -735,6 +779,10 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
             "true_basin_error_t",
             "true_basin_error_t_plus_1",
             "yaw_observability_class",
+            "yaw_observability_blocker_combo",
+            "yaw_observability_primary_blocker",
+            "yaw_entry_feasible",
+            "yaw_control_observable",
             "takeover_tier",
             "contraction",
             "overshoot",
@@ -745,6 +793,16 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
             "uses_privileged_label": True,
             "uses_rlbench_mask_runtime": False,
         },
+        "near_basin_shell_yaw_alignment": {
+            "yaw_entry_feasible_rows": int(counts["near_basin_shell_yaw_entry_feasible_rows"]),
+            "yaw_entry_blocked_rows": int(counts["near_basin_shell_yaw_entry_blocked_rows"]),
+            "yaw_control_observable_rows": int(counts["near_basin_shell_yaw_control_observable_rows"]),
+            "yaw_control_blocked_rows": int(counts["near_basin_shell_yaw_control_blocked_rows"]),
+            "yaw_observable_rows": int(counts["near_basin_shell_yaw_observable_rows"]),
+            "yaw_blocked_rows": int(counts["near_basin_shell_yaw_blocked_rows"]),
+            "yaw_observable_rate": float(counts["near_basin_shell_yaw_observable_rate"]),
+        },
+        "outer_pullback_candidate_rows": int(counts["outer_pullback_candidate_rows"]),
     }
     manifest_path = output_dir / "frame_residual_v2_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -772,10 +830,17 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
                         "yaw_label": {
                             "visual_observability_class": str(row.get("visual_observability_class", "")),
                             "yaw_observability_class": str(row.get("yaw_observability_class", "")),
+                            "yaw_observability_blocker_combo": str(row.get("yaw_observability_blocker_combo", "")),
+                            "yaw_observability_primary_blocker": str(row.get("yaw_observability_primary_blocker", "")),
+                            "yaw_entry_feasible": bool(row.get("yaw_entry_feasible", False)),
+                            "yaw_control_observable": bool(row.get("yaw_control_observable", row.get("yaw_observable", False))),
+                            "yaw_entry_block_reason": str(row.get("yaw_entry_block_reason", "")),
+                            "yaw_control_block_reason": str(row.get("yaw_control_block_reason", "")),
                             "yaw_observable": bool(row.get("yaw_observable", False)),
                             "requires_yaw_observability": bool(row.get("frame_contract", {}).get("requires_yaw_observability", False)),
                         },
                         "takeover_tier": str(row.get("takeover_tier", "outside_takeover")),
+                        "outer_pullback_candidate": bool(row.get("outer_pullback_candidate", False)),
                         "next_error_outcome": {
                             "true_basin_error_t_plus_1": row.get("true_basin_error_t_plus_1", {}),
                             "next_privileged_dx": row.get("next_privileged_dx", float("nan")),
@@ -839,9 +904,16 @@ def evaluate_root(eval_root: Path, task_name: str, output_dir: Path) -> dict[str
         md_lines.append(
             f"- {item['stage_name']} / {item['skill_name']} / {item['visual_observability_class']}: "
             f"rows={item['num_rows']}, near_grasp={item['near_grasp_rate']:.3f}, "
-            f"near_shell={item['near_basin_shell_rate']:.3f}, coarse={item['coarse_pullback_candidate_rate']:.3f}, "
+            f"near_shell={item['near_basin_shell_rate']:.3f}, coarse={item['coarse_pullback_candidate_rate']:.3f}, outer={item['outer_pullback_candidate_rate']:.3f}, "
             f"close_ready={item['close_ready_rate']:.3f}"
         )
+    md_lines.append("")
+    md_lines.append("## Near Shell / Yaw Alignment")
+    md_lines.append(f"- yaw_entry_feasible_rows: `{counts['near_basin_shell_yaw_entry_feasible_rows']}`")
+    md_lines.append(f"- yaw_control_observable_rows: `{counts['near_basin_shell_yaw_control_observable_rows']}`")
+    md_lines.append(f"- yaw_control_blocked_rows: `{counts['near_basin_shell_yaw_control_blocked_rows']}`")
+    md_lines.append(f"- yaw_observable_rate: `{counts['near_basin_shell_yaw_observable_rate']:.3f}`")
+    md_lines.append(f"- outer_pullback_candidate_rows: `{counts['outer_pullback_candidate_rows']}`")
     out_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
     print(out_json)

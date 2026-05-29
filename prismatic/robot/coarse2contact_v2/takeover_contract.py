@@ -25,12 +25,14 @@ CLOSE_READY_Z_THRESHOLD = 0.010
 DEFAULT_PULLBACK_HORIZON = 3
 DEFAULT_MAX_XY_STEP = 0.003
 COARSE_PULLBACK_XY_THRESHOLD = 0.060
+OUTER_PULLBACK_XY_THRESHOLD = 0.120
 
 YAW_OBSERVABLE = "observable"
 YAW_AMBIGUOUS = "ambiguous"
 YAW_UNOBSERVABLE = "unobservable"
 
 TIER_COARSE_PULLBACK = "coarse_pullback_candidate"
+TIER_OUTER_PULLBACK = "outer_pullback_candidate"
 TIER_NEAR_BASIN = "near_basin_shell"
 TIER_MICRO_ENTRY = "micro_entry_ready"
 TIER_CLOSE_READY = "close_ready"
@@ -149,6 +151,7 @@ class TakeoverThresholds:
     max_xy_step: float = DEFAULT_MAX_XY_STEP
     pullback_horizon: int = DEFAULT_PULLBACK_HORIZON
     coarse_xy: float = COARSE_PULLBACK_XY_THRESHOLD
+    outer_xy: float = OUTER_PULLBACK_XY_THRESHOLD
 
 
 @dataclass(frozen=True)
@@ -157,10 +160,15 @@ class TakeoverTierDecision:
 
     takeover_tier: str
     pullback_allowed: bool
+    yaw_entry_feasible: bool
+    yaw_control_observable: bool
     near_basin_shell: bool
     coarse_pullback_candidate: bool
+    outer_pullback_candidate: bool
     micro_entry_ready: bool
     close_ready_ready: bool
+    yaw_entry_block_reason: str
+    yaw_control_block_reason: str
     micro_entry_block_reason: str
     close_ready_block_reason: str
     axis_gate_policy: dict[str, str]
@@ -169,10 +177,15 @@ class TakeoverTierDecision:
         return {
             "takeover_tier": str(self.takeover_tier),
             "pullback_allowed": bool(self.pullback_allowed),
+            "yaw_entry_feasible": bool(self.yaw_entry_feasible),
+            "yaw_control_observable": bool(self.yaw_control_observable),
             "near_basin_shell": bool(self.near_basin_shell),
             "coarse_pullback_candidate": bool(self.coarse_pullback_candidate),
+            "outer_pullback_candidate": bool(self.outer_pullback_candidate),
             "micro_entry_ready": bool(self.micro_entry_ready),
             "close_ready_ready": bool(self.close_ready_ready),
+            "yaw_entry_block_reason": str(self.yaw_entry_block_reason),
+            "yaw_control_block_reason": str(self.yaw_control_block_reason),
             "micro_entry_block_reason": str(self.micro_entry_block_reason),
             "close_ready_block_reason": str(self.close_ready_block_reason),
             "axis_gate_policy": dict(self.axis_gate_policy),
@@ -227,6 +240,77 @@ def classify_yaw_observability(
     )
 
 
+def explain_yaw_observability(
+    trace_row: Mapping[str, Any],
+    visual_record: Mapping[str, Any],
+    *,
+    visual_observability_class: str,
+) -> dict[str, Any]:
+    """Explain which non-privileged evidence gates yaw observability.
+
+    This mirrors :func:`classify_yaw_observability` but exposes the threshold
+    failures so offline relabel/audit can tell whether rows are blocked because
+    of weak frame observability, low confidence, weak axis evidence, or a true
+    prior-only / occlusion fallback.
+    """
+
+    visual_class = str(visual_observability_class)
+    conf = _as_float(visual_record.get("frame_confidence", 0.0), 0.0)
+    obs = _as_float(visual_record.get("frame_observability", 0.0), 0.0)
+    axis = _as_float(visual_record.get("frame_axis_strength", 0.0), 0.0)
+    wide_visible = bool(visual_record.get("wide_ring_visible", False))
+    wrist_occluded = bool(trace_row.get("wrist_is_occluded", False))
+
+    gate_passes = {
+        "frame_confidence": bool(conf >= 0.50),
+        "frame_observability": bool(obs >= 0.10),
+        "frame_axis_strength": bool(axis >= 0.80),
+        "wide_ring_visible": bool(wide_visible),
+        "wrist_not_occluded": bool(not wrist_occluded),
+    }
+
+    blockers: list[str] = []
+    primary_blocker = "observable"
+    reason = "frame_axis_consistent"
+
+    if visual_class == "prior_only":
+        blockers = ["prior_only"]
+        primary_blocker = "prior_only"
+        reason = "prior_only"
+    elif wrist_occluded:
+        blockers = ["wrist_occluded"]
+        primary_blocker = "wrist_occluded"
+        reason = "wrist_occluded"
+    else:
+        if not gate_passes["frame_observability"]:
+            blockers.append("frame_observability_lt_010")
+        if not gate_passes["frame_confidence"]:
+            blockers.append("frame_confidence_lt_050")
+        if not gate_passes["frame_axis_strength"]:
+            blockers.append("frame_axis_strength_lt_080")
+
+        if blockers:
+            primary_blocker = blockers[0]
+            if wide_visible or gate_passes["frame_confidence"] or gate_passes["frame_observability"]:
+                reason = "partial_frame_evidence"
+            else:
+                reason = "low_frame_evidence"
+
+    return {
+        "visual_observability_class": visual_class,
+        "frame_confidence": conf,
+        "frame_observability": obs,
+        "frame_axis_strength": axis,
+        "wide_ring_visible": wide_visible,
+        "wrist_is_occluded": wrist_occluded,
+        "gate_passes": gate_passes,
+        "blockers": blockers,
+        "blocker_combo": "+".join(blockers) if blockers else "",
+        "primary_blocker": primary_blocker,
+        "reason": reason,
+    }
+
+
 def decide_takeover_tier(
     residual: FrameResidual,
     observability: ObservabilityDecision,
@@ -240,48 +324,66 @@ def decide_takeover_tier(
 
     t = thresholds or TakeoverThresholds()
     pullback_allowed = bool(precision_row and not observability.reacquire_needed)
-    yaw_ok_for_required = bool((not requires_yaw_observability) or observability.yaw_observable)
     finite = bool(precision_row and residual.finite)
+    yaw_entry_feasible = bool(finite and residual.yaw_abs <= float(t.near_yaw) + 1.0e-9)
+    close_yaw_entry_feasible = bool(finite and residual.yaw_abs <= float(t.close_yaw) + 1.0e-9)
+    yaw_control_observable = bool(precision_row and observability.yaw_observable)
 
     near_shell = bool(
         finite
         and pullback_allowed
+        and yaw_entry_feasible
         and residual.xy_error <= float(t.near_xy) + float(t.max_xy_step) * float(max(1, int(t.pullback_horizon))) + 1.0e-9
-        and residual.yaw_abs <= float(t.near_yaw) + 1.0e-9
     )
     micro_ready = bool(
         finite
         and pullback_allowed
         and _near_grasp(residual.dx, residual.dy, residual.dyaw, xy_threshold=t.near_xy, yaw_threshold=t.near_yaw)
-        and yaw_ok_for_required
+        and yaw_entry_feasible
     )
     close_ready = bool(
         finite
         and pullback_allowed
         and _near_grasp(residual.dx, residual.dy, residual.dyaw, xy_threshold=t.close_xy, yaw_threshold=t.close_yaw)
         and abs(float(residual.dz)) <= float(t.close_z)
-        and yaw_ok_for_required
+        and close_yaw_entry_feasible
     )
     coarse_candidate = bool(
         finite
         and pullback_allowed
         and not near_shell
         and residual.xy_error <= float(t.coarse_xy)
-        and residual.yaw_abs <= float(t.near_yaw) + 1.0e-9
+        and yaw_entry_feasible
+        and bool(xy_contracted)
+    )
+    outer_candidate = bool(
+        finite
+        and pullback_allowed
+        and not near_shell
+        and not coarse_candidate
+        and residual.xy_error <= float(t.outer_xy)
         and bool(xy_contracted)
     )
 
     micro_blocks: list[str] = []
     close_blocks: list[str] = []
+    yaw_entry_block_reason = "ready"
+    yaw_control_block_reason = "ready" if yaw_control_observable else str(observability.reason or observability.yaw_observability_class)
     if not precision_row:
         micro_blocks.append("not_precision")
         close_blocks.append("not_precision")
+        yaw_entry_block_reason = "not_precision"
+        yaw_control_block_reason = "not_precision"
     elif not residual.finite:
         micro_blocks.append("invalid_residual")
         close_blocks.append("invalid_residual")
+        yaw_entry_block_reason = "invalid_residual"
+        yaw_control_block_reason = "invalid_residual"
     elif observability.reacquire_needed:
         micro_blocks.append("prior_only")
         close_blocks.append("prior_only")
+        yaw_entry_block_reason = "prior_only"
+        yaw_control_block_reason = "prior_only"
     else:
         if residual.xy_error > float(t.near_xy):
             micro_blocks.append("xy")
@@ -289,9 +391,12 @@ def decide_takeover_tier(
             close_blocks.append("xy")
         if abs(float(residual.dz)) > float(t.close_z):
             close_blocks.append("z")
-        if requires_yaw_observability and not observability.yaw_observable:
-            micro_blocks.append("yaw")
-            close_blocks.append("yaw")
+        if not yaw_entry_feasible:
+            micro_blocks.append("yaw_entry")
+            close_blocks.append("yaw_entry")
+            yaw_entry_block_reason = "yaw_abs_gt_near_threshold"
+        elif not close_yaw_entry_feasible:
+            close_blocks.append("yaw_entry_close")
 
     if not precision_row:
         tier = TIER_INVALID
@@ -307,6 +412,8 @@ def decide_takeover_tier(
         tier = TIER_NEAR_BASIN
     elif coarse_candidate:
         tier = TIER_COARSE_PULLBACK
+    elif outer_candidate:
+        tier = TIER_OUTER_PULLBACK
     else:
         tier = TIER_OUTSIDE
 
@@ -314,18 +421,22 @@ def decide_takeover_tier(
         "x": "trusted_control" if pullback_allowed and residual.finite else "abstain",
         "y": "trusted_control" if pullback_allowed and residual.finite else "abstain",
         "z": "diagnostic_only" if pullback_allowed and residual.finite else "abstain",
-        "yaw": "trusted_control" if pullback_allowed and observability.yaw_observable and residual.finite else "abstain",
+        "yaw": "trusted_control" if pullback_allowed and yaw_control_observable and residual.finite else "abstain",
     }
 
     return TakeoverTierDecision(
         takeover_tier=tier,
         pullback_allowed=bool(pullback_allowed),
+        yaw_entry_feasible=bool(yaw_entry_feasible),
+        yaw_control_observable=bool(yaw_control_observable),
         near_basin_shell=bool(near_shell),
         coarse_pullback_candidate=bool(coarse_candidate),
+        outer_pullback_candidate=bool(outer_candidate),
         micro_entry_ready=bool(micro_ready),
         close_ready_ready=bool(close_ready),
+        yaw_entry_block_reason=str(yaw_entry_block_reason),
+        yaw_control_block_reason=str(yaw_control_block_reason),
         micro_entry_block_reason="+".join(micro_blocks) if micro_blocks else "ready",
         close_ready_block_reason="+".join(close_blocks) if close_blocks else "ready",
         axis_gate_policy=axis_policy,
     )
-

@@ -161,6 +161,9 @@ class LocalGeometryError:
     target_entity: str = ""
     reference_entity: str = ""
     stage_name: str = ""
+    yaw_valid: bool = True
+    yaw_reason: str = ""
+    image_axis_yaw: float = 0.0
 
 
 class _BaseLocalizer:
@@ -208,15 +211,48 @@ class RingGraspLocalizer(_BaseLocalizer):
         rgb = _first_non_none(_as_rgb_array(_obs_get(observation, "wrist_rgb")), _as_rgb_array(_obs_get(observation, "front_rgb")))
         depth = _first_non_none(_as_depth_array(_obs_get(observation, "wrist_depth")), _as_depth_array(_obs_get(observation, "front_depth")))
         if rgb is None or depth is None:
-            return LocalGeometryError(False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "missing_rgbd", target.name, skill_spec.reference_entity, stage_name)
+            return LocalGeometryError(
+                False,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                "missing_rgbd",
+                target.name,
+                skill_spec.reference_entity,
+                stage_name,
+                yaw_valid=False,
+                yaw_reason="missing_rgbd",
+            )
 
         mask = _color_mask(rgb, target.color_hint)
         mask = _maybe_center_crop(mask, center_fraction=0.74)
         mask = ndi.binary_opening(mask, iterations=1)
         mask = ndi.binary_closing(mask, iterations=1)
-        dx, dy, angle, observability, fit_residual = self._error_from_mask(mask, depth)
+        dx, dy, image_axis_yaw, observability, fit_residual = self._error_from_mask(mask, depth)
         if not np.isfinite(dx) or observability <= 0.0005:
-            return LocalGeometryError(False, 0.0, 0.0, 0.0, 0.0, 0.0, observability, fit_residual, 0.0, "weak_ring_mask", target.name, skill_spec.reference_entity, stage_name)
+            return LocalGeometryError(
+                False,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                observability,
+                fit_residual,
+                0.0,
+                "weak_ring_mask",
+                target.name,
+                skill_spec.reference_entity,
+                stage_name,
+                yaw_valid=False,
+                yaw_reason="weak_ring_mask",
+                image_axis_yaw=float(image_axis_yaw) if np.isfinite(image_axis_yaw) else 0.0,
+            )
 
         depth_med, _ = _depth_summary(depth, mask)
         dz = float(depth_med) if np.isfinite(depth_med) else 0.0
@@ -233,7 +269,7 @@ class RingGraspLocalizer(_BaseLocalizer):
             dx=float(dx),
             dy=float(dy),
             dz=dz,
-            dyaw=float(angle),
+            dyaw=0.0,
             observability=observability,
             fit_residual=float(fit_residual),
             inlier_ratio=float(np.clip(1.0 - fit_residual, 0.0, 1.0)),
@@ -241,6 +277,9 @@ class RingGraspLocalizer(_BaseLocalizer):
             target_entity=target.name,
             reference_entity=skill_spec.reference_entity,
             stage_name=stage_name,
+            yaw_valid=False,
+            yaw_reason="image_pca_axis_not_jaw_local_residual",
+            image_axis_yaw=float(image_axis_yaw),
         )
 
 

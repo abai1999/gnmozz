@@ -88,7 +88,8 @@ The v2 runtime now routes control decisions through an explicit
 
 `LocalGeometryError` is treated as raw visual proxy evidence. It may contain
 ring mask centroid, PCA yaw, approximate depth, and simple visibility scores.
-It is not assumed to be the true jaw-local basin error.
+The PCA/image-axis yaw signal is diagnostic only. It is not assumed to be the
+true jaw-local basin error and is not trusted for runtime yaw control.
 
 `EstimatedBasinError` contains:
 
@@ -153,6 +154,11 @@ Those are useful diagnostics, but they are not proven to be the same coordinate
 semantics as the true basin residual. As a result, using them directly can give
 visually plausible but task-wrong corrections.
 
+The current yaw path is especially sensitive here: image/PCA yaw remains a
+diagnostic feature for offline analysis and focused evaluation, but it is not a
+trusted runtime control axis until a frame-aware yaw estimator can predict the
+jaw-local privileged `dyaw` reliably on the focused near-basin slice.
+
 The learned residual/recovery heads explored so far also do not solve this by
 themselves. They mostly learn single-step correction-like outputs. The desired
 skill is a closed-loop behavior that:
@@ -193,6 +199,8 @@ OK
 
 - C2C does not yet prove closed-loop recovery from real planner failure tails.
 - Current depth proxy does not provide trusted `x/y/z/yaw` basin axes.
+- Image/PCA yaw remains diagnostic-only and should not be reinterpreted as jaw-
+  local residual yaw.
 - Yaw is especially unreliable because partial crop PCA and symmetry handling
   can invert or destabilize the intended grasp frame.
 - Z is not yet a proper progress-to-contact / descend-to-close estimator.

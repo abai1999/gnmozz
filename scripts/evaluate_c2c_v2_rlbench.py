@@ -220,6 +220,45 @@ def _bounded_xy_oracle_probe_step(error_local_6d: np.ndarray, *, xy_gain: float,
     return correction.astype(np.float32)
 
 
+def _compact_grasp_error(error_local: np.ndarray | None) -> np.ndarray:
+    """Return [dx, dy, dz, dyaw] from either compact 4D or local 6D residuals."""
+
+    if error_local is None:
+        return np.full((4,), np.nan, dtype=np.float32)
+    raw = np.asarray(error_local, dtype=np.float32).reshape(-1)
+    out = np.full((4,), np.nan, dtype=np.float32)
+    if raw.size > 0:
+        out[0] = raw[0]
+    if raw.size > 1:
+        out[1] = raw[1]
+    if raw.size > 2:
+        out[2] = raw[2]
+    yaw_idx = 5 if raw.size >= 6 else 3
+    if raw.size > yaw_idx:
+        out[3] = raw[yaw_idx]
+    return out
+
+
+def _load_grasp_probe_candidate_rows(path_text: str | None) -> tuple[set[tuple[int, int]], dict[tuple[int, int], dict[str, object]]]:
+    if not path_text:
+        return set(), {}
+    path = Path(path_text)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing --c2c_grasp_probe_candidate_jsonl: {path}")
+    keys: set[tuple[int, int]] = set()
+    rows: dict[tuple[int, int], dict[str, object]] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            key = (int(row.get("episode_idx", -1)), int(row.get("step_idx", row.get("step", -1))))
+            keys.add(key)
+            rows[key] = row
+    return keys, rows
+
+
 def _absolute_to_world_delta(abs_action: np.ndarray, current_gripper_pose: np.ndarray) -> np.ndarray:
     action = np.asarray(abs_action, dtype=np.float32).reshape(-1)
     pose = np.asarray(current_gripper_pose, dtype=np.float32).reshape(-1)
@@ -425,15 +464,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
     parser.add_argument("--c2c_grasp_probe_window_mode", type=str, default="stage", choices=["stage", "forced_shell"])
     parser.add_argument(
+        "--c2c_grasp_probe_candidate_jsonl",
+        type=str,
+        default="",
+        help="Optional grasp failure-tail candidate JSONL. When set, replay_oracle_xy only activates on listed episode/step rows.",
+    )
+    parser.add_argument(
         "--c2c_grasp_probe_shell_filter",
         type=str,
         default="off",
-        choices=["off", "near_yaw_feasible", "tight_near_yaw_feasible", "coarse_yaw_feasible"],
+        choices=[
+            "off",
+            "near_yaw_feasible",
+            "tight_near_yaw_feasible",
+            "coarse_yaw_feasible",
+            "frontier_pullback_feasible",
+            "small_xy_large_yaw_frontier_feasible",
+        ],
     )
     parser.add_argument("--near_grasp_xy_threshold", type=float, default=0.015)
     parser.add_argument("--near_grasp_yaw_threshold", type=float, default=0.08)
     parser.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
     parser.add_argument("--close_ready_yaw_threshold", type=float, default=0.03)
+    parser.add_argument("--c2c_grasp_probe_outer_pullback_xy_threshold", type=float, default=0.120)
+    parser.add_argument("--c2c_grasp_probe_frontier_pullback_xy_threshold", type=float, default=0.180)
+    parser.add_argument("--c2c_grasp_probe_small_xy_large_yaw_xy_threshold", type=float, default=0.060)
+    parser.add_argument("--c2c_grasp_probe_relax_small_xy_large_yaw_candidate", action="store_true", default=False)
     parser.add_argument("--num_episodes", type=int, default=3)
     parser.add_argument("--episode_indices", type=str, default="5,8,19")
     parser.add_argument("--max_steps", type=int, default=320)
@@ -510,6 +566,9 @@ def evaluate(args: argparse.Namespace) -> float:
             raise ValueError("--c2c_grasp_probe_policy requires --dump_runtime_obs and --capture_failure_target_pose")
         if not args.shadow_only and args.mode not in {"c2c_stage_shadow", "basin_recovery_shadow"}:
             raise ValueError("--c2c_grasp_probe_policy is intended for shadow-only intervention data collection")
+    grasp_probe_candidate_keys, grasp_probe_candidate_rows = _load_grasp_probe_candidate_rows(
+        getattr(args, "c2c_grasp_probe_candidate_jsonl", "")
+    )
 
     vla, processor, action_head, proprio_projector, norm_stats = load_checkpoint(
         args.checkpoint_dir,
@@ -576,6 +635,11 @@ def evaluate(args: argparse.Namespace) -> float:
         "c2c_grasp_probe_flush_planner_queue": bool(args.c2c_grasp_probe_flush_planner_queue),
         "c2c_grasp_probe_window_mode": str(args.c2c_grasp_probe_window_mode),
         "c2c_grasp_probe_shell_filter": str(args.c2c_grasp_probe_shell_filter),
+        "c2c_grasp_probe_frontier_pullback_xy_threshold": float(args.c2c_grasp_probe_frontier_pullback_xy_threshold),
+        "c2c_grasp_probe_small_xy_large_yaw_xy_threshold": float(args.c2c_grasp_probe_small_xy_large_yaw_xy_threshold),
+        "c2c_grasp_probe_relax_small_xy_large_yaw_candidate": bool(args.c2c_grasp_probe_relax_small_xy_large_yaw_candidate),
+        "c2c_grasp_probe_candidate_jsonl": str(getattr(args, "c2c_grasp_probe_candidate_jsonl", "")),
+        "c2c_grasp_probe_candidate_count": int(len(grasp_probe_candidate_keys)),
         "depth_error_trend": [],
     }
 
@@ -707,9 +771,11 @@ def evaluate(args: argparse.Namespace) -> float:
                     probe_true_error_before,
                     near_grasp_xy_threshold=float(args.near_grasp_xy_threshold),
                     near_grasp_yaw_threshold=float(args.near_grasp_yaw_threshold),
-                    max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
-                    horizon_steps=int(max(1, int(args.c2c_grasp_probe_horizon))),
-                )
+                max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
+                horizon_steps=int(max(1, int(args.c2c_grasp_probe_horizon))),
+                outer_pullback_xy_threshold=float(args.c2c_grasp_probe_outer_pullback_xy_threshold),
+                frontier_pullback_xy_threshold=float(args.c2c_grasp_probe_frontier_pullback_xy_threshold),
+            )
                 probe_has_error = bool(probe_true_error_before is not None)
                 probe_finite_xy = bool(
                     probe_true_error_before is not None
@@ -719,22 +785,60 @@ def evaluate(args: argparse.Namespace) -> float:
                     probe_stage == "RING_GRASP_ALIGN"
                     or args.c2c_grasp_probe_window_mode == "forced_shell"
                 )
+                probe_candidate_required = bool(grasp_probe_candidate_keys)
+                probe_candidate_key = (int(ep_idx), int(step_idx))
+                probe_candidate_row = grasp_probe_candidate_rows.get(probe_candidate_key, {})
+                probe_candidate_match = bool((not probe_candidate_required) or probe_candidate_key in grasp_probe_candidate_keys)
+                probe_candidate_axes = probe_candidate_row.get("recommended_intervention_axes", [])
+                if not isinstance(probe_candidate_axes, (list, tuple)):
+                    probe_candidate_axes = []
+                probe_candidate_actionable = bool(
+                    (not probe_candidate_required)
+                    or (
+                        not str(probe_candidate_row.get("abstain_reason", ""))
+                        and "x" in {str(axis) for axis in probe_candidate_axes}
+                        and "y" in {str(axis) for axis in probe_candidate_axes}
+                    )
+                )
+                small_xy_large_yaw_candidate_relaxed = bool(
+                    args.c2c_grasp_probe_relax_small_xy_large_yaw_candidate
+                    and args.c2c_grasp_probe_shell_filter == "small_xy_large_yaw_frontier_feasible"
+                    and str(probe_candidate_row.get("failure_bucket", "")) == "small_xy_large_yaw"
+                    and probe_candidate_required
+                    and probe_candidate_match
+                    and "x" in {str(axis) for axis in probe_candidate_axes}
+                    and "y" in {str(axis) for axis in probe_candidate_axes}
+                )
                 probe_shell_ok = bool(
                     args.c2c_grasp_probe_shell_filter == "off"
                     or (
-                    args.c2c_grasp_probe_shell_filter == "near_yaw_feasible"
-                    and bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
-                )
-                or (
-                    args.c2c_grasp_probe_shell_filter == "tight_near_yaw_feasible"
-                    and bool(probe_shell_fields.get("grasp_probe_tight_near_basin_shell", False))
-                )
-                or (
-                    args.c2c_grasp_probe_shell_filter == "coarse_yaw_feasible"
-                    and (
-                        bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
-                        or bool(probe_shell_fields.get("grasp_probe_coarse_pullback_candidate", False))
+                        args.c2c_grasp_probe_shell_filter == "near_yaw_feasible"
+                        and bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                    )
+                    or (
+                        args.c2c_grasp_probe_shell_filter == "tight_near_yaw_feasible"
+                        and bool(probe_shell_fields.get("grasp_probe_tight_near_basin_shell", False))
+                    )
+                    or (
+                        args.c2c_grasp_probe_shell_filter == "coarse_yaw_feasible"
+                        and (
+                            bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                            or bool(probe_shell_fields.get("grasp_probe_coarse_pullback_candidate", False))
                         )
+                    )
+                    or (
+                        args.c2c_grasp_probe_shell_filter == "frontier_pullback_feasible"
+                        and (
+                            bool(probe_shell_fields.get("grasp_probe_outer_pullback_candidate", False))
+                            or bool(probe_shell_fields.get("grasp_probe_coarse_pullback_candidate", False))
+                            or bool(probe_shell_fields.get("grasp_probe_near_basin_shell", False))
+                            or bool(probe_shell_fields.get("grasp_probe_frontier_pullback_candidate", False))
+                        )
+                    )
+                    or (
+                        args.c2c_grasp_probe_shell_filter == "small_xy_large_yaw_frontier_feasible"
+                        and str(probe_candidate_row.get("failure_bucket", "")) == "small_xy_large_yaw"
+                        and float(probe_shell_fields.get("grasp_probe_pre_xy_error", float("inf"))) <= float(args.c2c_grasp_probe_small_xy_large_yaw_xy_threshold)
                     )
                 )
                 probe_eligible = bool(
@@ -743,24 +847,45 @@ def evaluate(args: argparse.Namespace) -> float:
                     and probe_visibility_bucket != "prior_only"
                     and probe_has_error
                     and probe_finite_xy
-                    and probe_shell_ok
+                    and probe_candidate_match
+                    and (probe_shell_ok or small_xy_large_yaw_candidate_relaxed)
+                    and (probe_candidate_actionable or small_xy_large_yaw_candidate_relaxed)
                 )
                 trace_entry["grasp_probe_policy"] = str(args.c2c_grasp_probe_policy)
                 trace_entry["grasp_probe_visibility_bucket"] = probe_visibility_bucket
                 trace_entry["grasp_probe_active"] = bool(probe_eligible)
+                trace_entry["grasp_probe_candidate_required"] = bool(probe_candidate_required)
+                trace_entry["grasp_probe_candidate_match"] = bool(probe_candidate_match)
+                trace_entry["grasp_probe_candidate_actionable"] = bool(probe_candidate_actionable)
+                trace_entry["grasp_probe_candidate_actionable_relaxed_small_xy_large_yaw"] = bool(small_xy_large_yaw_candidate_relaxed)
+                trace_entry["grasp_probe_candidate_jsonl"] = str(getattr(args, "c2c_grasp_probe_candidate_jsonl", ""))
+                trace_entry["grasp_probe_failure_tail_sample_role"] = str(probe_candidate_row.get("sample_role", ""))
+                trace_entry["grasp_probe_failure_tail_takeover_tier"] = str(probe_candidate_row.get("takeover_tier", ""))
+                trace_entry["grasp_probe_failure_tail_abstain_reason"] = str(probe_candidate_row.get("abstain_reason", ""))
+                trace_entry["grasp_probe_failure_tail_planner_natural_outcome"] = str(probe_candidate_row.get("planner_natural_outcome", ""))
+                trace_entry["failure_bucket"] = str(probe_candidate_row.get("failure_bucket", trace_entry.get("failure_bucket", "")))
                 trace_entry["grasp_probe_window_mode"] = str(args.c2c_grasp_probe_window_mode)
                 trace_entry["grasp_probe_shell_filter"] = str(args.c2c_grasp_probe_shell_filter)
                 trace_entry["grasp_probe_stage_ok"] = bool(probe_stage_ok)
                 trace_entry["grasp_probe_stage_source"] = "runtime_stage" if probe_stage == "RING_GRASP_ALIGN" else ("forced_shell" if probe_stage_ok else "not_grasp_align")
-                trace_entry["grasp_probe_reason"] = "replay_oracle_xy" if probe_eligible else grasp_probe_inactive_reason(
-                    policy=str(args.c2c_grasp_probe_policy),
-                    stage_ok=bool(probe_stage_ok),
-                    visibility_bucket=probe_visibility_bucket,
-                    has_error=bool(probe_has_error),
-                    finite_xy=bool(probe_finite_xy),
-                    shell_filter=str(args.c2c_grasp_probe_shell_filter),
-                    shell_fields=probe_shell_fields,
-                )
+                if probe_eligible:
+                    trace_entry["grasp_probe_reason"] = "replay_oracle_xy"
+                elif probe_candidate_required and not probe_candidate_match:
+                    trace_entry["grasp_probe_reason"] = "not_failure_tail_candidate"
+                elif small_xy_large_yaw_candidate_relaxed:
+                    trace_entry["grasp_probe_reason"] = "small_xy_large_yaw_frontier_relaxed"
+                elif probe_candidate_required and not probe_candidate_actionable:
+                    trace_entry["grasp_probe_reason"] = "failure_tail_candidate_abstain"
+                else:
+                    trace_entry["grasp_probe_reason"] = grasp_probe_inactive_reason(
+                        policy=str(args.c2c_grasp_probe_policy),
+                        stage_ok=bool(probe_stage_ok),
+                        visibility_bucket=probe_visibility_bucket,
+                        has_error=bool(probe_has_error),
+                        finite_xy=bool(probe_finite_xy),
+                        shell_filter=str(args.c2c_grasp_probe_shell_filter),
+                        shell_fields=probe_shell_fields,
+                    )
                 trace_entry["grasp_probe_requested_horizon"] = int(max(1, int(args.c2c_grasp_probe_horizon)))
                 trace_entry["grasp_probe_horizon_steps_executed"] = 0
                 trace_entry["grasp_probe_close_locked"] = bool(probe_eligible)
@@ -768,9 +893,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_queue_len_before"] = int(len(action_queue))
                 trace_entry["grasp_probe_queue_len_after"] = int(len(action_queue))
                 trace_entry["grasp_probe_queue_flushed"] = False
-                trace_entry["grasp_probe_pre_true_error_t"] = _jsonable_value(
-                    np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4] if probe_true_error_before is not None else np.full((4,), np.nan, dtype=np.float32)
-                )
+                trace_entry["grasp_probe_pre_true_error_t"] = _jsonable_value(_compact_grasp_error(probe_true_error_before))
                 trace_entry.update(probe_shell_fields)
                 if probe_eligible:
                     probe_correction_local = _bounded_xy_oracle_probe_step(
@@ -1010,8 +1133,8 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_horizon_stage_sequence"] = []
                 trace_entry["grasp_probe_horizon_owner_sequence"] = []
                 if probe_true_error_after is not None and probe_true_error_before is not None:
-                    pre_probe = np.asarray(probe_true_error_before, dtype=np.float32).reshape(-1)[:4]
-                    post_probe = np.asarray(probe_true_error_after, dtype=np.float32).reshape(-1)[:4]
+                    pre_probe = _compact_grasp_error(probe_true_error_before)
+                    post_probe = _compact_grasp_error(probe_true_error_after)
                     visibility_bucket = str(trace_entry.get("grasp_probe_visibility_bucket", "prior_only"))
                     horizon_stage = str(trace_entry.get("c2c_v2_stage", "unknown"))
                     horizon_owner = str(trace_entry.get("phase_owner", trace_entry.get("c2c_v2_owner", "unknown")))
@@ -1054,7 +1177,7 @@ def evaluate(args: argparse.Namespace) -> float:
                         latest_error = _grasp_teacher_error_from_pack(latest_pack, grasp_spec)
                         if latest_error is None:
                             break
-                        step_pre = np.asarray(latest_error, dtype=np.float32).reshape(-1)[:4]
+                        step_pre = _compact_grasp_error(latest_error)
                         if not np.all(np.isfinite(step_pre[:2])):
                             break
                         step_correction_local = _bounded_xy_oracle_probe_step(
@@ -1095,7 +1218,7 @@ def evaluate(args: argparse.Namespace) -> float:
                         step_after_error = _grasp_teacher_error_from_pack(step_after_pack, grasp_spec)
                         if step_after_error is None:
                             break
-                        step_post = np.asarray(step_after_error, dtype=np.float32).reshape(-1)[:4]
+                        step_post = _compact_grasp_error(step_after_error)
                         step_metrics = _grasp_probe_metric_fields(
                             step_pre,
                             step_post,

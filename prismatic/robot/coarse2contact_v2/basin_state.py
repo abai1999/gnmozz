@@ -182,6 +182,7 @@ class EstimatedBasinError:
     proxy_dy: float = 0.0
     proxy_dz: float = 0.0
     proxy_dyaw: float = 0.0
+    proxy_image_axis_yaw: float = 0.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any] | None) -> "EstimatedBasinError":
@@ -213,6 +214,7 @@ class EstimatedBasinError:
             proxy_dy=_as_float(data.get("proxy_dy", 0.0), 0.0),
             proxy_dz=_as_float(data.get("proxy_dz", 0.0), 0.0),
             proxy_dyaw=_as_float(data.get("proxy_dyaw", 0.0), 0.0),
+            proxy_image_axis_yaw=_as_float(data.get("proxy_image_axis_yaw", 0.0), 0.0),
         )
 
     def to_vector(self) -> np.ndarray:
@@ -324,6 +326,7 @@ class EstimatedBasinError:
             f"{prefix}_proxy_dy": float(self.proxy_dy),
             f"{prefix}_proxy_dz": float(self.proxy_dz),
             f"{prefix}_proxy_dyaw": float(self.proxy_dyaw),
+            f"{prefix}_proxy_image_axis_yaw": float(self.proxy_image_axis_yaw),
             f"{prefix}_axis_validity": self.axis_validity,
             f"{prefix}_axis_confidence": self.axis_confidence,
             f"{prefix}_pullback_ready_axes": list(self.pullback_ready_axes),
@@ -620,8 +623,15 @@ class CalibratedGraspBasinEstimator:
         *,
         stage_name: str = "",
     ) -> EstimatedBasinError:
+        localizer_yaw_valid = bool(getattr(local_error, "yaw_valid", True))
+        proxy_image_axis_yaw = float(getattr(local_error, "image_axis_yaw", 0.0) or 0.0)
         proxy = np.asarray(
-            [float(local_error.dx), float(local_error.dy), float(local_error.dz), float(local_error.dyaw)],
+            [
+                float(local_error.dx),
+                float(local_error.dy),
+                float(local_error.dz),
+                float(local_error.dyaw) if localizer_yaw_valid else 0.0,
+            ],
             dtype=np.float32,
         )
         obs = float(np.clip(local_error.observability, 0.0, 1.0))
@@ -660,16 +670,22 @@ class CalibratedGraspBasinEstimator:
             frame_consistency=frame_consistency,
             controlled_dofs=controlled_dofs,
         )
-        yaw, yaw_valid, yaw_conf, yaw_reason = self._axis_from_proxy(
-            axis_name="yaw",
-            proxy_value=float(proxy[3]),
-            axis_cal=self.calibration.yaw,
-            base_confidence=conf_base,
-            obs=obs,
-            fit_residual=fit_residual,
-            frame_consistency=frame_consistency,
-            controlled_dofs=controlled_dofs,
-        )
+        if localizer_yaw_valid:
+            yaw, yaw_valid, yaw_conf, yaw_reason = self._axis_from_proxy(
+                axis_name="yaw",
+                proxy_value=float(proxy[3]),
+                axis_cal=self.calibration.yaw,
+                base_confidence=conf_base,
+                obs=obs,
+                fit_residual=fit_residual,
+                frame_consistency=frame_consistency,
+                controlled_dofs=controlled_dofs,
+            )
+        else:
+            yaw = 0.0
+            yaw_valid = False
+            yaw_conf = 0.0
+            yaw_reason = str(getattr(local_error, "yaw_reason", "") or "localizer_yaw_not_residual")
 
         # If the observation itself is weak, keep the estimate conservative.
         wrist_valid_depth_ratio = float(robot_state.get("wrist_valid_depth_ratio", 0.0) or 0.0)
@@ -737,4 +753,5 @@ class CalibratedGraspBasinEstimator:
             proxy_dy=float(proxy[1]),
             proxy_dz=float(proxy[2]),
             proxy_dyaw=float(proxy[3]),
+            proxy_image_axis_yaw=proxy_image_axis_yaw,
         )

@@ -477,11 +477,14 @@ class PrecisionSkillSupervisor:
         return estimated
 
     def _basin_visual_error(self, grasp_error: LocalGeometryError) -> Optional[np.ndarray]:
-        if not np.isfinite(grasp_error.dx) or not np.isfinite(grasp_error.dy) or not np.isfinite(grasp_error.dyaw):
+        if not np.isfinite(grasp_error.dx) or not np.isfinite(grasp_error.dy):
             return None
         if grasp_error.observability <= 0.0 and grasp_error.confidence <= 0.0:
             return None
-        return np.asarray([float(grasp_error.dx), float(grasp_error.dy), float(grasp_error.dyaw)], dtype=np.float32)
+        dyaw = float(grasp_error.dyaw) if bool(getattr(grasp_error, "yaw_valid", True)) else 0.0
+        if not np.isfinite(dyaw):
+            dyaw = 0.0
+        return np.asarray([float(grasp_error.dx), float(grasp_error.dy), dyaw], dtype=np.float32)
 
     @staticmethod
     def _wide_ring_glimpse(bundle: PrecisionObservationBundle) -> dict[str, Any]:
