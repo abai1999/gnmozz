@@ -15,6 +15,9 @@ Review whether Coarse2Contact v2 is converging on its intended role:
 Do not treat planner-only success windows, replay-only traces, or shadow scores
 as proof of success.
 
+The current strongest intended claim is a contract-calibrated precision
+takeover framework, not solved online failure-tail recovery.
+
 ## Fixed Review Anchors
 
 - Branch: `codex/c2c-v2-status-publish`
@@ -85,6 +88,8 @@ Look at:
 What to verify:
 
 - tiering is explicit, not a disguised gate relaxation
+- `pullback_ready`, `micro_entry_ready`, and `close_ready` are audited as
+  separate readiness levels
 - queue/window ablations are interpreted separately from frame semantics
 - hard-bucket support is being widened without breaking the control contract
 

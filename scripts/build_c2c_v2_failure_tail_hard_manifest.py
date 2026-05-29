@@ -97,7 +97,8 @@ def _priority_components(key: tuple[str, str, str, str]) -> dict[str, int]:
 
 def _coverage_priority(key: tuple[str, str, str, str]) -> int:
     parts = _priority_components(key)
-    return int(parts["failure_bucket"] * 4 + parts["support_tier"] * 3 + parts["visual"] * 2 + parts["yaw"] * 2 + parts["tier"])
+    support_bonus = int(parts["support_tier"]) if parts["failure_bucket"] else 0
+    return int(parts["failure_bucket"] * 4 + support_bonus * 3 + parts["visual"] * 2 + parts["yaw"] * 2 + parts["tier"])
 
 
 def _row_priority(row: Mapping[str, Any]) -> tuple[int, int, int, int, int, int]:

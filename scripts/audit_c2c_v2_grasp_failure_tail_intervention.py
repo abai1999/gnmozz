@@ -140,6 +140,18 @@ def _joined_rows(candidates: list[dict[str, Any]], trace_rows: list[dict[str, An
         joined.append(
             {
                 **cand,
+                "alias_drift_decision": str(
+                    cand.get(
+                        "alias_drift_decision",
+                        trace.get("alias_drift_decision", trace.get("yaw_alias_drift_decision", "unknown")) if trace else "unknown",
+                    )
+                ),
+                "alias_label": str(
+                    cand.get("alias_label", trace.get("alias_label", "unknown") if trace else "unknown")
+                ),
+                "acceptance_role": str(
+                    cand.get("acceptance_role", trace.get("acceptance_role", "unknown") if trace else "unknown")
+                ),
                 "intervention_trace_found": bool(trace),
                 "intervention_active": bool(trace.get("grasp_probe_active", False)) if trace else False,
                 "intervention_reason": str(trace.get("grasp_probe_reason", "missing_trace")) if trace else "missing_trace",
@@ -234,6 +246,9 @@ def audit(candidates: list[dict[str, Any]], trace_rows: list[dict[str, Any]]) ->
         "by_takeover_tier": _group(joined, "takeover_tier"),
         "by_yaw_observability": _group(joined, "yaw_observability_class"),
         "by_visual_bucket": _group(joined, "visual_observability_class"),
+        "active_by_alias_drift_decision": _group(joined, "alias_drift_decision"),
+        "contraction_by_alias_drift_decision": _group(joined, "alias_drift_decision"),
+        "near_entry_by_alias_drift_decision": _group(joined, "alias_drift_decision"),
         "by_episode": _group(joined, "episode_idx"),
         "by_stage": _group(joined, "stage_name"),
         "joined_rows": joined,

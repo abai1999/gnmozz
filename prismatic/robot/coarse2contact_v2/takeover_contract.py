@@ -26,6 +26,7 @@ DEFAULT_PULLBACK_HORIZON = 3
 DEFAULT_MAX_XY_STEP = 0.003
 COARSE_PULLBACK_XY_THRESHOLD = 0.060
 OUTER_PULLBACK_XY_THRESHOLD = 0.120
+FRONTIER_PULLBACK_XY_THRESHOLD = 0.180
 
 YAW_OBSERVABLE = "observable"
 YAW_AMBIGUOUS = "ambiguous"
@@ -33,10 +34,13 @@ YAW_UNOBSERVABLE = "unobservable"
 
 TIER_COARSE_PULLBACK = "coarse_pullback_candidate"
 TIER_OUTER_PULLBACK = "outer_pullback_candidate"
+TIER_FRONTIER_PULLBACK = "frontier_pullback_candidate"
 TIER_NEAR_BASIN = "near_basin_shell"
 TIER_MICRO_ENTRY = "micro_entry_ready"
 TIER_CLOSE_READY = "close_ready"
 TIER_ABSTAIN_PRIOR = "abstain_prior_only"
+TIER_YAW_ENTRY_BLOCKED = "yaw_entry_blocked"
+TIER_TOO_FAR = "too_far"
 TIER_OUTSIDE = "outside_takeover"
 TIER_INVALID = "invalid"
 
@@ -152,6 +156,7 @@ class TakeoverThresholds:
     pullback_horizon: int = DEFAULT_PULLBACK_HORIZON
     coarse_xy: float = COARSE_PULLBACK_XY_THRESHOLD
     outer_xy: float = OUTER_PULLBACK_XY_THRESHOLD
+    frontier_xy: float = FRONTIER_PULLBACK_XY_THRESHOLD
 
 
 @dataclass(frozen=True)
@@ -165,6 +170,7 @@ class TakeoverTierDecision:
     near_basin_shell: bool
     coarse_pullback_candidate: bool
     outer_pullback_candidate: bool
+    frontier_pullback_candidate: bool
     micro_entry_ready: bool
     close_ready_ready: bool
     yaw_entry_block_reason: str
@@ -182,6 +188,7 @@ class TakeoverTierDecision:
             "near_basin_shell": bool(self.near_basin_shell),
             "coarse_pullback_candidate": bool(self.coarse_pullback_candidate),
             "outer_pullback_candidate": bool(self.outer_pullback_candidate),
+            "frontier_pullback_candidate": bool(self.frontier_pullback_candidate),
             "micro_entry_ready": bool(self.micro_entry_ready),
             "close_ready_ready": bool(self.close_ready_ready),
             "yaw_entry_block_reason": str(self.yaw_entry_block_reason),
@@ -364,6 +371,15 @@ def decide_takeover_tier(
         and residual.xy_error <= float(t.outer_xy)
         and bool(xy_contracted)
     )
+    frontier_candidate = bool(
+        finite
+        and pullback_allowed
+        and not near_shell
+        and not coarse_candidate
+        and not outer_candidate
+        and residual.xy_error <= float(t.frontier_xy)
+        and bool(xy_contracted)
+    )
 
     micro_blocks: list[str] = []
     close_blocks: list[str] = []
@@ -414,6 +430,8 @@ def decide_takeover_tier(
         tier = TIER_COARSE_PULLBACK
     elif outer_candidate:
         tier = TIER_OUTER_PULLBACK
+    elif frontier_candidate:
+        tier = TIER_FRONTIER_PULLBACK
     else:
         tier = TIER_OUTSIDE
 
@@ -432,6 +450,7 @@ def decide_takeover_tier(
         near_basin_shell=bool(near_shell),
         coarse_pullback_candidate=bool(coarse_candidate),
         outer_pullback_candidate=bool(outer_candidate),
+        frontier_pullback_candidate=bool(frontier_candidate),
         micro_entry_ready=bool(micro_ready),
         close_ready_ready=bool(close_ready),
         yaw_entry_block_reason=str(yaw_entry_block_reason),

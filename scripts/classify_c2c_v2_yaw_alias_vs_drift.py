@@ -25,7 +25,7 @@ def _classify(report: dict) -> dict:
     if jump_points == 0 and bias_corr_mae <= 0.01:
         label = "stable_alias"
         reason = "single symmetry alias explains the slice after a tiny bias correction"
-    elif jump_points > 0 and bias_corr_mae >= 0.10:
+    elif (jump_points > 0 and bias_corr_mae >= 0.10) or jump_points >= 2:
         label = "frame_drift"
         reason = "alias correction is not enough; the proxy flips branches across the slice"
     else:

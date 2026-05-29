@@ -273,6 +273,47 @@ class EstimatedBasinError:
             axes.append("yaw")
         return tuple(axes)
 
+    def pullback_ready(
+        self,
+        *,
+        xy_threshold: float,
+        min_frame_consistency: float = 0.0,
+    ) -> bool:
+        """Return whether the estimate may drive a bounded coarse pullback.
+
+        Pullback is intentionally weaker than close readiness: it only needs a
+        valid x/y control surface inside the configured pullback window.  Z and
+        yaw can remain diagnostic or abstained here; they are checked by
+        stricter micro-entry and close-ready gates.
+        """
+
+        xy = float(np.hypot(float(self.dx), float(self.dy)))
+        xy_axes_ok = bool(self.x_valid or self.y_valid)
+        xy_ok = bool(np.isfinite(xy) and xy <= float(xy_threshold) and xy_axes_ok)
+        frame_ok = bool(float(self.frame_consistency) >= float(min_frame_consistency))
+        prior_only = str(self.reason) in {"prior_only", "prior_only_reacquire", "reacquire_needed"}
+        return bool(self.valid and not prior_only and xy_ok and frame_ok)
+
+    def pullback_block_reason(
+        self,
+        *,
+        xy_threshold: float,
+        min_frame_consistency: float = 0.0,
+    ) -> str:
+        blocks: list[str] = []
+        if not self.valid:
+            blocks.append("invalid_estimate")
+        if str(self.reason) in {"prior_only", "prior_only_reacquire", "reacquire_needed"}:
+            blocks.append("prior_only")
+        if not (self.x_valid or self.y_valid):
+            blocks.append("no_xy_trusted_axis")
+        xy = float(np.hypot(float(self.dx), float(self.dy)))
+        if not np.isfinite(xy) or xy > float(xy_threshold):
+            blocks.append("xy_outside_pullback_window")
+        if float(self.frame_consistency) < float(min_frame_consistency):
+            blocks.append("frame_consistency")
+        return "+".join(blocks) if blocks else "ready"
+
     def close_ready(
         self,
         *,
@@ -296,11 +337,13 @@ class EstimatedBasinError:
         *,
         prefix: str = "estimated_basin_error",
         xy_threshold: float = 0.005,
+        pullback_xy_threshold: float | None = None,
         z_threshold: float = 0.010,
         yaw_threshold: float = 0.03,
         yaw_required: bool | None = None,
         min_frame_consistency: float = 0.0,
     ) -> dict[str, Any]:
+        pullback_xy = float(xy_threshold if pullback_xy_threshold is None else pullback_xy_threshold)
         return {
             f"{prefix}_valid": bool(self.valid),
             f"{prefix}_confidence": float(self.confidence),
@@ -330,6 +373,18 @@ class EstimatedBasinError:
             f"{prefix}_axis_validity": self.axis_validity,
             f"{prefix}_axis_confidence": self.axis_confidence,
             f"{prefix}_pullback_ready_axes": list(self.pullback_ready_axes),
+            f"{prefix}_pullback_ready": bool(
+                self.pullback_ready(
+                    xy_threshold=max(float(pullback_xy), 0.0),
+                    min_frame_consistency=min_frame_consistency,
+                )
+            ),
+            f"{prefix}_pullback_block_reason": str(
+                self.pullback_block_reason(
+                    xy_threshold=max(float(pullback_xy), 0.0),
+                    min_frame_consistency=min_frame_consistency,
+                )
+            ),
             f"{prefix}_close_ready": bool(
                 self.close_ready(
                     xy_threshold=xy_threshold,

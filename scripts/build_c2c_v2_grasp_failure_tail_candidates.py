@@ -27,13 +27,17 @@ from prismatic.robot.coarse2contact_v2.takeover_contract import (
     CLOSE_READY_YAW_THRESHOLD,
     CLOSE_READY_Z_THRESHOLD,
     COARSE_PULLBACK_XY_THRESHOLD,
+    FRONTIER_PULLBACK_XY_THRESHOLD,
     NEAR_GRASP_XY_THRESHOLD,
     NEAR_GRASP_YAW_THRESHOLD,
     TIER_CLOSE_READY,
     TIER_COARSE_PULLBACK,
+    TIER_FRONTIER_PULLBACK,
     TIER_MICRO_ENTRY,
     TIER_NEAR_BASIN,
     TIER_OUTER_PULLBACK,
+    TIER_TOO_FAR,
+    TIER_YAW_ENTRY_BLOCKED,
     OUTER_PULLBACK_XY_THRESHOLD,
 )
 
@@ -160,9 +164,16 @@ def _failure_tail_tier(row: Mapping[str, Any]) -> str:
         and bool(row.get("xy_contracted", row.get("contraction", False)))
     ):
         return TIER_OUTER_PULLBACK
+    if (
+        str(row.get("failure_bucket", "")) in HARD_FAILURE_BUCKETS
+        and np.isfinite(xy)
+        and xy <= FRONTIER_PULLBACK_XY_THRESHOLD
+        and bool(row.get("xy_contracted", row.get("contraction", False)))
+    ):
+        return TIER_FRONTIER_PULLBACK
     if not _yaw_entry_feasible(row):
-        return "yaw_entry_blocked"
-    return "too_far"
+        return TIER_YAW_ENTRY_BLOCKED
+    return TIER_TOO_FAR
 
 
 def _abstain_reason(row: Mapping[str, Any], *, failure_tail_tier: str) -> str:
@@ -178,7 +189,7 @@ def _abstain_reason(row: Mapping[str, Any], *, failure_tail_tier: str) -> str:
 
 
 def _recommended_axes(row: Mapping[str, Any], *, failure_tail_tier: str) -> list[str]:
-    if failure_tail_tier in {TIER_COARSE_PULLBACK, TIER_OUTER_PULLBACK, TIER_NEAR_BASIN, TIER_MICRO_ENTRY}:
+    if failure_tail_tier in {TIER_COARSE_PULLBACK, TIER_OUTER_PULLBACK, TIER_FRONTIER_PULLBACK, TIER_NEAR_BASIN, TIER_MICRO_ENTRY}:
         return ["x", "y"]
     return []
 
@@ -248,6 +259,7 @@ def build_candidates(
             "near_basin_shell": bool(failure_tail_tier == TIER_NEAR_BASIN),
             "coarse_pullback_candidate": bool(failure_tail_tier == TIER_COARSE_PULLBACK),
             "outer_pullback_candidate": bool(failure_tail_tier == TIER_OUTER_PULLBACK),
+            "frontier_pullback_candidate": bool(failure_tail_tier == TIER_FRONTIER_PULLBACK),
             "failure_bucket": str(row.get("failure_bucket", "")),
             "recommended_intervention_axes": recommended_axes,
             "abstain_reason": abstain_reason,

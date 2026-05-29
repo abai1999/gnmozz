@@ -90,6 +90,8 @@ def _join_candidates(
                     "intervention_trace_found": False,
                     "intervention_active": False,
                     "intervention_reason": "missing_trace",
+                    "window_protocol": str(cand.get("window_protocol", cand.get("probe_window_protocol", ""))),
+                    "alias_drift_decision": str(cand.get("alias_drift_decision", "unknown")),
                     "grasp_probe_candidate_actionable": False,
                     "grasp_probe_candidate_actionable_relaxed_small_xy_large_yaw": False,
                 }
@@ -104,6 +106,18 @@ def _join_candidates(
                 "intervention_active": bool(trace.get("intervention_active", trace.get("grasp_probe_active", False))),
                 "intervention_reason": str(
                     trace.get("intervention_reason", trace.get("grasp_probe_reason", "missing_trace")) or "missing_trace"
+                ),
+                "window_protocol": str(
+                    trace.get(
+                        "window_protocol",
+                        trace.get("grasp_probe_window_protocol", cand.get("window_protocol", cand.get("probe_window_protocol", ""))),
+                    )
+                ),
+                "alias_drift_decision": str(
+                    cand.get(
+                        "alias_drift_decision",
+                        trace.get("alias_drift_decision", trace.get("yaw_alias_drift_decision", "unknown")),
+                    )
                 ),
                 "grasp_probe_candidate_actionable": bool(
                     trace.get("grasp_probe_candidate_actionable", trace.get("candidate_actionable", False))
@@ -185,6 +199,8 @@ def build_gap_report(candidate_rows: list[dict[str, Any]], trace_rows: list[dict
         "by_episode": _group_summary(joined, "episode_idx"),
         "by_takeover_tier": _group_summary(joined, "takeover_tier"),
         "by_yaw_observability": _group_summary(joined, "yaw_observability_class"),
+        "by_window_protocol": _group_summary(joined, "window_protocol"),
+        "by_alias_drift_decision": _group_summary(joined, "alias_drift_decision"),
         "by_intervention_reason": _group_summary(joined, "intervention_reason"),
         "joined_rows": joined,
         "runtime_invariants": {
@@ -264,6 +280,22 @@ def main() -> None:
     for item in report["by_yaw_observability"]:
         md_lines.append(
             f"- `{item['yaw_observability_class']}`: candidate={item['candidate_rows']}, trace={item['trace_found_rows']}, active={item['active_rows']}, "
+            f"missing={item['missing_trace_rows']}, actionable={item['candidate_actionable_blocked_rows']}, "
+            f"xy_blocked={item['shell_xy_outside_horizon_rows']}, yaw_blocked={item['shell_yaw_blocked_rows']}"
+        )
+    md_lines.append("")
+    md_lines.append("## By Window Protocol")
+    for item in report["by_window_protocol"]:
+        md_lines.append(
+            f"- `{item['window_protocol']}`: candidate={item['candidate_rows']}, trace={item['trace_found_rows']}, active={item['active_rows']}, "
+            f"missing={item['missing_trace_rows']}, actionable={item['candidate_actionable_blocked_rows']}, "
+            f"xy_blocked={item['shell_xy_outside_horizon_rows']}, yaw_blocked={item['shell_yaw_blocked_rows']}"
+        )
+    md_lines.append("")
+    md_lines.append("## By Alias/Drift Decision")
+    for item in report["by_alias_drift_decision"]:
+        md_lines.append(
+            f"- `{item['alias_drift_decision']}`: candidate={item['candidate_rows']}, trace={item['trace_found_rows']}, active={item['active_rows']}, "
             f"missing={item['missing_trace_rows']}, actionable={item['candidate_actionable_blocked_rows']}, "
             f"xy_blocked={item['shell_xy_outside_horizon_rows']}, yaw_blocked={item['shell_yaw_blocked_rows']}"
         )

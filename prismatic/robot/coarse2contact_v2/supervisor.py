@@ -286,6 +286,13 @@ class PrecisionSkillSupervisor:
             "reason": "not_precision_stage",
             "stable_frames": 0,
             "required_frames": 0,
+            "pullback_gate_ready": False,
+            "micro_entry_ready": False,
+            "close_ready": False,
+            "pullback_block_reason": "not_precision_stage",
+            "micro_entry_block_reason": "not_precision_stage",
+            "close_block_reason": "not_precision_stage",
+            "takeover_gate_kind": "none",
         }
         if key is None:
             self._last_precision_gate_info = dict(info)
@@ -309,7 +316,14 @@ class PrecisionSkillSupervisor:
         info["required_frames"] = required_frames
         info["takeover_depth_max"] = depth_max
         if self._precision_gate_active.get(key, False):
-            info.update(active=True, reason="latched", stable_frames=int(self._precision_gate_stable_frames.get(key, required_frames)))
+            info.update(
+                active=True,
+                reason="latched",
+                stable_frames=int(self._precision_gate_stable_frames.get(key, required_frames)),
+                pullback_gate_ready=True,
+                pullback_block_reason="ready",
+                takeover_gate_kind="pullback",
+            )
             self._last_precision_gate_info = dict(info)
             return True, info
 
@@ -334,6 +348,13 @@ class PrecisionSkillSupervisor:
                     localizer_visible=False,
                     depth_nearfield=False,
                     target_nearfield=False,
+                    pullback_gate_ready=False,
+                    micro_entry_ready=False,
+                    close_ready=False,
+                    pullback_block_reason="no_trusted_control_axis",
+                    micro_entry_block_reason="no_trusted_control_axis",
+                    close_block_reason="no_trusted_control_axis",
+                    takeover_gate_kind="none",
                 )
                 self._last_precision_gate_info = dict(info)
                 return False, info
@@ -342,24 +363,88 @@ class PrecisionSkillSupervisor:
             error_depth = float(abs(est.dz)) if np.isfinite(est.dz) else float("inf")
             target_near = bool(error_xy <= error_xy_max and (est.x_valid or est.y_valid))
             depth_near = bool(error_depth <= depth_max and est.z_valid)
+            pullback_ready = bool(
+                visible
+                and est.pullback_ready(
+                    xy_threshold=error_xy_max,
+                    min_frame_consistency=self.basin_recovery.config.visual_observability_threshold,
+                )
+            )
+            micro_xy_max = float(getattr(self.basin_recovery.config, "micro_entry_xy_threshold", error_xy_max))
+            micro_z_max = float(getattr(self.basin_recovery.config, "micro_entry_z_threshold", depth_max))
+            micro_entry_ready = bool(
+                pullback_ready
+                and error_xy <= micro_xy_max
+                and depth_near
+                and error_depth <= micro_z_max
+            )
+            close_ready = bool(
+                est.close_ready(
+                    xy_threshold=float(skill.xy_tolerance),
+                    z_threshold=float(skill.z_tolerance),
+                    yaw_threshold=float(skill.yaw_tolerance),
+                    yaw_required=bool(est.yaw_valid),
+                    min_frame_consistency=self.basin_recovery.config.visual_observability_threshold,
+                )
+            )
+            pullback_blocks: list[str] = []
+            if not visible:
+                pullback_blocks.append("visibility")
+            est_pullback_reason = est.pullback_block_reason(
+                xy_threshold=error_xy_max,
+                min_frame_consistency=self.basin_recovery.config.visual_observability_threshold,
+            )
+            if est_pullback_reason != "ready":
+                pullback_blocks.extend(est_pullback_reason.split("+"))
+            micro_blocks = list(pullback_blocks)
+            if error_xy > micro_xy_max:
+                micro_blocks.append("xy")
+            if not depth_near or error_depth > micro_z_max:
+                micro_blocks.append("z")
+            close_blocks: list[str] = []
+            if not close_ready:
+                if not est.valid:
+                    close_blocks.append("invalid_estimate")
+                if error_xy > float(skill.xy_tolerance) or not est.xy_valid:
+                    close_blocks.append("xy")
+                if error_depth > float(skill.z_tolerance) or not est.z_valid:
+                    close_blocks.append("z")
+                if est.yaw_valid and abs(float(est.dyaw)) > float(skill.yaw_tolerance):
+                    close_blocks.append("yaw")
+                if est.frame_consistency < self.basin_recovery.config.visual_observability_threshold:
+                    close_blocks.append("frame_consistency")
         else:
             visible = bool(local_error.valid and local_error.confidence >= conf_min and local_error.observability >= obs_min)
             error_xy = float(np.hypot(float(local_error.dx), float(local_error.dy))) if np.isfinite(local_error.dx) and np.isfinite(local_error.dy) else float("inf")
             error_depth = float(local_error.dz) if np.isfinite(local_error.dz) else float("inf")
             target_near = bool(error_xy <= error_xy_max)
             depth_near = bool(error_depth <= depth_max)
+            pullback_ready = bool(visible and depth_near and target_near)
+            micro_entry_ready = bool(pullback_ready)
+            close_ready = False
+            pullback_blocks = []
+            if not visible:
+                pullback_blocks.append("visibility")
+            if not target_near:
+                pullback_blocks.append("xy_outside_pullback_window")
+            if not depth_near:
+                pullback_blocks.append("z")
+            micro_blocks = list(pullback_blocks)
+            close_blocks = ["estimated_basin_error_required"]
 
-        if visible and depth_near and target_near:
+        if pullback_ready:
             self._precision_gate_stable_frames[key] = int(self._precision_gate_stable_frames.get(key, 0)) + 1
-            info_reason = "stable_near_precision_basin"
+            info_reason = "stable_pullback_window"
         else:
             self._precision_gate_stable_frames[key] = 0
             if not visible:
                 info_reason = "waiting_visible_confident_localizer"
+            elif not target_near:
+                info_reason = "waiting_target_near_precision_basin"
             elif not depth_near:
                 info_reason = "waiting_absolute_nearfield_depth"
             else:
-                info_reason = "waiting_target_near_precision_basin"
+                info_reason = "waiting_pullback_gate"
 
         stable_frames = int(self._precision_gate_stable_frames.get(key, 0))
         info.update(
@@ -370,6 +455,13 @@ class PrecisionSkillSupervisor:
             localizer_visible=bool(visible),
             depth_nearfield=bool(depth_near),
             target_nearfield=bool(target_near),
+            pullback_gate_ready=bool(pullback_ready),
+            micro_entry_ready=bool(micro_entry_ready),
+            close_ready=bool(close_ready),
+            pullback_block_reason="+".join(dict.fromkeys(pullback_blocks)) if pullback_blocks else "ready",
+            micro_entry_block_reason="+".join(dict.fromkeys(micro_blocks)) if micro_blocks else "ready",
+            close_block_reason="+".join(dict.fromkeys(close_blocks)) if close_blocks else "ready",
+            takeover_gate_kind="pullback" if pullback_ready else "none",
         )
         if stable_frames >= required_frames:
             self._precision_gate_active[key] = True
@@ -1111,7 +1203,18 @@ class PrecisionSkillSupervisor:
                 "grasp": _jsonable_value(grasp_error.__dict__),
                 "spoke": _jsonable_value(spoke_error.__dict__),
             },
-            "estimated_basin_error": _jsonable_value(estimated_basin_error.to_trace() if estimated_basin_error is not None else {}),
+            "estimated_basin_error": _jsonable_value(
+                estimated_basin_error.to_trace(
+                    xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
+                    pullback_xy_threshold=float(gate_info.get("target_xy_error_max", active_skill.xy_tolerance if active_skill is not None else 0.005)),
+                    z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
+                    yaw_threshold=float(active_skill.yaw_tolerance if active_skill is not None else 0.03),
+                    yaw_required=bool(estimated_basin_error.yaw_valid),
+                    min_frame_consistency=0.20,
+                )
+                if estimated_basin_error is not None
+                else {}
+            ),
             "localizer_confidence": float(localizer_active.confidence if localizer_active is not None else 0.0),
             "localizer_abstained": bool(localizer_active is None or not localizer_active.valid),
             "force_skill_state": force_state,
@@ -1140,13 +1243,11 @@ class PrecisionSkillSupervisor:
             },
             "basin_axis_source": str(estimated_basin_error.source if estimated_basin_error is not None else "none"),
             "basin_frame_consistency": float(estimated_basin_error.frame_consistency if estimated_basin_error is not None else 0.0),
-            "basin_entry_gate_ready": bool(estimated_basin_error.close_ready(
-                xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
-                z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
-                yaw_threshold=float(active_skill.yaw_tolerance if active_skill is not None else 0.03),
-                yaw_required=bool(estimated_basin_error.yaw_valid) if estimated_basin_error is not None else False,
-                min_frame_consistency=0.20,
-            ) if estimated_basin_error is not None else False),
+            "basin_pullback_gate_ready": bool(gate_info.get("pullback_gate_ready", False)),
+            "basin_pullback_block_reason": str(gate_info.get("pullback_block_reason", "not_evaluated")),
+            "basin_micro_entry_ready": bool(gate_info.get("micro_entry_ready", False)),
+            "basin_micro_entry_block_reason": str(gate_info.get("micro_entry_block_reason", "not_evaluated")),
+            "basin_entry_gate_ready": bool(gate_info.get("micro_entry_ready", False)),
             "basin_close_ready": bool(estimated_basin_error.close_ready(
                 xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
                 z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
@@ -1154,6 +1255,7 @@ class PrecisionSkillSupervisor:
                 yaw_required=bool(estimated_basin_error.yaw_valid) if estimated_basin_error is not None else False,
                 min_frame_consistency=0.20,
             ) if estimated_basin_error is not None else False),
+            "basin_close_block_reason": str(gate_info.get("close_block_reason", "not_evaluated")),
             "phase_owner": stage.owner if stage_apply_allowed else "planner",
             "phase_reason": stage.transition_on if stage_apply_allowed else str(gate_info.get("reason", "waiting_precision_gate")),
             "invalid_action_flag": invalid_action_flag,
@@ -1190,6 +1292,13 @@ class PrecisionSkillSupervisor:
             "c2c_gate_localizer_visible": bool(gate_info.get("localizer_visible", False)),
             "c2c_gate_depth_nearfield": bool(gate_info.get("depth_nearfield", False)),
             "c2c_gate_target_nearfield": bool(gate_info.get("target_nearfield", False)),
+            "c2c_gate_pullback_ready": bool(gate_info.get("pullback_gate_ready", False)),
+            "c2c_gate_micro_entry_ready": bool(gate_info.get("micro_entry_ready", False)),
+            "c2c_gate_close_ready": bool(gate_info.get("close_ready", False)),
+            "c2c_gate_pullback_block_reason": str(gate_info.get("pullback_block_reason", "not_evaluated")),
+            "c2c_gate_micro_entry_block_reason": str(gate_info.get("micro_entry_block_reason", "not_evaluated")),
+            "c2c_gate_close_block_reason": str(gate_info.get("close_block_reason", "not_evaluated")),
+            "c2c_gate_takeover_kind": str(gate_info.get("takeover_gate_kind", "none")),
             "planner_reaches_precontact": bool(
                 estimated_basin_error is not None
                 and estimated_basin_error.valid

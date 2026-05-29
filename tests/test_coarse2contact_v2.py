@@ -60,6 +60,7 @@ from scripts.audit_c2c_v2_grasp_failure_tail_intervention import audit as audit_
 from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_intervention
 from scripts.audit_c2c_v2_yaw_threshold_sweep import sweep as audit_yaw_threshold_sweep
 from scripts.build_c2c_v2_grasp_failure_tail_candidates import build_candidates
+from scripts.build_c2c_v2_grasp_failure_tail_hard_bucket_gap_report import build_gap_report
 from scripts.build_c2c_v2_failure_tail_balanced_manifest import build_balanced_manifest
 from scripts.build_c2c_v2_failure_tail_hard_manifest import build_hard_manifest
 from scripts.build_c2c_v2_failure_tail_hard_observability_supplement import build_hard_observability_supplement
@@ -560,7 +561,32 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         )
         self.assertIn("x", est.pullback_ready_axes)
         self.assertIn("y", est.pullback_ready_axes)
+        self.assertTrue(est.pullback_ready(xy_threshold=0.020, min_frame_consistency=0.20))
+        self.assertEqual(est.pullback_block_reason(xy_threshold=0.020, min_frame_consistency=0.20), "ready")
         self.assertFalse(est.close_ready(xy_threshold=0.005, z_threshold=0.010, yaw_threshold=0.03, yaw_required=True))
+
+    def test_prior_only_estimate_never_becomes_pullback_ready(self) -> None:
+        est = EstimatedBasinError(
+            valid=False,
+            confidence=0.0,
+            dx=0.002,
+            dy=0.001,
+            dz=0.004,
+            dyaw=0.0,
+            x_valid=False,
+            y_valid=False,
+            z_valid=False,
+            yaw_valid=False,
+            x_confidence=0.0,
+            y_confidence=0.0,
+            z_confidence=0.0,
+            yaw_confidence=0.0,
+            frame_consistency=0.0,
+            source="unit_test",
+            reason="prior_only_reacquire",
+        )
+        self.assertFalse(est.pullback_ready(xy_threshold=0.020, min_frame_consistency=0.20))
+        self.assertIn("prior_only", est.pullback_block_reason(xy_threshold=0.020, min_frame_consistency=0.20))
 
     def test_xy_pullback_can_apply_while_micro_entry_false(self) -> None:
         row = {
@@ -595,6 +621,50 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(result.reason, "privileged_relabel_replay")
         self.assertEqual(result.correction_local_6d.shape[0], 6)
         self.assertGreater(np.linalg.norm(result.correction_local_6d[:2]), 0.0)
+
+    def test_supervisor_pullback_gate_allows_xy_without_z_close_ready(self) -> None:
+        spec = load_precision_task_spec("insert_onto_square_peg")
+        assert spec is not None
+        spec.runtime_flags["precision_takeover_stable_frames"] = 1
+        spec.runtime_flags["precision_grasp_takeover_error_xy_max"] = 0.030
+        spec.runtime_flags["precision_grasp_takeover_confidence_min"] = 0.0
+        stage = spec.get_stage("RING_GRASP_ALIGN")
+        skill = spec.skills["precision_grasp_ring"]
+        sup = PrecisionSkillSupervisor(spec, mode="basin_recovery_only", shadow_only=False)
+        est = EstimatedBasinError(
+            valid=True,
+            confidence=0.90,
+            dx=0.012,
+            dy=-0.010,
+            dz=0.040,
+            dyaw=0.12,
+            x_valid=True,
+            y_valid=True,
+            z_valid=False,
+            yaw_valid=False,
+            x_confidence=0.9,
+            y_confidence=0.9,
+            z_confidence=0.0,
+            yaw_confidence=0.0,
+            frame_consistency=0.90,
+            source="unit_test",
+            reason="xy_pullback_only",
+        )
+        zero_error = LocalGeometryError(False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, "unused")
+        active, info = sup._precision_gate_status(
+            stage=stage,
+            active_skill=skill,
+            local_base=np.zeros(6, dtype=np.float32),
+            grasp_error=zero_error,
+            spoke_error=zero_error,
+            estimated_basin_error=est,
+        )
+        self.assertTrue(active)
+        self.assertTrue(info["pullback_gate_ready"])
+        self.assertFalse(info["micro_entry_ready"])
+        self.assertFalse(info["close_ready"])
+        self.assertEqual(info["pullback_block_reason"], "ready")
+        self.assertIn("z", info["close_block_reason"])
 
     def test_close_stays_locked_until_entry_gate(self) -> None:
         row = {
@@ -1525,6 +1595,8 @@ class Coarse2ContactV2Tests(unittest.TestCase):
                 "visual_observability_class": "visual_observable",
                 "yaw_observability_class": "observable",
                 "yaw_observable": True,
+                "alias_drift_decision": "stable_alias_control",
+                "alias_label": "stable_alias",
                 "abstain_reason": "",
                 "xy_error": 0.040,
                 "yaw_abs": 0.030,
@@ -1550,6 +1622,8 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(report["overall"]["planner_natural_contraction_rate"], 0.0)
         self.assertEqual(report["overall"]["oracle_intervention_contraction_rate"], 1.0)
         self.assertEqual(report["overall"]["intervention_vs_planner_improvement_rate"], 1.0)
+        by_alias = {item["alias_drift_decision"]: item for item in report["active_by_alias_drift_decision"]}
+        self.assertEqual(by_alias["stable_alias_control"]["active_failure_tail_rows"], 1)
 
     def test_failure_tail_intervention_audit_splits_blocked_reasons(self) -> None:
         candidates = [
@@ -1626,6 +1700,35 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(by_bucket["large_xy_large_yaw"]["blocked_reason_counts"]["candidate_actionable"], 1)
         self.assertEqual(by_bucket["large_xy_large_yaw"]["blocked_reason_counts"]["yaw"], 1)
         self.assertEqual(by_bucket["large_xy_small_yaw"]["blocked_reason_counts"]["xy"], 1)
+
+    def test_hard_bucket_gap_report_groups_window_and_alias_drift(self) -> None:
+        candidates = [
+            {
+                "episode_idx": 4,
+                "step_idx": 7,
+                "failure_bucket": "small_xy_large_yaw",
+                "takeover_tier": "frontier_pullback_candidate",
+                "yaw_observability_class": "ambiguous",
+                "visual_observability_class": "visual_observable",
+                "alias_drift_decision": "frame_drift_abstain",
+            }
+        ]
+        traces = [
+            {
+                "episode_idx": 4,
+                "step": 7,
+                "grasp_probe_active": False,
+                "grasp_probe_reason": "shell_yaw_blocked",
+                "grasp_probe_window_protocol": "retain_h5",
+                "grasp_probe_candidate_actionable": True,
+            }
+        ]
+        report = build_gap_report(candidates, traces)
+        self.assertEqual(report["overall"]["shell_yaw_blocked_rows"], 1)
+        by_window = {item["window_protocol"]: item for item in report["by_window_protocol"]}
+        by_alias = {item["alias_drift_decision"]: item for item in report["by_alias_drift_decision"]}
+        self.assertEqual(by_window["retain_h5"]["candidate_rows"], 1)
+        self.assertEqual(by_alias["frame_drift_abstain"]["shell_yaw_blocked_rows"], 1)
 
     def test_yaw_alias_drift_manifest_separates_calibration_positive_from_frame_drift(self) -> None:
         reports = [
@@ -2887,7 +2990,7 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(trace["phase_owner"], "planner")
         self.assertIn(trace["c2c_gate_reason"], {"waiting_absolute_nearfield_depth", "waiting_target_near_precision_basin", "waiting_visible_confident_localizer"})
 
-    def test_precision_gate_requires_absolute_nearfield_depth(self) -> None:
+    def test_precision_gate_splits_pullback_from_micro_depth(self) -> None:
         spec = load_precision_task_spec("insert_onto_square_peg")
         assert spec is not None
         spec.runtime_flags["precision_takeover_stable_frames"] = 2
@@ -2909,8 +3012,11 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertFalse(bool(sup.get_last_trace().get("c2c_gate_active", False)))
         _ = sup.step(planner_delta, obs_lo, robot_state={}, task_spec=spec, current_instruction="put the ring on the red spoke")
         trace = sup.get_last_trace()
-        self.assertFalse(bool(trace["c2c_gate_active"]))
-        self.assertIn(trace["c2c_gate_reason"], {"stable_near_precision_basin", "waiting_absolute_nearfield_depth", "waiting_target_near_precision_basin"})
+        self.assertTrue(bool(trace["c2c_gate_active"]))
+        self.assertTrue(bool(trace["c2c_gate_pullback_ready"]))
+        self.assertFalse(bool(trace["c2c_gate_micro_entry_ready"]))
+        self.assertFalse(bool(trace["c2c_gate_close_ready"]))
+        self.assertEqual(trace["c2c_gate_reason"], "takeover_gate_armed")
         self.assertLessEqual(float(trace["c2c_gate_nearfield_depth_m"]), float(trace["c2c_gate_nearfield_depth_max"]) + 1e-6)
 
     def test_basin_recovery_budget_does_not_advance_before_gate(self) -> None:
@@ -3804,7 +3910,14 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         trace = sup.get_last_trace()
         self.assertIn("estimated_basin_error", trace)
         self.assertIn("basin_axis_validity", trace)
+        self.assertIn("basin_pullback_gate_ready", trace)
+        self.assertIn("basin_micro_entry_ready", trace)
         self.assertIn("basin_close_ready", trace)
+        self.assertIn("basin_pullback_block_reason", trace)
+        self.assertIn("basin_close_block_reason", trace)
+        self.assertIn("c2c_gate_pullback_ready", trace)
+        self.assertIn("c2c_gate_micro_entry_ready", trace)
+        self.assertIn("c2c_gate_close_ready", trace)
         self.assertFalse(trace["uses_privileged_target"])
         self.assertFalse(trace["uses_rlbench_mask_runtime"])
 

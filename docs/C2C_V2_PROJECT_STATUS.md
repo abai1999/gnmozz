@@ -107,6 +107,17 @@ The precision gate is currently tightened so that if no axis is marked trusted
 for control, C2C does not take over. This is deliberate: a weak proxy signal
 should not be allowed to drive a real robot action.
 
+The gate is now tracked as three separate readiness levels:
+
+- `pullback_ready`: a bounded x/y pullback window. This can be true with
+  z/yaw still diagnostic or abstained.
+- `micro_entry_ready`: a stricter near-basin entry for small local servoing.
+- `close_ready`: the strict contact/close entrance; this must remain blocked
+  until the basin state is stable enough to close safely.
+
+This split matters for the current research line: C2C may gather and audit
+coarse pullback evidence without claiming that close/contact is safe.
+
 ## Current Known Result
 
 The current depthgate calibration says the existing proxy signals are not good
@@ -242,6 +253,11 @@ post-gate C2C control segment.
 The next useful work is not another broad residual checkpoint. It should focus
 on proving a true basin-state estimator and then a conservative closed-loop
 controller.
+
+For paper framing, the strongest current claim should remain a
+contract-calibrated precision takeover framework. Planner-only success windows,
+success-window videos, and replay-only oracle probes are not final evidence for
+closed-loop failure-tail recovery.
 
 Suggested next steps:
 
