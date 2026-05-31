@@ -165,7 +165,8 @@ For the hard-bucket sweeps:
   candidates. The rebuilt candidate manifest eliminated `unknown` entirely by
   falling back to episode-level alias support, and the flush/retain comparison
   now clearly favors flush on the narrow slice: flush keeps overshoot lower and
-  near-grasp higher, while retain is noisier and more over-shoot prone.
+  near-grasp higher, while retain is noisier and more over-shoot prone. This
+  should be treated as a window-protocol conclusion, not a sign-flip one.
 - `alias_drift_decision` is now propagated through candidate, trace, and
   support manifests, with the rebuilt alias-aware candidate set split cleanly
   into `stable_alias_control` and `frame_drift_abstain`.

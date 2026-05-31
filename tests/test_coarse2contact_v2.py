@@ -59,6 +59,7 @@ from scripts.audit_c2c_v2_frame_contract_relabel import _apply_calibrated_yaw_ob
 from scripts.audit_c2c_v2_grasp_failure_tail_intervention import audit as audit_grasp_failure_tail_intervention
 from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_intervention
 from scripts.audit_c2c_v2_yaw_threshold_sweep import sweep as audit_yaw_threshold_sweep
+from scripts.compare_c2c_v2_queue_flush_ablation import compare as compare_queue_flush_ablation
 from scripts.build_c2c_v2_grasp_failure_tail_candidates import build_candidates
 from scripts.build_c2c_v2_grasp_failure_tail_hard_bucket_gap_report import build_gap_report
 from scripts.build_c2c_v2_failure_tail_balanced_manifest import build_balanced_manifest
@@ -2706,6 +2707,46 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(report["overall"]["ring_grasp_align_dwell_steps"]["total"], 2)
         self.assertEqual(report["overall"]["queue_protocol"]["queue_flushed_rate"], 0.5)
         self.assertGreater(report["overall"]["queue_protocol"]["queue_flush_ablation_delta"], 0.0)
+
+    def test_queue_flush_ablation_compare_prefers_flush_for_small_window(self) -> None:
+        flush_obj = {
+            "sweep_config": {"c2c_grasp_probe_flush_planner_queue": True},
+            "frame_contract_summary": {
+                "close_ready_rows": 0,
+                "coarse_pullback_candidate_rows": 12,
+                "micro_entry_ready_rows": 4,
+                "near_basin_shell_rows": 18,
+                "yaw_blocked_rows": 2,
+                "yaw_observable_rows": 20,
+                "contraction_rate_by_tier": {"outer_pullback_candidate": 0.62},
+                "contraction_lower_ci_by_tier": {"outer_pullback_candidate": 0.41},
+            },
+            "shell_hit_bucket_counts": {"small_xy_large_yaw": 32},
+            "shell_hit_episode_counts": {"14": 12},
+        }
+        retain_obj = {
+            "sweep_config": {"c2c_grasp_probe_flush_planner_queue": False},
+            "frame_contract_summary": {
+                "close_ready_rows": 0,
+                "coarse_pullback_candidate_rows": 12,
+                "micro_entry_ready_rows": 2,
+                "near_basin_shell_rows": 10,
+                "yaw_blocked_rows": 5,
+                "yaw_observable_rows": 20,
+                "contraction_rate_by_tier": {"outer_pullback_candidate": 0.45},
+                "contraction_lower_ci_by_tier": {"outer_pullback_candidate": 0.30},
+            },
+            "shell_hit_bucket_counts": {"small_xy_large_yaw": 32},
+            "shell_hit_episode_counts": {"14": 12},
+        }
+        report = compare_queue_flush_ablation(flush_obj, retain_obj)
+        self.assertTrue(report["flush"]["queue_flushed"])
+        self.assertFalse(report["retain"]["queue_flushed"])
+        self.assertGreater(report["flush"]["micro_entry_ready_rows"], report["retain"]["micro_entry_ready_rows"])
+        self.assertGreater(report["flush"]["near_basin_shell_rows"], report["retain"]["near_basin_shell_rows"])
+        self.assertGreater(report["delta"]["micro_entry_ready_rows"], 0)
+        self.assertGreater(report["delta"]["near_basin_shell_rows"], 0)
+        self.assertNotEqual(report["delta"]["yaw_blocked_rows"], 0)
 
     def test_grasp_probe_inactive_reason_handles_tight_near_shell(self) -> None:
         shell_fields = grasp_probe_shell_fields(

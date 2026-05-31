@@ -151,4 +151,5 @@ Recent hard-bucket validation tightened the current interpretation:
 - On the narrow `small_xy_large_yaw` sweep (`xy_gain=0.50`, `max_xy_step=0.0025`,
   `horizon=2`), flush remains the preferred window protocol: it keeps overshoot
   lower and near-grasp higher than retain, even though both variants preserve
-  the same basic support story.
+  the same basic support story. Treat that as a protocol choice, not a sign
+  correction story.
