@@ -141,7 +141,8 @@ Recent hard-bucket validation tightened the current interpretation:
 - `small_xy_large_yaw` is no longer treated as a sign flip. The focused
   direction diagnostic points to a `step_too_small_candidate` pattern instead.
 - `large_xy_large_yaw` now shows active rows after entry-focused support was
-  widened, but it still does not show near-grasp entry.
+  widened, and the remaining tail sweep over episodes `16..29` still supports
+  the same conclusion: entry support is real, not a one-off early-chunk effect.
 - `alias_drift_decision` now propagates through candidate, trace, and support
   plumbing, so reviewers should inspect whether any remaining `unknown` rows are
   a true observability gap or just incomplete support coverage.

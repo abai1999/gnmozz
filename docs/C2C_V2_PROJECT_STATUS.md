@@ -167,6 +167,19 @@ For the hard-bucket sweeps:
   manifests, but the focused sweeps still need more non-`unknown` coverage before
   yaw/frame drift conclusions are clean.
 
+The current formal acceptance snapshot is:
+
+| bucket | active / rows | oracle contraction | planner contraction | improvement | overshoot | note |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `small_xy_large_yaw` | `3496 / 14352` | `0.382` | `0.278` | `0.757` | `0.075` | flush and retain match closely; still not near-grasp complete |
+| `large_xy_large_yaw` | `45 / 9568` | `0.914` | `0.311` | `0.908` | `0.000` | tail support now spans the remaining 16..29 episodes too |
+| `large_xy_small_yaw` | `283 / 8280` | `0.804` | `0.379` | `1.000` | `0.000` | support is clearly paying off |
+| `small_xy_small_yaw` | `428 / 8680` | `0.773` | `0.370` | `0.906` | `0.037` | strong but not the current bottleneck |
+
+This table is the clearest current summary: the big-bucket entry support is
+working, while the small bucket still needs step-size / bracket refinement and
+cleaner alias/drift split before it can be treated as a finished support story.
+
 ## Important Diagnosis
 
 The current bottleneck is semantic, not just gain tuning.
