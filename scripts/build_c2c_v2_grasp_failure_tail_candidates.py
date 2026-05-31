@@ -226,8 +226,11 @@ def _alias_support_lookup(paths: Iterable[Path] | None) -> dict[tuple[int, int],
                         continue
                     if step_int >= 0:
                         keys.append((ep, step_int))
-            if not keys:
-                keys.append((ep, -1))
+            # Keep an episode-level fallback so alias support rows can still
+            # annotate candidates whose exact step does not appear in the
+            # support file. This is intentionally coarse and only used when a
+            # step-level match is absent.
+            keys.append((ep, -1))
             for key in keys:
                 existing = lookup.get(key)
                 if existing is None or _alias_drift_decision_priority(decision) >= _alias_drift_decision_priority(

@@ -144,5 +144,11 @@ Recent hard-bucket validation tightened the current interpretation:
   widened, and the remaining tail sweep over episodes `16..29` still supports
   the same conclusion: entry support is real, not a one-off early-chunk effect.
 - `alias_drift_decision` now propagates through candidate, trace, and support
-  plumbing, so reviewers should inspect whether any remaining `unknown` rows are
-  a true observability gap or just incomplete support coverage.
+  plumbing. The rebuilt alias-aware candidate manifest now falls back to
+  episode-level support matching, which eliminated `unknown` on the focused
+  small manifest and split it cleanly into `stable_alias_control` vs
+  `frame_drift_abstain`.
+- On the narrow `small_xy_large_yaw` sweep (`xy_gain=0.50`, `max_xy_step=0.0025`,
+  `horizon=2`), flush remains the preferred window protocol: it keeps overshoot
+  lower and near-grasp higher than retain, even though both variants preserve
+  the same basic support story.

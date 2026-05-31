@@ -160,18 +160,21 @@ For the hard-bucket sweeps:
 
 - `large_xy_large_yaw` now produces real active rows under the widened entry
   support, but it still has `horizon_near_grasp_after_rate = 0.000`.
-- `small_xy_large_yaw` produces a stable active set across flush and retain
-  variants, but its near-grasp entry remains weak and is now being treated as a
-  step-size / bracket question rather than a direction-sign bug.
-- `alias_drift_decision` is now propagated through candidate, trace, and support
-  manifests, but the focused sweeps still need more non-`unknown` coverage before
-  yaw/frame drift conclusions are clean.
+- `small_xy_large_yaw` now has a narrow-window validation at
+  `xy_gain=0.50`, `max_xy_step=0.0025`, `horizon=2` with alias-aware
+  candidates. The rebuilt candidate manifest eliminated `unknown` entirely by
+  falling back to episode-level alias support, and the flush/retain comparison
+  now clearly favors flush on the narrow slice: flush keeps overshoot lower and
+  near-grasp higher, while retain is noisier and more over-shoot prone.
+- `alias_drift_decision` is now propagated through candidate, trace, and
+  support manifests, with the rebuilt alias-aware candidate set split cleanly
+  into `stable_alias_control` and `frame_drift_abstain`.
 
 The current formal acceptance snapshot is:
 
 | bucket | active / rows | oracle contraction | planner contraction | improvement | overshoot | note |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `small_xy_large_yaw` | `3496 / 14352` | `0.382` | `0.278` | `0.757` | `0.075` | flush and retain match closely; still not near-grasp complete |
+| `small_xy_large_yaw` | `3496 / 14352` | `0.382` | `0.278` | `0.757` | `0.075` | older wide-window snapshot; the newer narrow `h2/ms0025` sweep now shows flush > retain |
 | `large_xy_large_yaw` | `45 / 9568` | `0.914` | `0.311` | `0.908` | `0.000` | tail support now spans the remaining 16..29 episodes too |
 | `large_xy_small_yaw` | `283 / 8280` | `0.804` | `0.379` | `1.000` | `0.000` | support is clearly paying off |
 | `small_xy_small_yaw` | `428 / 8680` | `0.773` | `0.370` | `0.906` | `0.037` | strong but not the current bottleneck |

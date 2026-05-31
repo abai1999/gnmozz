@@ -984,6 +984,57 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             self.assertEqual(rows[0]["yaw_alias_drift_decision"], "stable_alias_control")
             self.assertEqual(rows[0]["alias_drift_support_source"], str(support_path.resolve()))
 
+    def test_failure_tail_candidate_builder_falls_back_to_episode_level_alias_support(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            support_path = tmpdir / "yaw_alias_support.jsonl"
+            support_rows = [
+                {
+                    "episode_idx": 14,
+                    "step_idx": 6,
+                    "acceptance_role": "calibration_positive",
+                    "alias_label": "stable_alias",
+                    "alias_drift_decision": "stable_alias_control",
+                    "selected_step_idxs": [6],
+                }
+            ]
+            with open(support_path, "w", encoding="utf-8") as handle:
+                for row in support_rows:
+                    handle.write(json.dumps(row) + "\n")
+
+            rows = build_candidates(
+                [
+                    {
+                        "task_name": "insert_onto_square_peg",
+                        "episode_idx": 14,
+                        "step_idx": 11,
+                        "stage_name": "RING_GRASP_ALIGN",
+                        "skill_name": "precision_grasp_ring",
+                        "skill_type": "precision_grasp",
+                        "label_valid": True,
+                        "failure_bucket": "small_xy_large_yaw",
+                        "planner_prior": {"local_delta_6d": [0.0] * 6},
+                        "true_basin_error_t": {"dx": 0.045, "dy": 0.0, "dz": 0.02, "dyaw": 0.17},
+                        "true_basin_error_t_plus_1": {"dx": 0.044, "dy": 0.0, "dz": 0.02, "dyaw": 0.17},
+                        "xy_error": 0.045,
+                        "yaw_abs": 0.17,
+                        "next_xy_error": 0.044,
+                        "next_yaw_abs": 0.17,
+                        "xy_contracted": False,
+                        "near_basin_shell": False,
+                        "visual_observability_class": "visual_observable",
+                        "yaw_observability_class": "unobservable",
+                        "yaw_observable": False,
+                    }
+                ],
+                include_success_controls=False,
+                alias_drift_support_jsonl=[support_path],
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["alias_drift_decision"], "stable_alias_control")
+            self.assertEqual(rows[0]["yaw_alias_drift_decision"], "stable_alias_control")
+            self.assertEqual(rows[0]["alias_drift_support_source"], str(support_path.resolve()))
+
     def test_failure_tail_candidate_builder_emits_outer_pullback_frontier(self) -> None:
         base = {
             "task_name": "insert_onto_square_peg",
