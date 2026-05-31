@@ -194,14 +194,81 @@ def _recommended_axes(row: Mapping[str, Any], *, failure_tail_tier: str) -> list
     return []
 
 
+def _alias_drift_decision_from_row(row: Mapping[str, Any]) -> str:
+    decision = str(row.get("alias_drift_decision", row.get("yaw_alias_drift_decision", ""))).strip()
+    if decision in {"stable_alias_control", "frame_drift_abstain", "unknown"}:
+        return decision
+    label = str(row.get("alias_label", "")).strip()
+    role = str(row.get("acceptance_role", "")).strip()
+    if role == "calibration_positive" or label == "stable_alias":
+        return "stable_alias_control"
+    if role == "frame_drift_hard_case" or label == "frame_drift":
+        return "frame_drift_abstain"
+    return "unknown"
+
+
+def _alias_support_lookup(paths: Iterable[Path] | None) -> dict[tuple[int, int], dict[str, Any]]:
+    lookup: dict[tuple[int, int], dict[str, Any]] = {}
+    for path in paths or []:
+        for row in read_jsonl(path):
+            decision = _alias_drift_decision_from_row(row)
+            ep = int(row.get("episode_idx", -1))
+            step_idx = int(row.get("step_idx", row.get("step", -1)))
+            keys: list[tuple[int, int]] = []
+            if step_idx >= 0:
+                keys.append((ep, step_idx))
+            selected_step_idxs = row.get("selected_step_idxs", [])
+            if isinstance(selected_step_idxs, list):
+                for step in selected_step_idxs:
+                    try:
+                        step_int = int(step)
+                    except Exception:
+                        continue
+                    if step_int >= 0:
+                        keys.append((ep, step_int))
+            if not keys:
+                keys.append((ep, -1))
+            for key in keys:
+                existing = lookup.get(key)
+                if existing is None or _alias_drift_decision_priority(decision) >= _alias_drift_decision_priority(
+                    _text_or_default(existing.get("alias_drift_decision", None), "unknown")
+                ):
+                    lookup[key] = {
+                        "alias_drift_decision": decision,
+                        "alias_drift_support_source": str(path.resolve()),
+                        "alias_drift_support_role": str(row.get("acceptance_role", row.get("support_role", ""))),
+                        "alias_drift_support_label": str(row.get("alias_label", row.get("support_label", ""))),
+                    }
+    return lookup
+
+
+def _alias_drift_decision_priority(decision: str) -> int:
+    return {
+        "stable_alias_control": 2,
+        "frame_drift_abstain": 1,
+        "unknown": 0,
+    }.get(str(decision), 0)
+
+
+def _text_or_default(value: Any, default: str) -> str:
+    if value is None:
+        return str(default)
+    text = str(value).strip()
+    if not text or text == "None":
+        return str(default)
+    return text
+
+
 def build_candidates(
     rows: Iterable[Mapping[str, Any]],
     *,
     include_success_controls: bool = False,
     exclude_episode_indices: set[int] | None = None,
+    alias_drift_support_jsonl: Iterable[Path] | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     excluded = exclude_episode_indices or set()
+    alias_lookup = _alias_support_lookup(alias_drift_support_jsonl)
     for row_in in rows:
         row = dict(row_in)
         ep = int(row.get("episode_idx", -1))
@@ -221,6 +288,10 @@ def build_candidates(
         sample_role = "success_window_control" if success_window else "failure_tail_candidate"
         abstain_reason = _abstain_reason(row, failure_tail_tier=failure_tail_tier)
         recommended_axes = _recommended_axes(row, failure_tail_tier=failure_tail_tier)
+        alias_entry = alias_lookup.get((ep, int(row.get("step_idx", row.get("step", -1)))))
+        if alias_entry is None:
+            alias_entry = alias_lookup.get((ep, -1), {})
+        alias_drift_decision = _text_or_default(alias_entry.get("alias_drift_decision", None), _alias_drift_decision_from_row(row))
 
         candidate = {
             "schema_version": "grasp_failure_tail_candidate_v1",
@@ -254,6 +325,11 @@ def build_candidates(
             "yaw_control_observable": bool(_yaw_control_observable(row)),
             "yaw_entry_block_reason": str(row.get("yaw_entry_block_reason", "")),
             "yaw_control_block_reason": str(row.get("yaw_control_block_reason", "")),
+            "alias_drift_decision": alias_drift_decision,
+            "yaw_alias_drift_decision": alias_drift_decision,
+            "alias_drift_support_source": str(alias_entry.get("alias_drift_support_source", "")),
+            "alias_drift_support_role": str(alias_entry.get("alias_drift_support_role", "")),
+            "alias_drift_support_label": str(alias_entry.get("alias_drift_support_label", "")),
             "source_takeover_tier": str(row.get("takeover_tier", "")),
             "takeover_tier": failure_tail_tier,
             "near_basin_shell": bool(failure_tail_tier == TIER_NEAR_BASIN),
@@ -284,6 +360,7 @@ def summarize(candidates: list[dict[str, Any]]) -> dict[str, Any]:
         "by_visual_observability": Counter(str(r.get("visual_observability_class", "")) for r in candidates),
         "by_failure_bucket": Counter(str(r.get("failure_bucket", "")) for r in candidates),
         "by_planner_natural_outcome": Counter(str(r.get("planner_natural_outcome", "")) for r in candidates),
+        "by_alias_drift_decision": Counter(str(r.get("alias_drift_decision", "")) for r in candidates),
     }
     by_episode: dict[int, int] = defaultdict(int)
     for row in candidates:
@@ -309,6 +386,13 @@ def main() -> None:
     ap.add_argument("--summary_json", type=Path, default=None)
     ap.add_argument("--include_success_controls", action="store_true", default=False)
     ap.add_argument(
+        "--alias_drift_support_jsonl",
+        type=Path,
+        action="append",
+        default=None,
+        help="Optional yaw alias support JSONL files used to annotate alias_drift_decision on candidate rows.",
+    )
+    ap.add_argument(
         "--exclude_episode_indices",
         type=str,
         default="6",
@@ -318,7 +402,12 @@ def main() -> None:
 
     excluded = {int(part.strip()) for part in str(args.exclude_episode_indices).split(",") if part.strip()}
     rows = read_jsonl(args.relabel_jsonl)
-    candidates = build_candidates(rows, include_success_controls=bool(args.include_success_controls), exclude_episode_indices=excluded)
+    candidates = build_candidates(
+        rows,
+        include_success_controls=bool(args.include_success_controls),
+        exclude_episode_indices=excluded,
+        alias_drift_support_jsonl=args.alias_drift_support_jsonl,
+    )
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_jsonl, "w", encoding="utf-8") as handle:
@@ -329,6 +418,7 @@ def main() -> None:
         "source_relabel_jsonl": str(args.relabel_jsonl.resolve()),
         "output_jsonl": str(args.output_jsonl.resolve()),
         "include_success_controls": bool(args.include_success_controls),
+        "alias_drift_support_jsonl": [str(path.resolve()) for path in args.alias_drift_support_jsonl or []],
         "excluded_episode_indices": sorted(excluded),
         **summarize(candidates),
     }

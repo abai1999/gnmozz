@@ -36,6 +36,23 @@ NEGATIVE_DIAGNOSIS_LABELS = {
 }
 
 
+def _alias_drift_decision(*, acceptance_role: str, alias_label: str) -> str:
+    if acceptance_role == "calibration_positive" or alias_label == "stable_alias":
+        return "stable_alias_control"
+    if acceptance_role == "frame_drift_hard_case" or alias_label == "frame_drift":
+        return "frame_drift_abstain"
+    return "unknown"
+
+
+def _text_or_default(value: Any, default: str) -> str:
+    if value is None:
+        return str(default)
+    text = str(value).strip()
+    if not text or text == "None":
+        return str(default)
+    return text
+
+
 def _safe_float(value: Any, default: float = float("nan")) -> float:
     try:
         out = float(value)
@@ -148,6 +165,10 @@ def _support_row(
         "selected_step_count": int(len(selected_step_idxs)),
         "acceptance_role": acceptance_role,
         "alias_label": alias_label,
+        "alias_drift_decision": _text_or_default(
+            row.get("alias_drift_decision", None),
+            _alias_drift_decision(acceptance_role=acceptance_role, alias_label=alias_label),
+        ),
         "support_role": acceptance_role,
         "support_label": alias_label,
         "acceptance_reason": reason,
@@ -223,6 +244,7 @@ def build_row_support_manifest(
         "stable_alias_max_abs_error": float(stable_alias_max_abs_error),
         "by_acceptance_role": _count_by(selected, "acceptance_role"),
         "by_alias_label": _count_by(selected, "alias_label"),
+        "by_alias_drift_decision": _count_by(selected, "alias_drift_decision"),
         "by_diagnosis_label": _count_by(selected, "diagnosis_label"),
         "by_failure_bucket": _count_by(selected, "failure_bucket"),
         "by_visual_observability": _count_by(selected, "visual_observability_class"),

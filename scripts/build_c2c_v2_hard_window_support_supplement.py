@@ -116,7 +116,7 @@ def build_hard_window_support_supplement(
             mode = "strict"
             enriched["selection_reason"] = "hard_window_strict_support"
         elif (
-            str(row.get("failure_bucket", "")) == "small_xy_large_yaw"
+            str(row.get("failure_bucket", "")) in HARD_FAILURE_BUCKETS
             and tier in {"outside_takeover", "yaw_entry_blocked"}
             and float(row.get("xy_error", float("inf"))) <= float(frontier_xy_threshold)
         ):

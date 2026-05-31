@@ -70,6 +70,7 @@ from scripts.build_c2c_v2_yaw_alias_drift_support_manifest import build_support_
 from scripts.build_c2c_v2_yaw_alias_drift_row_support_manifest import build_row_support_manifest
 from scripts.build_c2c_v2_hard_window_support_supplement import build_hard_window_support_supplement
 from scripts.build_c2c_v2_frame_yaw_dataset import build_dataset as build_frame_yaw_dataset
+from scripts.diagnose_c2c_v2_grasp_failure_tail_direction import build_direction_diagnostic
 from scripts.eval_c2c_v2_frame_yaw_estimator import evaluate as evaluate_frame_yaw_estimator
 from scripts.diagnose_c2c_v2_yaw_frame_alignment import diagnose as diagnose_yaw_frame_alignment
 from scripts.mine_c2c_v2_yaw_positive_windows import mine as mine_yaw_positive_windows
@@ -932,6 +933,57 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(rows[0]["abstain_reason"], "")
         self.assertFalse(rows[0]["yaw_entry_feasible"])
 
+    def test_failure_tail_candidate_builder_annotates_alias_drift_decision_from_support_manifest(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            support_path = tmpdir / "yaw_alias_support.jsonl"
+            support_rows = [
+                {
+                    "episode_idx": 14,
+                    "step_idx": 6,
+                    "acceptance_role": "calibration_positive",
+                    "alias_label": "stable_alias",
+                    "alias_drift_decision": "stable_alias_control",
+                    "selected_step_idxs": [6],
+                }
+            ]
+            with open(support_path, "w", encoding="utf-8") as handle:
+                for row in support_rows:
+                    handle.write(json.dumps(row) + "\n")
+
+            rows = build_candidates(
+                [
+                    {
+                        "task_name": "insert_onto_square_peg",
+                        "episode_idx": 14,
+                        "step_idx": 6,
+                        "stage_name": "RING_GRASP_ALIGN",
+                        "skill_name": "precision_grasp_ring",
+                        "skill_type": "precision_grasp",
+                        "label_valid": True,
+                        "failure_bucket": "small_xy_large_yaw",
+                        "planner_prior": {"local_delta_6d": [0.0] * 6},
+                        "true_basin_error_t": {"dx": 0.045, "dy": 0.0, "dz": 0.02, "dyaw": 0.17},
+                        "true_basin_error_t_plus_1": {"dx": 0.044, "dy": 0.0, "dz": 0.02, "dyaw": 0.17},
+                        "xy_error": 0.045,
+                        "yaw_abs": 0.17,
+                        "next_xy_error": 0.044,
+                        "next_yaw_abs": 0.17,
+                        "xy_contracted": False,
+                        "near_basin_shell": False,
+                        "visual_observability_class": "visual_observable",
+                        "yaw_observability_class": "unobservable",
+                        "yaw_observable": False,
+                    }
+                ],
+                include_success_controls=False,
+                alias_drift_support_jsonl=[support_path],
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["alias_drift_decision"], "stable_alias_control")
+            self.assertEqual(rows[0]["yaw_alias_drift_decision"], "stable_alias_control")
+            self.assertEqual(rows[0]["alias_drift_support_source"], str(support_path.resolve()))
+
     def test_failure_tail_candidate_builder_emits_outer_pullback_frontier(self) -> None:
         base = {
             "task_name": "insert_onto_square_peg",
@@ -964,6 +1016,78 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(rows[0]["recommended_intervention_axes"], ["x", "y"])
         self.assertFalse(rows[0]["yaw_entry_feasible"])
         self.assertFalse(rows[0]["coarse_pullback_candidate"])
+
+    def test_hard_window_support_supplement_promotes_large_xy_large_yaw_frontier_rows(self) -> None:
+        rows = [
+            {
+                "episode_idx": 7,
+                "step_idx": 1,
+                "failure_bucket": "large_xy_large_yaw",
+                "takeover_tier": "yaw_entry_blocked",
+                "xy_error": 0.16,
+            },
+        ]
+        selected, summary = build_hard_window_support_supplement(
+            rows,
+            episode_windows=[(5, 7)],
+            outer_xy_threshold=0.12,
+            frontier_xy_threshold=0.18,
+            max_rows_per_episode=10,
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(summary["frontier_support_rows"], 1)
+        self.assertEqual(selected[0]["takeover_tier"], "frontier_pullback_candidate")
+        self.assertEqual(selected[0]["selection_reason"], "hard_window_frontier_support")
+        self.assertEqual(selected[0]["support_mode"], "frontier")
+
+    def test_direction_diagnostic_tracks_step_size_vs_flip(self) -> None:
+        rows = [
+            {
+                "episode_idx": 0,
+                "step_idx": 10,
+                "stage_name": "RING_GRASP_ALIGN",
+                "skill_type": "precision_grasp",
+                "failure_bucket": "small_xy_large_yaw",
+                "takeover_tier": "outer_pullback_candidate",
+                "alias_drift_decision": "frame_drift_abstain",
+                "intervention_active": True,
+                "privileged_dx": 0.04,
+                "privileged_dy": 0.03,
+                "grasp_probe_applied_xy_step_local_6d": [0.005, 0.004, 0.0, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [0.04, 0.03, 0.0, 0.12],
+                "grasp_probe_horizon_final_true_error_t": [0.038, 0.028, 0.0, 0.12],
+                "grasp_probe_pre_xy_error": 0.05,
+                "grasp_probe_horizon_final_xy_error": 0.047,
+                "grasp_probe_horizon_overshoot": False,
+                "xy_error": 0.05,
+                "next_xy_error": 0.047,
+            },
+            {
+                "episode_idx": 0,
+                "step_idx": 11,
+                "stage_name": "RING_GRASP_ALIGN",
+                "skill_type": "precision_grasp",
+                "failure_bucket": "small_xy_large_yaw",
+                "takeover_tier": "outer_pullback_candidate",
+                "alias_drift_decision": "frame_drift_abstain",
+                "intervention_active": True,
+                "privileged_dx": 0.04,
+                "privileged_dy": 0.03,
+                "grasp_probe_applied_xy_step_local_6d": [-0.04, -0.03, 0.0, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [0.04, 0.03, 0.0, 0.12],
+                "grasp_probe_horizon_final_true_error_t": [0.045, 0.034, 0.0, 0.12],
+                "grasp_probe_pre_xy_error": 0.05,
+                "grasp_probe_horizon_final_xy_error": 0.056,
+                "grasp_probe_horizon_overshoot": True,
+                "xy_error": 0.05,
+                "next_xy_error": 0.056,
+            },
+        ]
+        report = build_direction_diagnostic(rows, failure_bucket="small_xy_large_yaw", episodes={0}, active_only=True)
+        self.assertEqual(report["overall"]["active_rows"], 2)
+        self.assertEqual(report["rows"][0]["direction_hint"], "step_too_small_candidate")
+        self.assertEqual(report["rows"][1]["direction_hint"], "direction_flip_candidate")
+        self.assertIn("frame_drift_abstain", report["overall"]["by_alias_drift_decision"])
 
     def test_failure_tail_balanced_manifest_spreads_coverage_beyond_high_recover_episode(self) -> None:
         rows = []
@@ -2834,15 +2958,15 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual(summary["selected_rows"], 3)
         self.assertEqual(summary["strict_support_rows"], 1)
-        self.assertEqual(summary["frontier_support_rows"], 1)
-        self.assertEqual(summary["relaxed_frontier_rows"], 1)
+        self.assertEqual(summary["frontier_support_rows"], 2)
+        self.assertEqual(summary["relaxed_frontier_rows"], 0)
         self.assertEqual(summary["selected_by_episode"]["ep006"], 2)
         self.assertEqual(summary["selected_by_episode"]["ep009"], 1)
 
         relaxed = next(row for row in selected if row["episode_idx"] == 6)
-        self.assertEqual(relaxed["takeover_tier"], "outer_pullback_candidate")
-        self.assertEqual(relaxed["selection_reason"], "hard_window_pre_takeover_frontier")
-        self.assertEqual(relaxed["support_mode"], "relaxed")
+        self.assertEqual(relaxed["takeover_tier"], "frontier_pullback_candidate")
+        self.assertEqual(relaxed["selection_reason"], "hard_window_frontier_support")
+        self.assertEqual(relaxed["support_mode"], "frontier")
         self.assertEqual(relaxed["support_window_tag"], "5-7")
         self.assertTrue(relaxed["support_window_match"])
         self.assertEqual(relaxed["recommended_intervention_axes"], ["x", "y"])

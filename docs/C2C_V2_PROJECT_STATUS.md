@@ -145,6 +145,28 @@ After tightening runtime apply to only trusted axes, the smoke run
 This means the current code is no longer silently applying bad corrections, but
 it also means C2C is not yet recovering the planner failure tail.
 
+## Current Hard-Bucket Validation
+
+The latest hard-bucket validation on the fixed 30k planner, restricted to
+`RING_GRASP_ALIGN`, made the current diagnosis more precise.
+
+For `small_xy_large_yaw`, the direction diagnostic now points to
+`step_too_small_candidate`, not a sign flip. The key `ep000` and `ep010`
+small slices show `oracle_xy_step_cosine_to_residual = 1.0`, which means the
+oracle step is aligned with the true residual direction; the problem is that the
+step is too conservative, not reversed.
+
+For the hard-bucket sweeps:
+
+- `large_xy_large_yaw` now produces real active rows under the widened entry
+  support, but it still has `horizon_near_grasp_after_rate = 0.000`.
+- `small_xy_large_yaw` produces a stable active set across flush and retain
+  variants, but its near-grasp entry remains weak and is now being treated as a
+  step-size / bracket question rather than a direction-sign bug.
+- `alias_drift_decision` is now propagated through candidate, trace, and support
+  manifests, but the focused sweeps still need more non-`unknown` coverage before
+  yaw/frame drift conclusions are clean.
+
 ## Important Diagnosis
 
 The current bottleneck is semantic, not just gain tuning.

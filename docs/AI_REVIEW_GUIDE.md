@@ -21,7 +21,8 @@ takeover framework, not solved online failure-tail recovery.
 ## Fixed Review Anchors
 
 - Branch: `codex/c2c-v2-status-publish`
-- Latest relevant commit: `6576053` (`advance grasp failure-tail yaw diagnostics`)
+- Latest relevant commit: current branch tip on `codex/c2c-v2-status-publish`
+  (see `git log -n 1`)
 - Fixed planner checkpoint:
   `/home/guoning/code/VLA2/pretrained_models/planner_checkpoints/insert_onto_square_peg_30000_chkpt`
 - Fixed runtime environment: `conda run -n vla-adapter ...`
@@ -132,3 +133,15 @@ at runtime?
 
 If the answer is no, the next fix should be semantic and structural, not just a
 gain tweak.
+
+## Latest Validation Snapshot
+
+Recent hard-bucket validation tightened the current interpretation:
+
+- `small_xy_large_yaw` is no longer treated as a sign flip. The focused
+  direction diagnostic points to a `step_too_small_candidate` pattern instead.
+- `large_xy_large_yaw` now shows active rows after entry-focused support was
+  widened, but it still does not show near-grasp entry.
+- `alias_drift_decision` now propagates through candidate, trace, and support
+  plumbing, so reviewers should inspect whether any remaining `unknown` rows are
+  a true observability gap or just incomplete support coverage.

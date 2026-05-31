@@ -64,6 +64,32 @@ def _count_by(rows: Iterable[Mapping[str, Any]], key: str) -> dict[str, int]:
     return dict(Counter(str(row.get(key, "")) for row in rows))
 
 
+def _window_protocol_label(value: Any) -> str:
+    if isinstance(value, Mapping):
+        queue = "flush" if bool(value.get("queue_flushed", False)) else "retain"
+        mode = str(value.get("window_mode", value.get("stage_source", "")))
+        shell = str(value.get("shell_filter", ""))
+        horizon = value.get("requested_horizon", value.get("horizon", ""))
+        parts = [queue]
+        if mode:
+            parts.append(mode)
+        if shell:
+            parts.append(shell)
+        if horizon != "":
+            parts.append(f"h{horizon}")
+        return "|".join(parts)
+    return str(value)
+
+
+def _text_or_default(value: Any, default: str = "unknown") -> str:
+    if value is None:
+        return str(default)
+    text = str(value).strip()
+    if not text or text == "None":
+        return str(default)
+    return text
+
+
 def _row_blocked_reason(row: Mapping[str, Any]) -> str:
     if bool(row.get("intervention_active", False)):
         return "active"
@@ -90,8 +116,8 @@ def _join_candidates(
                     "intervention_trace_found": False,
                     "intervention_active": False,
                     "intervention_reason": "missing_trace",
-                    "window_protocol": str(cand.get("window_protocol", cand.get("probe_window_protocol", ""))),
-                    "alias_drift_decision": str(cand.get("alias_drift_decision", "unknown")),
+                    "window_protocol": _window_protocol_label(cand.get("window_protocol", cand.get("grasp_probe_window_protocol", cand.get("probe_window_protocol", "")))),
+                    "alias_drift_decision": _text_or_default(cand.get("alias_drift_decision", None)),
                     "grasp_probe_candidate_actionable": False,
                     "grasp_probe_candidate_actionable_relaxed_small_xy_large_yaw": False,
                 }
@@ -107,17 +133,12 @@ def _join_candidates(
                 "intervention_reason": str(
                     trace.get("intervention_reason", trace.get("grasp_probe_reason", "missing_trace")) or "missing_trace"
                 ),
-                "window_protocol": str(
-                    trace.get(
-                        "window_protocol",
-                        trace.get("grasp_probe_window_protocol", cand.get("window_protocol", cand.get("probe_window_protocol", ""))),
-                    )
+                "window_protocol": _window_protocol_label(
+                    trace.get("window_protocol", trace.get("grasp_probe_window_protocol", cand.get("window_protocol", cand.get("probe_window_protocol", ""))))
                 ),
-                "alias_drift_decision": str(
-                    cand.get(
-                        "alias_drift_decision",
-                        trace.get("alias_drift_decision", trace.get("yaw_alias_drift_decision", "unknown")),
-                    )
+                "alias_drift_decision": _text_or_default(
+                    cand.get("alias_drift_decision", None),
+                    _text_or_default(trace.get("alias_drift_decision", None), _text_or_default(trace.get("yaw_alias_drift_decision", None))),
                 ),
                 "grasp_probe_candidate_actionable": bool(
                     trace.get("grasp_probe_candidate_actionable", trace.get("candidate_actionable", False))

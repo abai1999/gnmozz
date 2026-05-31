@@ -107,6 +107,22 @@ def _mode_to_flags(mode: str) -> tuple[bool, bool]:
     return mode in {"c2c_stage_shadow", "grasp_depth_apply", "spoke_depth_apply", "force_recovery", "full_owner_by_stage", "basin_recovery_shadow", "basin_recovery_only"}, mode in {"c2c_stage_shadow", "basin_recovery_shadow"}
 
 
+def _candidate_alias_drift_decision(row: Mapping[str, Any]) -> str:
+    decision = row.get("alias_drift_decision", None)
+    if decision is None or str(decision).strip() in {"", "None"}:
+        decision = row.get("yaw_alias_drift_decision", None)
+    decision = str(decision if decision is not None else "unknown").strip()
+    if decision in {"stable_alias_control", "frame_drift_abstain", "unknown"}:
+        return decision
+    label = str(row.get("alias_label", "")).strip()
+    role = str(row.get("acceptance_role", "")).strip()
+    if role == "calibration_positive" or label == "stable_alias":
+        return "stable_alias_control"
+    if role == "frame_drift_hard_case" or label == "frame_drift":
+        return "frame_drift_abstain"
+    return "unknown"
+
+
 def _compose_video_frame(front_rgb: np.ndarray, wrist_rgb: np.ndarray | None, *, layout: str = "front") -> np.ndarray:
     front = np.asarray(front_rgb, dtype=np.uint8)
     if layout == "front" or wrist_rgb is None:
@@ -792,6 +808,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 probe_candidate_axes = probe_candidate_row.get("recommended_intervention_axes", [])
                 if not isinstance(probe_candidate_axes, (list, tuple)):
                     probe_candidate_axes = []
+                probe_alias_drift_decision = _candidate_alias_drift_decision(probe_candidate_row)
                 probe_candidate_actionable = bool(
                     (not probe_candidate_required)
                     or (
@@ -858,6 +875,8 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_candidate_match"] = bool(probe_candidate_match)
                 trace_entry["grasp_probe_candidate_actionable"] = bool(probe_candidate_actionable)
                 trace_entry["grasp_probe_candidate_actionable_relaxed_small_xy_large_yaw"] = bool(small_xy_large_yaw_candidate_relaxed)
+                trace_entry["alias_drift_decision"] = str(probe_alias_drift_decision)
+                trace_entry["yaw_alias_drift_decision"] = str(probe_alias_drift_decision)
                 trace_entry["grasp_probe_candidate_jsonl"] = str(getattr(args, "c2c_grasp_probe_candidate_jsonl", ""))
                 trace_entry["grasp_probe_failure_tail_sample_role"] = str(probe_candidate_row.get("sample_role", ""))
                 trace_entry["grasp_probe_failure_tail_takeover_tier"] = str(probe_candidate_row.get("takeover_tier", ""))

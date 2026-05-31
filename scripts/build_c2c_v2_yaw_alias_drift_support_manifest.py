@@ -93,6 +93,23 @@ def _step_diff(a: float, b: float) -> float:
     return float(((float(a) - float(b) + math.pi) % (2.0 * math.pi)) - math.pi)
 
 
+def _alias_drift_decision(*, acceptance_role: str, alias_label: str) -> str:
+    if acceptance_role == "calibration_positive" or alias_label == "stable_alias":
+        return "stable_alias_control"
+    if acceptance_role == "frame_drift_hard_case" or alias_label == "frame_drift":
+        return "frame_drift_abstain"
+    return "unknown"
+
+
+def _text_or_default(value: Any, default: str) -> str:
+    if value is None:
+        return str(default)
+    text = str(value).strip()
+    if not text or text == "None":
+        return str(default)
+    return text
+
+
 def _group_by_episode(rows: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -147,6 +164,7 @@ def _episode_summary_from_diagnostic_rows(rows: list[dict[str, Any]], *, source_
         **cls,
         "acceptance_role": acceptance_role,
         "alias_label": str(cls["label"]),
+        "alias_drift_decision": _alias_drift_decision(acceptance_role=acceptance_role, alias_label=str(cls["label"])),
         "rows": int(len(ordered)),
         "selected_step_idxs": [int(r.get("step_idx", r.get("step", -1))) for r in ordered],
         "source_row_count": int(len(ordered)),
@@ -183,6 +201,7 @@ def _sequence_report_rows(paths: list[Path]) -> list[dict[str, Any]]:
                 **cls,
                 "acceptance_role": acceptance_role,
                 "alias_label": str(cls["label"]),
+                "alias_drift_decision": _alias_drift_decision(acceptance_role=acceptance_role, alias_label=str(cls["label"])),
                 "gif_path": report.get("gif_path"),
                 "jump_sheet_path": report.get("jump_sheet_path"),
                 "report_path": str(path.resolve()),
@@ -228,6 +247,10 @@ def _merge_support_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["source_path"] = row["source_paths"][0] if row["source_paths"] else str(row.get("report_path", ""))
         row["support_priority"] = list(row.get("support_priority", []))
         row["selection_reason"] = str(row.get("reason", row.get("acceptance_reason", "")))
+        row["alias_drift_decision"] = _text_or_default(
+            row.get("alias_drift_decision", None),
+            _alias_drift_decision(acceptance_role=str(row.get("acceptance_role", "")), alias_label=str(row.get("alias_label", ""))),
+        )
         merged.append(row)
     return merged
 
@@ -271,6 +294,10 @@ def build_support_manifest(
                 "selected_step_count": int(len(row.get("selected_step_idxs", []))),
                 "acceptance_role": role,
                 "alias_label": label,
+                "alias_drift_decision": _text_or_default(
+                    row.get("alias_drift_decision", None),
+                    _alias_drift_decision(acceptance_role=role, alias_label=label),
+                ),
                 "support_role": role,
                 "support_label": label,
                 "acceptance_reason": str(row.get("acceptance_reason", row.get("reason", ""))),
@@ -297,6 +324,7 @@ def build_support_manifest(
         "num_rows": int(len(output_rows)),
         "by_acceptance_role": dict(Counter(str(r["acceptance_role"]) for r in output_rows)),
         "by_alias_label": dict(Counter(str(r["alias_label"]) for r in output_rows)),
+        "by_alias_drift_decision": dict(Counter(str(r["alias_drift_decision"]) for r in output_rows)),
         "by_source_kind": dict(Counter(str(r["source_kind"]) for r in output_rows)),
         "by_episode": {f"ep{int(row['episode_idx']):03d}": 1 for row in output_rows},
         "report_paths": [str(path.resolve()) for path in seq_paths],
