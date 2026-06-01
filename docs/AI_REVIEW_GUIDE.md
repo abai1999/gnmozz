@@ -139,7 +139,9 @@ gain tweak.
 Recent hard-bucket validation tightened the current interpretation:
 
 - `small_xy_large_yaw` is no longer treated as a sign flip. The focused
-  direction diagnostic points to a `step_too_small_candidate` pattern instead.
+  direction diagnostic now treats `oracle_xy_step_cosine_to_residual` as the
+  primary sign field and points to a `step_too_small_candidate` pattern
+  instead.
 - `large_xy_large_yaw` now shows active rows after entry-focused support was
   widened, and the remaining tail sweep over episodes `16..29` still supports
   the same conclusion: entry support is real, not a one-off early-chunk effect.
@@ -148,6 +150,9 @@ Recent hard-bucket validation tightened the current interpretation:
   episode-level support matching, which eliminated `unknown` on the focused
   small manifest and split it cleanly into `stable_alias_control` vs
   `frame_drift_abstain`.
+- The hard-window support supplement now gives `small_xy_large_yaw` a slightly
+  looser outer/frontier allowance than the other hard buckets so the support
+  surface can widen without changing the runtime gate.
 - On the narrow `small_xy_large_yaw` sweep (`xy_gain=0.50`, `max_xy_step=0.0025`,
   `horizon=2`), flush remains the preferred window protocol: it keeps overshoot
   lower and near-grasp higher than retain, even though both variants preserve

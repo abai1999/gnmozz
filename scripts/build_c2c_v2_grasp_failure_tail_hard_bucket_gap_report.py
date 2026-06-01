@@ -93,6 +93,8 @@ def _text_or_default(value: Any, default: str = "unknown") -> str:
 def _row_blocked_reason(row: Mapping[str, Any]) -> str:
     if bool(row.get("intervention_active", False)):
         return "active"
+    if bool(row.get("xy_correction_ready", row.get("grasp_probe_xy_correction_ready", False))):
+        return "xy_ready"
     reason = str(row.get("intervention_reason", row.get("grasp_probe_reason", "")))
     if reason:
         return reason
@@ -183,10 +185,12 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     shell_xy_outside_horizon = [row for row in rows if _classify_gap(row) == "shell_xy_outside_horizon"]
     shell_yaw_blocked = [row for row in rows if _classify_gap(row) == "shell_yaw_blocked"]
+    xy_ready_rows = [row for row in rows if _row_blocked_reason(row) == "xy_ready"]
     return {
         "candidate_rows": int(len(rows)),
         "trace_found_rows": int(len(found)),
         "active_rows": int(len(active)),
+        "xy_correction_ready_rows": int(len(xy_ready_rows)),
         "missing_trace_rows": int(len(missing)),
         "not_failure_tail_candidate_rows": int(len(not_failure_tail_candidate)),
         "candidate_actionable_blocked_rows": int(len(candidate_actionable_blocked)),
@@ -194,6 +198,7 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "shell_yaw_blocked_rows": int(len(shell_yaw_blocked)),
         "intervention_reason_counts": dict(Counter(str(row.get("intervention_reason", "")) for row in rows)),
         "blocked_reason_counts": dict(Counter(_classify_gap(row) for row in rows)),
+        "row_blocked_reason_counts": dict(Counter(_row_blocked_reason(row) for row in rows)),
         "failure_bucket_counts": _count_by(rows, "failure_bucket"),
         "takeover_tier_counts": _count_by(rows, "takeover_tier"),
         "yaw_observability_counts": _count_by(rows, "yaw_observability_class"),

@@ -112,6 +112,8 @@ def _planner_near_next(row: Mapping[str, Any], *, near_xy: float = 0.015, near_y
 def _blocked_reason_layer(row: Mapping[str, Any]) -> str:
     if bool(row.get("intervention_active", False)):
         return "active"
+    if bool(row.get("xy_correction_ready", row.get("grasp_probe_xy_correction_ready", False))):
+        return "xy_ready"
     reason = str(row.get("intervention_reason", ""))
     tier = str(row.get("takeover_tier", ""))
     yaw_observable = bool(row.get("yaw_control_observable", row.get("yaw_observable", False)))
@@ -214,6 +216,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "takeover_tier_counts": dict(Counter(str(r.get("takeover_tier", "")) for r in rows)),
         "intervention_reason_counts": dict(Counter(str(r.get("intervention_reason", "")) for r in rows)),
         "blocked_reason_counts": blocked_reason_counts,
+        "xy_correction_ready_rows": int(sum(bool(r.get("xy_correction_ready", r.get("grasp_probe_xy_correction_ready", False))) for r in rows)),
     }
 
 

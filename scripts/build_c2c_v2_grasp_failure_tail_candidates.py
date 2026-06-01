@@ -44,6 +44,14 @@ from prismatic.robot.coarse2contact_v2.takeover_contract import (
 
 SUCCESS_TIERS = {TIER_MICRO_ENTRY, TIER_CLOSE_READY}
 HARD_FAILURE_BUCKETS = {"large_xy_large_yaw", "large_xy_small_yaw", "small_xy_large_yaw"}
+XY_CORRECTION_READY_TIERS = {
+    TIER_COARSE_PULLBACK,
+    TIER_OUTER_PULLBACK,
+    TIER_FRONTIER_PULLBACK,
+    TIER_NEAR_BASIN,
+    TIER_MICRO_ENTRY,
+    TIER_YAW_ENTRY_BLOCKED,
+}
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -194,6 +202,16 @@ def _recommended_axes(row: Mapping[str, Any], *, failure_tail_tier: str) -> list
     return []
 
 
+def _xy_correction_ready(row: Mapping[str, Any], *, failure_tail_tier: str) -> bool:
+    if not bool(row.get("label_valid", True)):
+        return False
+    if failure_tail_tier == "abstain_prior_only":
+        return False
+    if failure_tail_tier == "too_far":
+        return False
+    return bool(failure_tail_tier in XY_CORRECTION_READY_TIERS)
+
+
 def _alias_drift_decision_from_row(row: Mapping[str, Any]) -> str:
     decision = str(row.get("alias_drift_decision", row.get("yaw_alias_drift_decision", ""))).strip()
     if decision in {"stable_alias_control", "frame_drift_abstain", "unknown"}:
@@ -291,6 +309,7 @@ def build_candidates(
         sample_role = "success_window_control" if success_window else "failure_tail_candidate"
         abstain_reason = _abstain_reason(row, failure_tail_tier=failure_tail_tier)
         recommended_axes = _recommended_axes(row, failure_tail_tier=failure_tail_tier)
+        xy_correction_ready = _xy_correction_ready(row, failure_tail_tier=failure_tail_tier)
         alias_entry = alias_lookup.get((ep, int(row.get("step_idx", row.get("step", -1)))))
         if alias_entry is None:
             alias_entry = alias_lookup.get((ep, -1), {})
@@ -341,6 +360,12 @@ def build_candidates(
             "frontier_pullback_candidate": bool(failure_tail_tier == TIER_FRONTIER_PULLBACK),
             "failure_bucket": str(row.get("failure_bucket", "")),
             "recommended_intervention_axes": recommended_axes,
+            "xy_correction_ready": xy_correction_ready,
+            "xy_correction_reason": (
+                "hard_pullback_surface"
+                if xy_correction_ready
+                else ("prior_only" if failure_tail_tier == "abstain_prior_only" else ("too_far" if failure_tail_tier == "too_far" else "inactive"))
+            ),
             "abstain_reason": abstain_reason,
             "label_valid": bool(row.get("label_valid", True)),
             "label_invalid_reason": str(row.get("label_invalid_reason", "")),

@@ -7,6 +7,10 @@ This is an offline report generator for the specific question:
     actually pointing at the privileged residual, or is it mostly
     biased, flipped, or simply too small?
 
+The formal sign metric is `oracle_xy_step_cosine_to_residual`.  The older
+`oracle_xy_step_cosine_to_descent` is still reported for compatibility, but
+it is no longer the primary sign decision field.
+
 The script is intentionally narrow.  It consumes already-joined failure-tail
 intervention rows and summarizes one episode / bucket slice at a time so the
 largest disagreement patterns are easy to inspect.
@@ -159,6 +163,8 @@ def _direction_hint(row: Mapping[str, Any]) -> str:
     cosine_to_descent = _safe_float(row.get("oracle_xy_step_cosine_to_descent", float("nan")))
     if not np.isfinite(step_norm) or step_norm <= 1.0e-12:
         return "zero_step"
+    # Keep the primary decision tied to the residual sign.  Only fall back to
+    # the descent cosine when the residual cosine is unavailable.
     if np.isfinite(cosine_to_residual) and cosine_to_residual <= -0.35:
         return "direction_flip_candidate"
     if np.isfinite(cosine_to_residual) and cosine_to_residual >= 0.65 and np.isfinite(pre_norm) and pre_norm > 1.0e-9 and step_norm < 0.55 * pre_norm:
@@ -173,7 +179,7 @@ def _direction_hint(row: Mapping[str, Any]) -> str:
             return "step_too_small_candidate" if np.isfinite(pre_norm) and pre_norm > 1.0e-9 and step_norm < 0.55 * pre_norm else "mixed_or_unclear"
         if cosine_to_residual <= -0.35:
             return "direction_flip_candidate"
-    if np.isfinite(cosine_to_descent) and cosine_to_descent <= -0.35:
+    if not np.isfinite(cosine_to_residual) and np.isfinite(cosine_to_descent) and cosine_to_descent <= -0.35:
         return "direction_flip_candidate"
     if all(np.isfinite(v) for v in (*step, *pre)) and abs(_dot(step, pre)) <= 1.0e-12:
         return "orthogonal_or_unclear"
@@ -281,6 +287,8 @@ def build_direction_diagnostic(
             "mean_step_ratio_to_residual": _mean(row["step_ratio_to_residual"] for row in active),
             "mean_oracle_step_cosine_to_residual": _mean(row["oracle_xy_step_cosine_to_residual"] for row in active),
             "mean_oracle_step_cosine_to_descent": _mean(row["oracle_xy_step_cosine_to_descent"] for row in active),
+            "primary_sign_metric": "oracle_xy_step_cosine_to_residual",
+            "compat_sign_metric": "oracle_xy_step_cosine_to_descent",
             "mean_after_privileged_xy_norm": _mean(row["after_privileged_xy_norm"] for row in active),
             "mean_after_minus_before_xy_norm": _mean(row["after_minus_before_xy_norm"] for row in active),
             "mean_planner_xy_delta": _mean(row["planner_xy_delta"] for row in per_row),
@@ -316,6 +324,8 @@ def _write_markdown(report: Mapping[str, Any], output_path: Path) -> None:
         f"- mean_step_ratio_to_residual: `{report['overall']['mean_step_ratio_to_residual']:.3f}`",
         f"- mean_oracle_step_cosine_to_residual: `{report['overall']['mean_oracle_step_cosine_to_residual']:.3f}`",
         f"- mean_oracle_step_cosine_to_descent: `{report['overall']['mean_oracle_step_cosine_to_descent']:.3f}`",
+        f"- primary_sign_metric: `{report['overall']['primary_sign_metric']}`",
+        f"- compat_sign_metric: `{report['overall']['compat_sign_metric']}`",
         f"- mean_after_privileged_xy_norm: `{report['overall']['mean_after_privileged_xy_norm']:.6f}`",
         f"- mean_after_minus_before_xy_norm: `{report['overall']['mean_after_minus_before_xy_norm']:.6f}`",
         f"- overshoot_rate: `{report['overall']['overshoot_rate']:.3f}`",

@@ -74,6 +74,7 @@ from scripts.evaluate_c2c_rlbench import (
 from scripts.evaluate_rlbench import resolve_live_target_handle, safe_live_target_pose_7d
 from prismatic.robot.stage_target_provider import apply_yaw_symmetry_to_delta, build_phase1_teacher_targets, load_phase1_grasp_spec, pose_delta_local_between
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_inactive_reason, grasp_probe_shell_fields
+from prismatic.robot.coarse2contact_v2.grasp_probe_execution import candidate_xy_correction_ready
 from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin, recovery_overshoot_flag
 
 from prismatic.robot.coarse2contact_v2 import BasinRecoveryConfig, PrecisionSkillSupervisor, load_precision_task_spec, load_basin_state_calibration_report
@@ -234,6 +235,27 @@ def _bounded_xy_oracle_probe_step(error_local_6d: np.ndarray, *, xy_gain: float,
     if norm > float(max_xy_step) > 0.0:
         correction[:2] = correction[:2] * (float(max_xy_step) / max(norm, 1.0e-9))
     return correction.astype(np.float32)
+
+
+def _smooth_grasp_probe_xy_step(
+    current_local_6d: np.ndarray,
+    previous_local_6d: np.ndarray | None,
+    *,
+    alpha: float,
+    max_xy_step: float,
+) -> np.ndarray:
+    current = np.asarray(current_local_6d, dtype=np.float32).reshape(-1)
+    current = np.pad(current, (0, max(0, 6 - current.size)))[:6].astype(np.float32)
+    if previous_local_6d is not None:
+        previous = np.asarray(previous_local_6d, dtype=np.float32).reshape(-1)
+        previous = np.pad(previous, (0, max(0, 6 - previous.size)))[:6].astype(np.float32)
+        blended = current.copy()
+        blended[:2] = float(alpha) * current[:2] + (1.0 - float(alpha)) * previous[:2]
+        current = blended
+    norm = float(np.linalg.norm(current[:2]))
+    if norm > float(max_xy_step) > 0.0:
+        current[:2] = current[:2] * (float(max_xy_step) / max(norm, 1.0e-9))
+    return current.astype(np.float32)
 
 
 def _compact_grasp_error(error_local: np.ndarray | None) -> np.ndarray:
@@ -506,6 +528,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2c_grasp_probe_frontier_pullback_xy_threshold", type=float, default=0.180)
     parser.add_argument("--c2c_grasp_probe_small_xy_large_yaw_xy_threshold", type=float, default=0.060)
     parser.add_argument("--c2c_grasp_probe_relax_small_xy_large_yaw_candidate", action="store_true", default=False)
+    parser.add_argument("--c2c_grasp_probe_sticky_steps", type=int, default=3)
+    parser.add_argument("--c2c_grasp_probe_correction_ema_alpha", type=float, default=0.65)
+    parser.add_argument("--c2c_grasp_probe_sticky_decay", type=float, default=0.85)
     parser.add_argument("--num_episodes", type=int, default=3)
     parser.add_argument("--episode_indices", type=str, default="5,8,19")
     parser.add_argument("--max_steps", type=int, default=320)
@@ -654,6 +679,9 @@ def evaluate(args: argparse.Namespace) -> float:
         "c2c_grasp_probe_frontier_pullback_xy_threshold": float(args.c2c_grasp_probe_frontier_pullback_xy_threshold),
         "c2c_grasp_probe_small_xy_large_yaw_xy_threshold": float(args.c2c_grasp_probe_small_xy_large_yaw_xy_threshold),
         "c2c_grasp_probe_relax_small_xy_large_yaw_candidate": bool(args.c2c_grasp_probe_relax_small_xy_large_yaw_candidate),
+        "c2c_grasp_probe_sticky_steps": int(args.c2c_grasp_probe_sticky_steps),
+        "c2c_grasp_probe_correction_ema_alpha": float(args.c2c_grasp_probe_correction_ema_alpha),
+        "c2c_grasp_probe_sticky_decay": float(args.c2c_grasp_probe_sticky_decay),
         "c2c_grasp_probe_candidate_jsonl": str(getattr(args, "c2c_grasp_probe_candidate_jsonl", "")),
         "c2c_grasp_probe_candidate_count": int(len(grasp_probe_candidate_keys)),
         "depth_error_trend": [],
@@ -681,6 +709,9 @@ def evaluate(args: argparse.Namespace) -> float:
         runtime_obs_rows: list[dict[str, np.ndarray]] = []
         gate_frame_saved = False
         probe_frame_saved = False
+        probe_last_active_step_idx: int | None = None
+        probe_last_active_correction_local = np.zeros(6, dtype=np.float32)
+        probe_sticky_steps_remaining = 0
         episode_target_pose_7d = None
         if c2c is not None:
             c2c.reset()
@@ -809,8 +840,10 @@ def evaluate(args: argparse.Namespace) -> float:
                 if not isinstance(probe_candidate_axes, (list, tuple)):
                     probe_candidate_axes = []
                 probe_alias_drift_decision = _candidate_alias_drift_decision(probe_candidate_row)
+                probe_candidate_xy_ready = candidate_xy_correction_ready(probe_candidate_row)
                 probe_candidate_actionable = bool(
                     (not probe_candidate_required)
+                    or probe_candidate_xy_ready
                     or (
                         not str(probe_candidate_row.get("abstain_reason", ""))
                         and "x" in {str(axis) for axis in probe_candidate_axes}
@@ -874,6 +907,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_candidate_required"] = bool(probe_candidate_required)
                 trace_entry["grasp_probe_candidate_match"] = bool(probe_candidate_match)
                 trace_entry["grasp_probe_candidate_actionable"] = bool(probe_candidate_actionable)
+                trace_entry["grasp_probe_xy_correction_ready"] = bool(probe_candidate_xy_ready)
                 trace_entry["grasp_probe_candidate_actionable_relaxed_small_xy_large_yaw"] = bool(small_xy_large_yaw_candidate_relaxed)
                 trace_entry["alias_drift_decision"] = str(probe_alias_drift_decision)
                 trace_entry["yaw_alias_drift_decision"] = str(probe_alias_drift_decision)
@@ -905,30 +939,69 @@ def evaluate(args: argparse.Namespace) -> float:
                         shell_filter=str(args.c2c_grasp_probe_shell_filter),
                         shell_fields=probe_shell_fields,
                     )
+                probe_takeover_active = bool(
+                    probe_eligible
+                    or (
+                        probe_sticky_steps_remaining > 0
+                        and probe_candidate_match
+                        and probe_stage_ok
+                        and probe_visibility_bucket != "prior_only"
+                        and probe_has_error
+                        and probe_finite_xy
+                        and (probe_shell_ok or small_xy_large_yaw_candidate_relaxed)
+                        and (probe_candidate_actionable or small_xy_large_yaw_candidate_relaxed)
+                    )
+                )
+                trace_entry["grasp_probe_active"] = bool(probe_takeover_active)
+                trace_entry["grasp_probe_sticky_takeover_active"] = bool(probe_sticky_steps_remaining > 0)
+                trace_entry["grasp_probe_sticky_steps_remaining"] = int(probe_sticky_steps_remaining)
                 trace_entry["grasp_probe_requested_horizon"] = int(max(1, int(args.c2c_grasp_probe_horizon)))
                 trace_entry["grasp_probe_horizon_steps_executed"] = 0
-                trace_entry["grasp_probe_close_locked"] = bool(probe_eligible)
+                trace_entry["grasp_probe_close_locked"] = bool(probe_takeover_active)
                 trace_entry["grasp_probe_flush_planner_queue_requested"] = bool(args.c2c_grasp_probe_flush_planner_queue)
                 trace_entry["grasp_probe_queue_len_before"] = int(len(action_queue))
                 trace_entry["grasp_probe_queue_len_after"] = int(len(action_queue))
                 trace_entry["grasp_probe_queue_flushed"] = False
                 trace_entry["grasp_probe_pre_true_error_t"] = _jsonable_value(_compact_grasp_error(probe_true_error_before))
                 trace_entry.update(probe_shell_fields)
+                probe_raw_correction_local = np.zeros(6, dtype=np.float32)
+                probe_applied_correction_local = np.zeros(6, dtype=np.float32)
                 if probe_eligible:
-                    probe_correction_local = _bounded_xy_oracle_probe_step(
+                    probe_raw_correction_local = _bounded_xy_oracle_probe_step(
                         np.asarray(probe_true_error_before, dtype=np.float32),
                         xy_gain=float(args.c2c_grasp_probe_xy_gain),
                         max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
                     )
+                    if probe_last_active_step_idx is not None and step_idx == int(probe_last_active_step_idx) + 1:
+                        probe_applied_correction_local = _smooth_grasp_probe_xy_step(
+                            probe_raw_correction_local,
+                            probe_last_active_correction_local,
+                            alpha=float(args.c2c_grasp_probe_correction_ema_alpha),
+                            max_xy_step=float(args.c2c_grasp_probe_max_xy_step),
+                        )
+                    else:
+                        probe_applied_correction_local = probe_raw_correction_local.copy()
+                    probe_last_active_step_idx = int(step_idx)
+                    probe_last_active_correction_local = probe_applied_correction_local.copy()
+                    probe_sticky_steps_remaining = max(int(args.c2c_grasp_probe_sticky_steps) - 1, 0)
+                elif probe_takeover_active and probe_sticky_steps_remaining > 0:
+                    probe_raw_correction_local = probe_last_active_correction_local.copy()
+                    probe_applied_correction_local = (float(args.c2c_grasp_probe_sticky_decay) * probe_last_active_correction_local).astype(np.float32)
+                    probe_last_active_correction_local = probe_applied_correction_local.copy()
+                    probe_last_active_step_idx = int(step_idx)
+                    probe_sticky_steps_remaining = max(probe_sticky_steps_remaining - 1, 0)
+                if probe_takeover_active:
                     current_local_command = world_delta_to_local(np.asarray(delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
                     probe_local_command = current_local_command.copy()
-                    probe_local_command[0] += float(probe_correction_local[0])
-                    probe_local_command[1] += float(probe_correction_local[1])
+                    probe_local_command[0] += float(probe_applied_correction_local[0])
+                    probe_local_command[1] += float(probe_applied_correction_local[1])
                     probe_world_delta = local_delta_to_world(probe_local_command, np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
                     delta_action = delta_action.copy()
                     delta_action[:6] = probe_world_delta[:6]
                     delta_action[6] = 1.0
-                    trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(probe_correction_local)
+                    trace_entry["grasp_probe_raw_xy_step_local_6d"] = _jsonable_value(probe_raw_correction_local)
+                    trace_entry["grasp_probe_smoothed_xy_step_local_6d"] = _jsonable_value(probe_applied_correction_local)
+                    trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(probe_applied_correction_local)
                     trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(probe_local_command)
                     trace_entry["grasp_probe_control_gate_axes"] = list(c2c.get_last_trace().get("basin_control_gate_axes", []))
                     trace_entry["grasp_probe_pullback_ready_axes"] = list(c2c.get_last_trace().get("basin_pullback_ready_axes", []))
@@ -939,6 +1012,8 @@ def evaluate(args: argparse.Namespace) -> float:
                         probe_frame_saved = True
                 else:
                     inactive_local_command = world_delta_to_local(np.asarray(delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
+                    trace_entry["grasp_probe_raw_xy_step_local_6d"] = _jsonable_value(np.zeros(6, dtype=np.float32))
+                    trace_entry["grasp_probe_smoothed_xy_step_local_6d"] = _jsonable_value(np.zeros(6, dtype=np.float32))
                     trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(np.zeros(6, dtype=np.float32))
                     trace_entry["grasp_probe_local_command_local_6d"] = _jsonable_value(inactive_local_command)
                     trace_entry["grasp_probe_control_gate_axes"] = list(c2c.get_last_trace().get("basin_control_gate_axes", []))

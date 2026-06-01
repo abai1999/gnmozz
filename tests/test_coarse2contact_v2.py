@@ -79,6 +79,8 @@ from scripts.run_c2c_v2_yaw_alias_drift_baseline import run_baseline as run_yaw_
 from scripts.run_c2c_v2_yaw_alias_drift_two_stage_baseline import _calibrate_threshold, run_two_stage_baseline
 from scripts.run_c2c_v2_grasp_shell_episode_sweep import _summarize_sweep_reports
 from scripts.relabel_c2c_v2_privileged_basin_frames import _frame_label_fields
+from prismatic.robot.coarse2contact_v2.grasp_probe_execution import smooth_grasp_probe_xy_step
+from prismatic.robot.coarse2contact_v2.grasp_probe_execution import candidate_xy_correction_ready
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_shell_fields
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_inactive_reason
 
@@ -899,10 +901,12 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(by_step[3]["abstain_reason"], "prior_only")
         self.assertEqual(by_step[4]["takeover_tier"], "coarse_pullback_candidate")
         self.assertEqual(by_step[4]["recommended_intervention_axes"], ["x", "y"])
+        self.assertTrue(by_step[4]["xy_correction_ready"])
         self.assertFalse(by_step[4]["yaw_control_observable"])
         self.assertTrue(by_step[4]["yaw_entry_feasible"])
         self.assertEqual(by_step[5]["takeover_tier"], "yaw_entry_blocked")
         self.assertEqual(by_step[5]["recommended_intervention_axes"], [])
+        self.assertTrue(by_step[5]["xy_correction_ready"])
 
     def test_failure_tail_candidate_builder_promotes_small_xy_large_yaw_yaw_blocked_into_outer_support(self) -> None:
         row = {
@@ -933,6 +937,16 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(rows[0]["recommended_intervention_axes"], ["x", "y"])
         self.assertEqual(rows[0]["abstain_reason"], "")
         self.assertFalse(rows[0]["yaw_entry_feasible"])
+        self.assertTrue(rows[0]["xy_correction_ready"])
+
+    def test_xy_correction_ready_treats_yaw_blocked_hard_cases_as_correctable_xy_surface(self) -> None:
+        candidate = {
+            "label_valid": True,
+            "sample_role": "failure_tail_candidate",
+            "takeover_tier": "yaw_entry_blocked",
+            "xy_correction_ready": True,
+        }
+        self.assertTrue(candidate_xy_correction_ready(candidate))
 
     def test_failure_tail_candidate_builder_annotates_alias_drift_decision_from_support_manifest(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -1092,6 +1106,40 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(selected[0]["selection_reason"], "hard_window_frontier_support")
         self.assertEqual(selected[0]["support_mode"], "frontier")
 
+    def test_hard_window_support_supplement_relaxes_small_xy_large_yaw_outer_support(self) -> None:
+        rows = [
+            {
+                "episode_idx": 9,
+                "step_idx": 3,
+                "failure_bucket": "small_xy_large_yaw",
+                "takeover_tier": "outside_takeover",
+                "xy_error": 0.14,
+            },
+            {
+                "episode_idx": 9,
+                "step_idx": 4,
+                "failure_bucket": "small_xy_large_yaw",
+                "takeover_tier": "yaw_entry_blocked",
+                "xy_error": 0.12,
+            },
+        ]
+        selected, summary = build_hard_window_support_supplement(
+            rows,
+            episode_windows=[(8, 10)],
+            outer_xy_threshold=0.12,
+            frontier_xy_threshold=0.18,
+            small_xy_large_yaw_outer_xy_threshold=0.15,
+            small_xy_large_yaw_frontier_xy_threshold=0.13,
+            max_rows_per_episode=10,
+        )
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(summary["selected_by_failure_bucket"]["small_xy_large_yaw"], 2)
+        by_step = {int(row["step_idx"]): row for row in selected}
+        self.assertEqual(by_step[3]["support_mode"], "relaxed")
+        self.assertEqual(by_step[3]["takeover_tier"], "outer_pullback_candidate")
+        self.assertEqual(by_step[4]["support_mode"], "frontier")
+        self.assertEqual(by_step[4]["takeover_tier"], "frontier_pullback_candidate")
+
     def test_direction_diagnostic_tracks_step_size_vs_flip(self) -> None:
         rows = [
             {
@@ -1116,6 +1164,26 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             },
             {
                 "episode_idx": 0,
+                "step_idx": 12,
+                "stage_name": "RING_GRASP_ALIGN",
+                "skill_type": "precision_grasp",
+                "failure_bucket": "small_xy_large_yaw",
+                "takeover_tier": "outer_pullback_candidate",
+                "alias_drift_decision": "frame_drift_abstain",
+                "intervention_active": True,
+                "privileged_dx": 0.04,
+                "privileged_dy": 0.03,
+                "grasp_probe_applied_xy_step_local_6d": [0.004, 0.003, 0.0, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [0.04, 0.03, 0.0, 0.12],
+                "grasp_probe_horizon_final_true_error_t": [0.039, 0.029, 0.0, 0.12],
+                "grasp_probe_pre_xy_error": 0.05,
+                "grasp_probe_horizon_final_xy_error": 0.048,
+                "grasp_probe_horizon_overshoot": False,
+                "xy_error": 0.05,
+                "next_xy_error": 0.048,
+            },
+            {
+                "episode_idx": 0,
                 "step_idx": 11,
                 "stage_name": "RING_GRASP_ALIGN",
                 "skill_type": "precision_grasp",
@@ -1136,9 +1204,11 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             },
         ]
         report = build_direction_diagnostic(rows, failure_bucket="small_xy_large_yaw", episodes={0}, active_only=True)
-        self.assertEqual(report["overall"]["active_rows"], 2)
+        self.assertEqual(report["overall"]["active_rows"], 3)
+        self.assertEqual(report["overall"]["primary_sign_metric"], "oracle_xy_step_cosine_to_residual")
         self.assertEqual(report["rows"][0]["direction_hint"], "step_too_small_candidate")
         self.assertEqual(report["rows"][1]["direction_hint"], "direction_flip_candidate")
+        self.assertEqual(report["rows"][2]["direction_hint"], "step_too_small_candidate")
         self.assertIn("frame_drift_abstain", report["overall"]["by_alias_drift_decision"])
 
     def test_failure_tail_balanced_manifest_spreads_coverage_beyond_high_recover_episode(self) -> None:
@@ -1887,6 +1957,7 @@ class Coarse2ContactV2Tests(unittest.TestCase):
                 "yaw_observability_class": "ambiguous",
                 "visual_observability_class": "visual_observable",
                 "alias_drift_decision": "frame_drift_abstain",
+                "xy_correction_ready": True,
             }
         ]
         traces = [
@@ -1897,14 +1968,17 @@ class Coarse2ContactV2Tests(unittest.TestCase):
                 "grasp_probe_reason": "shell_yaw_blocked",
                 "grasp_probe_window_protocol": "retain_h5",
                 "grasp_probe_candidate_actionable": True,
+                "grasp_probe_xy_correction_ready": True,
             }
         ]
         report = build_gap_report(candidates, traces)
-        self.assertEqual(report["overall"]["shell_yaw_blocked_rows"], 1)
+        self.assertEqual(report["overall"]["active_rows"], 0)
+        self.assertEqual(report["overall"]["xy_correction_ready_rows"], 1)
+        self.assertEqual(report["overall"]["row_blocked_reason_counts"]["xy_ready"], 1)
         by_window = {item["window_protocol"]: item for item in report["by_window_protocol"]}
         by_alias = {item["alias_drift_decision"]: item for item in report["by_alias_drift_decision"]}
         self.assertEqual(by_window["retain_h5"]["candidate_rows"], 1)
-        self.assertEqual(by_alias["frame_drift_abstain"]["shell_yaw_blocked_rows"], 1)
+        self.assertEqual(by_alias["frame_drift_abstain"]["xy_correction_ready_rows"], 1)
 
     def test_yaw_alias_drift_manifest_separates_calibration_positive_from_frame_drift(self) -> None:
         reports = [
@@ -4074,6 +4148,14 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(decision.variant_name, "xy_only")
         self.assertLessEqual(float(np.linalg.norm(decision.correction_xyyaw[:2])), 0.005 + 1e-7)
         self.assertEqual(supervisor.config.max_recovery_steps, 36)
+
+    def test_grasp_probe_smoothing_blends_consecutive_active_steps(self) -> None:
+        prev = np.array([0.0040, -0.0020, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        curr = np.array([0.0010, -0.0010, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        smoothed = smooth_grasp_probe_xy_step(curr, prev, alpha=0.5, max_xy_step=0.005)
+        self.assertLess(float(np.linalg.norm(smoothed[:2])), float(np.linalg.norm(prev[:2])))
+        self.assertGreater(float(np.linalg.norm(smoothed[:2])), float(np.linalg.norm(curr[:2])))
+        self.assertTrue(np.all(np.isfinite(smoothed)))
 
     def test_basin_recovery_networks_expose_state_and_policy_outputs(self) -> None:
         features = torch.zeros((3, 24), dtype=torch.float32)

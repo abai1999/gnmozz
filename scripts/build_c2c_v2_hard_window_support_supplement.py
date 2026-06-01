@@ -8,7 +8,9 @@ gate.  The strict target is still hard-bucket rows that already land in
 window, the script can optionally promote the nearest hard-bucket
 `outside_takeover` rows into an outer pullback support tier so the supplement
 is not empty and the next sweep can test whether the support surface actually
-grew.
+grew.  `small_xy_large_yaw` gets a slightly looser outer/frontier threshold
+than the other hard buckets so its support surface can widen without changing
+the runtime gate.
 """
 
 from __future__ import annotations
@@ -89,6 +91,8 @@ def build_hard_window_support_supplement(
     episode_windows: list[tuple[int, int]],
     outer_xy_threshold: float = 0.12,
     frontier_xy_threshold: float = 0.18,
+    small_xy_large_yaw_outer_xy_threshold: float = 0.15,
+    small_xy_large_yaw_frontier_xy_threshold: float = 0.21,
     max_rows_per_episode: int = 64,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     selected: list[dict[str, Any]] = []
@@ -109,6 +113,7 @@ def build_hard_window_support_supplement(
             continue
         candidate_rows += 1
 
+        bucket = str(row.get("failure_bucket", ""))
         tier = str(row.get("takeover_tier", ""))
         mode = ""
         enriched = dict(row)
@@ -116,9 +121,10 @@ def build_hard_window_support_supplement(
             mode = "strict"
             enriched["selection_reason"] = "hard_window_strict_support"
         elif (
-            str(row.get("failure_bucket", "")) in HARD_FAILURE_BUCKETS
+            bucket in HARD_FAILURE_BUCKETS
             and tier in {"outside_takeover", "yaw_entry_blocked"}
-            and float(row.get("xy_error", float("inf"))) <= float(frontier_xy_threshold)
+            and float(row.get("xy_error", float("inf")))
+            <= float(small_xy_large_yaw_frontier_xy_threshold if bucket == "small_xy_large_yaw" else frontier_xy_threshold)
         ):
             mode = "frontier"
             source_tier_counts[tier] += 1
@@ -131,7 +137,9 @@ def build_hard_window_support_supplement(
             enriched["recommended_intervention_axes"] = ["x", "y"]
             enriched["support_frontier"] = "pre_takeover"
             enriched["selection_reason"] = "hard_window_frontier_support"
-        elif tier == "outside_takeover" and float(row.get("xy_error", float("inf"))) <= float(outer_xy_threshold):
+        elif tier == "outside_takeover" and float(row.get("xy_error", float("inf"))) <= float(
+            small_xy_large_yaw_outer_xy_threshold if bucket == "small_xy_large_yaw" else outer_xy_threshold
+        ):
             mode = "relaxed"
             source_tier_counts[tier] += 1
             enriched["source_takeover_tier"] = tier
@@ -198,6 +206,18 @@ def main() -> None:
     )
     ap.add_argument("--outer_xy_threshold", type=float, default=0.12)
     ap.add_argument("--frontier_xy_threshold", type=float, default=0.18)
+    ap.add_argument(
+        "--small_xy_large_yaw_outer_xy_threshold",
+        type=float,
+        default=0.15,
+        help="Looser outer support threshold reserved for small_xy_large_yaw rows.",
+    )
+    ap.add_argument(
+        "--small_xy_large_yaw_frontier_xy_threshold",
+        type=float,
+        default=0.21,
+        help="Looser frontier support threshold reserved for small_xy_large_yaw rows.",
+    )
     ap.add_argument("--max_rows_per_episode", type=int, default=64)
     ap.add_argument(
         "--output_jsonl",
@@ -218,6 +238,8 @@ def main() -> None:
         episode_windows=episode_windows,
         outer_xy_threshold=float(args.outer_xy_threshold),
         frontier_xy_threshold=float(args.frontier_xy_threshold),
+        small_xy_large_yaw_outer_xy_threshold=float(args.small_xy_large_yaw_outer_xy_threshold),
+        small_xy_large_yaw_frontier_xy_threshold=float(args.small_xy_large_yaw_frontier_xy_threshold),
         max_rows_per_episode=int(args.max_rows_per_episode),
     )
     summary["input_jsonl"] = str(args.relabel_jsonl.resolve())

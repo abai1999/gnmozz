@@ -150,7 +150,8 @@ it also means C2C is not yet recovering the planner failure tail.
 The latest hard-bucket validation on the fixed 30k planner, restricted to
 `RING_GRASP_ALIGN`, made the current diagnosis more precise.
 
-For `small_xy_large_yaw`, the direction diagnostic now points to
+For `small_xy_large_yaw`, the direction diagnostic now treats
+`oracle_xy_step_cosine_to_residual` as the formal sign metric and points to
 `step_too_small_candidate`, not a sign flip. The key `ep000` and `ep010`
 small slices show `oracle_xy_step_cosine_to_residual = 1.0`, which means the
 oracle step is aligned with the true residual direction; the problem is that the
@@ -167,6 +168,9 @@ For the hard-bucket sweeps:
   now clearly favors flush on the narrow slice: flush keeps overshoot lower and
   near-grasp higher, while retain is noisier and more over-shoot prone. This
   should be treated as a window-protocol conclusion, not a sign-flip one.
+- The hard-window support supplement now gives `small_xy_large_yaw` a slightly
+  looser outer/frontier allowance than the other hard buckets, so the support
+  surface can widen without changing the runtime gate.
 - `alias_drift_decision` is now propagated through candidate, trace, and
   support manifests, with the rebuilt alias-aware candidate set split cleanly
   into `stable_alias_control` and `frame_drift_abstain`.
