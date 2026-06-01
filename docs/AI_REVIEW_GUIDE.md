@@ -1,7 +1,8 @@
 # C2C v2 External Review Guide
 
 This file is meant for external AI reviewers that only have git access to this
-repository.
+repository. For the more complete research-route review entry point, start with
+[`docs/C2C_V2_RESEARCH_REVIEW_BRIEF.md`](C2C_V2_RESEARCH_REVIEW_BRIEF.md).
 
 ## Review Goal
 
@@ -96,7 +97,8 @@ What to verify:
 
 ## Suggested Review Order
 
-1. Read `README.md` and `docs/C2C_V2_PROJECT_STATUS.md`.
+1. Read `README.md`, `docs/C2C_V2_RESEARCH_REVIEW_BRIEF.md`, and
+   `docs/C2C_V2_PROJECT_STATUS.md`.
 2. Inspect the latest commit range with:
 
 ```bash
@@ -158,3 +160,15 @@ Recent hard-bucket validation tightened the current interpretation:
   lower and near-grasp higher than retain, even though both variants preserve
   the same basic support story. Treat that as a protocol choice, not a sign
   correction story.
+
+Latest clean focused-validation read:
+
+| bucket / protocol | active rows | xy contraction | overshoot | current read |
+| --- | ---: | ---: | ---: | --- |
+| `large_xy_large_yaw` / flush | 52 | 0.935 | 0.000 | active support exists; support is still narrow |
+| `large_xy_large_yaw` / retain | 74 | 0.919 | 0.000 | more active rows; protocol is not the main blocker |
+| `small_xy_large_yaw` / flush | 212 | 0.791 | 0.028 | active support exists; step/horizon still need bracketing |
+| `small_xy_large_yaw` / retain | 212 | 0.717 | 0.023 | comparable active rows; frame/step semantics still matter |
+
+The current review focus should be whether this evidence is being interpreted
+as bounded failure-tail pullback evidence, not as solved runtime recovery.

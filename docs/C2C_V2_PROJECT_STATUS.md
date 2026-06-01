@@ -7,7 +7,9 @@ current local skill layer does not yet solve the real failure-tail recovery
 problem.
 
 For a shorter external-review entry point, see
-[`docs/AI_REVIEW_GUIDE.md`](AI_REVIEW_GUIDE.md).
+[`docs/AI_REVIEW_GUIDE.md`](AI_REVIEW_GUIDE.md). For a route-level review of
+whether the project has drifted from its research goal, see
+[`docs/C2C_V2_RESEARCH_REVIEW_BRIEF.md`](C2C_V2_RESEARCH_REVIEW_BRIEF.md).
 
 ## Goal
 
@@ -175,7 +177,7 @@ For the hard-bucket sweeps:
   support manifests, with the rebuilt alias-aware candidate set split cleanly
   into `stable_alias_control` and `frame_drift_abstain`.
 
-The current formal acceptance snapshot is:
+The older formal acceptance snapshot was:
 
 | bucket | active / rows | oracle contraction | planner contraction | improvement | overshoot | note |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
@@ -187,6 +189,27 @@ The current formal acceptance snapshot is:
 This table is the clearest current summary: the big-bucket entry support is
 working, while the small bucket still needs step-size / bracket refinement and
 cleaner alias/drift split before it can be treated as a finished support story.
+
+The cleaner focused-validation read after the `xy_correction_ready` and
+hard-bucket support updates is:
+
+| bucket / protocol | active rows | xy contraction | overshoot | current interpretation |
+| --- | ---: | ---: | ---: | --- |
+| `large_xy_large_yaw` / flush | 52 | 0.935 | 0.000 | active support exists, but support remains narrow |
+| `large_xy_large_yaw` / retain | 74 | 0.919 | 0.000 | support is wider than flush in this slice; protocol is not the main blocker |
+| `small_xy_large_yaw` / flush | 212 | 0.791 | 0.028 | active support exists; step-size / horizon need more bracketing |
+| `small_xy_large_yaw` / retain | 212 | 0.717 | 0.023 | contraction is weaker but comparable; do not call this a sign flip |
+
+This focused read should guide the next loop: widen `large_xy_large_yaw`
+support around real active windows, and keep `small_xy_large_yaw` focused on
+step-size / horizon / frame-sign diagnosis. Queue flushing is a protocol choice
+to measure, not the primary bottleneck by itself.
+
+One important audit gap remains: some aggregate focused-sweep summaries still
+do not expose `alias_drift_decision`. The field is present in candidate/trace
+plumbing, but every future hard-bucket table should explicitly split active,
+contraction, near-entry, and overshoot by `stable_alias_control`,
+`frame_drift_abstain`, and `unknown`.
 
 ## Important Diagnosis
 
@@ -304,7 +327,21 @@ closed-loop failure-tail recovery.
 
 Suggested next steps:
 
-1. Build an independent privileged relabel audit for every post-depthgate
+1. Make focused hard-bucket summaries expose `alias_drift_decision` end to end:
+   candidate manifest, trace row, failure-tail audit, and final comparison
+   table.
+
+2. Continue widening `large_xy_large_yaw` entry support, but only around
+   episode/window slices that already show real active/contraction evidence.
+
+3. Keep `small_xy_large_yaw` on narrow step-size / horizon brackets and use
+   `oracle_xy_step_cosine_to_residual` as the formal sign metric. The older
+   `oracle_xy_step_cosine_to_descent` field is compatibility-only.
+
+4. Generate MP4 comparisons only from active, contractive failure-tail rows,
+   and inspect them together with trace summaries.
+
+5. Build an independent privileged relabel audit for every post-depthgate
    candidate frame:
    - true jaw-local `dx/dy/dz/dyaw`
    - localizer proxy `dx/dy/dz/dyaw`
@@ -312,32 +349,32 @@ Suggested next steps:
    - next-frame true error
    - per-axis sign match and contraction
 
-2. Replace crop proxy semantics with a frame estimator:
+6. Replace crop proxy semantics with a frame estimator:
    - `RingFrameLocalizer`: ring visible, center heatmap, aperture/grasp frame,
      yaw observability, confidence.
    - It should answer "where is the ring frame?" rather than "what action
      should I take?"
 
-3. Add a task-frame error estimator:
+7. Add a task-frame error estimator:
    - input: ring frame, jaw/gripper state, planner prior, local frame contract
    - output: calibrated jaw-local `EstimatedBasinError`
    - explicit axis validity
    - no control action output
 
-4. Train or implement a conservative basin pullback controller:
+8. Train or implement a conservative basin pullback controller:
    - active only when axes are trusted
    - pulls toward basin, not exact pose imitation
    - penalizes overshoot
    - re-observes every step
    - abstains or reacquires when visual evidence is weak
 
-5. Prove grasp recovery before reopening close:
+9. Prove grasp recovery before reopening close:
    - report true privileged error curves
    - report near-grasp and close-ready basin entry
    - report monotonicity and overshoot
    - only then enable close and lift verify
 
-6. After grasp recovery works, reuse the same interface for:
+10. After grasp recovery works, reuse the same interface for:
    - held-ring aperture to spoke-axis alignment
    - guarded slide
    - force-triggered recovery
