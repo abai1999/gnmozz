@@ -20,6 +20,7 @@ from .controllers import GuardedSlideController, GraspContactController, Recover
 from .learned_force import LearnedForceClassifierAdapter
 from .localizers import LocalGeometryError, RingGraspLocalizer, RingSpokeAlignLocalizer
 from .specs import PrecisionSkillSpec, PrecisionTaskSpec, StageTransition
+from .takeover_contract import FrameResidual, ObservabilityDecision, TakeoverThresholds, decide_takeover_tier
 
 
 def _obs_get(observation: Any, key: str, default: Any = None) -> Any:
@@ -40,6 +41,85 @@ def _jsonable_value(value):
     if isinstance(value, (list, tuple)):
         return [_jsonable_value(v) for v in value]
     return value
+
+
+def _local_geometry_semantics(error: LocalGeometryError, *, skill_type: str) -> dict[str, Any]:
+    if skill_type == "precision_grasp":
+        return {
+            "schema_version": "grasp_frame_residual_estimate_v1",
+            "estimate_status": "calibrated_proxy",
+            "visual_evidence": {
+                "dx_source": "mask_centroid_image_offset",
+                "dy_source": "mask_centroid_image_offset",
+                "dz_source": "mask_median_depth_proxy",
+                "dyaw_source": "image_axis_diagnostic_only",
+                "image_axis_yaw": float(error.image_axis_yaw),
+                "yaw_reason": str(error.yaw_reason),
+            },
+            "contract_aligned_estimated_residual": False,
+            "invalid_reason": "" if bool(error.valid) else str(error.reason),
+            "z_semantics_status": "proxy_not_descend_progress",
+            "yaw_control_status": "abstain" if not bool(error.yaw_valid) else "diagnostic_only",
+        }
+    return {
+        "schema_version": "frame_residual_estimate_v1",
+        "estimate_status": "localizer_output",
+        "contract_aligned_estimated_residual": bool(error.valid),
+        "invalid_reason": "" if bool(error.valid) else str(error.reason),
+    }
+
+
+def _runtime_contract_decision_from_estimate(
+    est: EstimatedBasinError | None,
+    *,
+    precision_row: bool,
+    requires_yaw_observability: bool,
+    pullback_xy_threshold: float,
+) -> dict[str, Any]:
+    if est is None:
+        return {
+            "takeover_tier": "invalid",
+            "pullback_allowed": False,
+            "micro_entry_ready": False,
+            "close_ready_ready": False,
+            "runtime_proxy_contract": True,
+            "contract_source": "estimated_basin_error_missing",
+        }
+    residual = FrameResidual(
+        dx=float(est.dx),
+        dy=float(est.dy),
+        dz=float(est.dz),
+        dyaw=float(est.dyaw if est.yaw_valid else 0.0),
+        reference_frame=str(est.reference_entity),
+        target_frame=str(est.target_entity),
+        z_semantics="runtime_estimated_basin_error",
+        source=str(est.source),
+    )
+    visual_class = "prior_only" if str(est.reason) in {"prior_only", "prior_only_reacquire", "reacquire_needed"} else "runtime_estimated"
+    observability = ObservabilityDecision(
+        visual_observability_class=visual_class,
+        yaw_observability_class="observable" if bool(est.yaw_valid) else "unobservable",
+        yaw_observable=bool(est.yaw_valid),
+        reacquire_needed=bool(visual_class == "prior_only" or not est.valid),
+        reason="runtime_yaw_valid" if bool(est.yaw_valid) else str(est.reason or "yaw_abstain"),
+    )
+    decision = decide_takeover_tier(
+        residual,
+        observability,
+        precision_row=bool(precision_row),
+        requires_yaw_observability=bool(requires_yaw_observability),
+        xy_contracted=bool(est.pullback_ready(xy_threshold=pullback_xy_threshold, min_frame_consistency=0.0)),
+        thresholds=TakeoverThresholds(coarse_xy=float(pullback_xy_threshold), outer_xy=max(float(pullback_xy_threshold), 0.120), frontier_xy=max(float(pullback_xy_threshold), 0.180)),
+    ).to_dict()
+    decision.update(
+        {
+            "runtime_proxy_contract": True,
+            "contract_source": "estimated_basin_error",
+            "residual_source": str(est.source),
+            "yaw_control_source": "estimated_basin_error_yaw" if bool(est.yaw_valid) else "abstain",
+        }
+    )
+    return decision
 
 
 @dataclass
@@ -1191,6 +1271,13 @@ class PrecisionSkillSupervisor:
             estimated_basin_error=estimated_basin_error,
             grasp_ctrl=grasp_ctrl,
         )
+        runtime_contract_decision = _runtime_contract_decision_from_estimate(
+            estimated_basin_error,
+            precision_row=bool(active_skill is not None and active_skill.skill_type in {"precision_grasp", "precision_align"}),
+            requires_yaw_observability=bool(active_skill is not None and "yaw" in set(active_skill.controlled_dofs)),
+            pullback_xy_threshold=float(gate_info.get("target_xy_error_max", active_skill.xy_tolerance if active_skill is not None else 0.005)),
+        )
+        localizer_semantics = _local_geometry_semantics(localizer_active, skill_type=active_skill.skill_type if active_skill is not None else "none")
 
         self._last_trace = {
             "c2c_v2_stage": stage.name,
@@ -1203,6 +1290,7 @@ class PrecisionSkillSupervisor:
                 "grasp": _jsonable_value(grasp_error.__dict__),
                 "spoke": _jsonable_value(spoke_error.__dict__),
             },
+            "runtime_frame_residual_estimate": _jsonable_value(localizer_semantics),
             "estimated_basin_error": _jsonable_value(
                 estimated_basin_error.to_trace(
                     xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
@@ -1256,6 +1344,18 @@ class PrecisionSkillSupervisor:
                 min_frame_consistency=0.20,
             ) if estimated_basin_error is not None else False),
             "basin_close_block_reason": str(gate_info.get("close_block_reason", "not_evaluated")),
+            "runtime_takeover_contract": _jsonable_value(runtime_contract_decision),
+            "runtime_takeover_tier": str(runtime_contract_decision.get("takeover_tier", "invalid")),
+            "runtime_takeover_contract_source": str(runtime_contract_decision.get("contract_source", "unknown")),
+            "runtime_gate_contract_pullback_consistent": bool(
+                bool(gate_info.get("pullback_gate_ready", False)) == bool(runtime_contract_decision.get("pullback_allowed", False))
+            ),
+            "runtime_gate_contract_micro_consistent": bool(
+                bool(gate_info.get("micro_entry_ready", False)) == bool(runtime_contract_decision.get("micro_entry_ready", False))
+            ),
+            "runtime_gate_contract_close_consistent": bool(
+                bool(gate_info.get("close_ready", False)) == bool(runtime_contract_decision.get("close_ready_ready", False))
+            ),
             "phase_owner": stage.owner if stage_apply_allowed else "planner",
             "phase_reason": stage.transition_on if stage_apply_allowed else str(gate_info.get("reason", "waiting_precision_gate")),
             "invalid_action_flag": invalid_action_flag,

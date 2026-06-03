@@ -40,6 +40,7 @@ heuristic visual proxy?
 Look at:
 
 - `prismatic/robot/coarse2contact_v2/frame_yaw_estimator.py`
+- `prismatic/robot/coarse2contact_v2/runtime_xy_residual.py`
 - `prismatic/robot/coarse2contact_v2/takeover_contract.py`
 - `scripts/relabel_c2c_v2_privileged_basin_frames.py`
 - `scripts/audit_c2c_v2_frame_contract_relabel.py`
@@ -122,6 +123,10 @@ git show --stat --summary 6576053
 - Planner-only trajectories with no hard-tail failure
 - Replay-only or offline-only scores
 - MP4s without matching trace interpretation
+- MP4s labeled `diagnostic_privileged_probe` as runtime recovery evidence
+- `runtime_style_c2c` MP4s that still use `replay_oracle_xy` as true
+  non-privileged success evidence; those are runtime-style eval probes until a
+  non-privileged residual estimator drives the correction
 - Local `runtime_artifacts/` outputs that are not committed to git
 
 ## Current Review Question
@@ -160,6 +165,39 @@ Recent hard-bucket validation tightened the current interpretation:
   lower and near-grasp higher than retain, even though both variants preserve
   the same basic support story. Treat that as a protocol choice, not a sign
   correction story.
+- Current audit plumbing exposes `alias_drift_decision` in focused aggregate
+  summaries. Reviewers should check `unknown` explicitly rather than assuming
+  it is harmless background noise.
+- Privileged frame metadata in evaluation traces is namespaced under
+  `offline_eval_only`; it is only for relabel/audit/probe evaluation and must
+  not be counted as runtime observation.
+- Runtime traces include a proxy-derived takeover-contract diagnostic. Treat it
+  as a consistency check between gate wording and contract wording, not as
+  evidence that the grasp residual estimator is already a true jaw-local frame
+  estimator.
+- The evaluator exposes `--c2c_grasp_probe_smoke_type` with
+  `diagnostic_privileged_probe` and `runtime_style_c2c`. `runtime_style_c2c`
+  rejects `forced_shell`, so coarse/frontier shell mining cannot silently become
+  MP4 runtime evidence.
+- The latest random smoke failure (`ep000/003/011/018`) is informative:
+  stricter runtime-style activation blocks early coarse-stage takeover, but
+  mature rows become `prior_only_abstain`. Row-level inspection points primarily
+  to estimator/calibration axis abstain despite usable local visual evidence,
+  not simply to an invisible ring. Reviewers should inspect
+  `scripts/diagnose_c2c_v2_prior_only_abstain.py` before concluding the
+  localizer cannot see the object.
+- Latest runtime XY estimator A/B:
+  - v25 affine remains the runtime default. It is small-data and likely
+    over-specialized to early smoke episodes, but it still passes the current
+    MP4/hard-bucket runtime A/B better than wider candidates.
+  - v34 hard/occlusion affine should not be used for runtime apply. It improved
+    amplitude MAE offline but failed direction-sensitive runtime control.
+  - v36 direction-first MLP is implemented and can be loaded by the runtime, but
+    it is not an approved replacement. It improves offline direction and some
+    near-entry rates, while reducing contraction and increasing overshoot
+    relative to v25.
+  - Reviewers should judge estimator candidates by MP4 runtime A/B plus
+    hard-bucket runtime A/B, not by offline MAE or pooled validation metrics.
 
 Latest clean focused-validation read:
 

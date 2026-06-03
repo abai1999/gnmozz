@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import numpy as np
+from scripts.c2c_v2_grasp_probe_metrics import grasp_probe_xy_metric_fields
 
 from prismatic.robot.coarse2contact_v2.takeover_contract import COARSE_PULLBACK_XY_THRESHOLD, OUTER_PULLBACK_XY_THRESHOLD
 
@@ -243,6 +244,7 @@ def _shell_summary(
     ]
 
     def _summary(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        xy_metrics = _xy_metric_summary(_active_probe_rows(subset))
         return {
             "count": int(len(subset)),
             "rate_of_active": float(len(subset) / len(active)) if active else 0.0,
@@ -253,6 +255,7 @@ def _shell_summary(
             "one_step_overshoot_rate": float(np.mean([_probe_bool(r, "overshoot") for r in subset])) if subset else 0.0,
             "horizon_overshoot_rate": float(np.mean([_probe_bool(r, "overshoot", horizon=True) for r in subset])) if subset else 0.0,
             "overshoot_rate": float(np.mean([_probe_bool(r, "overshoot", horizon=True) for r in subset])) if subset else 0.0,
+            **xy_metrics,
         }
 
     return {
@@ -327,11 +330,63 @@ def _queue_protocol_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _xy_metric_summary(rows: list[dict[str, Any]]) -> dict[str, float]:
+    if not rows:
+        return {
+            "scalar_xy_contraction_rate": 0.0,
+            "vector_norm_contraction_rate": 0.0,
+            "scalar_vector_xy_agreement_rate": 0.0,
+            "mean_scalar_xy_delta": 0.0,
+            "mean_vector_xy_delta": 0.0,
+        }
+    metrics = [grasp_probe_xy_metric_fields(r) for r in rows]
+    active = [m for m in metrics if np.isfinite(float(m.get("scalar_xy_before", float("nan")))) or np.isfinite(float(m.get("vector_xy_before", float("nan"))))]
+    return {
+        "scalar_xy_contraction_rate": float(np.mean([bool(m["scalar_xy_contracted"]) for m in active])) if active else 0.0,
+        "vector_norm_contraction_rate": float(np.mean([bool(m["vector_norm_contracted"]) for m in active])) if active else 0.0,
+        "scalar_vector_xy_agreement_rate": float(np.mean([bool(m["scalar_vector_xy_agree"]) for m in active])) if active else 0.0,
+        "mean_scalar_xy_delta": float(np.mean([float(m["scalar_xy_delta"]) for m in active if np.isfinite(float(m["scalar_xy_delta"]))])) if active else 0.0,
+        "mean_vector_xy_delta": float(np.mean([float(m["vector_xy_delta"]) for m in active if np.isfinite(float(m["vector_xy_delta"]))])) if active else 0.0,
+    }
+
+
 def _row_group_value(row: Mapping[str, Any], key: str, default: str = "") -> str:
     value = row.get(key, default)
     if value is None:
         return default
     return str(value)
+
+
+def _alias_drift_decision(row: Mapping[str, Any]) -> str:
+    decision = _row_group_value(row, "alias_drift_decision", "")
+    if not decision or decision == "None":
+        decision = _row_group_value(row, "yaw_alias_drift_decision", "")
+    if decision in {"stable_alias_control", "frame_drift_abstain", "unknown"}:
+        return decision
+    label = _row_group_value(row, "alias_label", "")
+    role = _row_group_value(row, "acceptance_role", "")
+    if role == "calibration_positive" or label == "stable_alias":
+        return "stable_alias_control"
+    if role == "frame_drift_hard_case" or label == "frame_drift":
+        return "frame_drift_abstain"
+    return "unknown"
+
+
+def _candidate_match(row: Mapping[str, Any]) -> bool:
+    if "grasp_probe_candidate_match" in row:
+        return bool(row.get("grasp_probe_candidate_match", False))
+    if "candidate_match" in row:
+        return bool(row.get("candidate_match", False))
+    return True
+
+
+def _candidate_coverage_bucket(row: Mapping[str, Any]) -> str:
+    if _candidate_match(row):
+        return "candidate_match_true"
+    reason = _row_group_value(row, "grasp_probe_reason", "") or _row_group_value(row, "intervention_reason", "")
+    if reason == "not_failure_tail_candidate":
+        return "not_failure_tail_candidate"
+    return "candidate_match_false"
 
 
 def _probe_pre_xy(row: Mapping[str, Any]) -> float:
@@ -490,12 +545,46 @@ def _group_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> dict[tuple
     return groups
 
 
+def _group_rows_by_alias(rows: list[dict[str, Any]]) -> dict[tuple[str], list[dict[str, Any]]]:
+    groups: dict[tuple[str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if not _candidate_match(row):
+            continue
+        groups[(_alias_drift_decision(row),)].append(row)
+    return groups
+
+
+def _group_rows_by_coverage_bucket(rows: list[dict[str, Any]]) -> dict[tuple[str], list[dict[str, Any]]]:
+    groups: dict[tuple[str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if _candidate_match(row):
+            continue
+        groups[(_candidate_coverage_bucket(row),)].append(row)
+    return groups
+
+
 def _probe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if str(row.get("grasp_probe_policy", "off")) != "off"]
 
 
 def _active_probe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if bool(row.get("grasp_probe_active", False))]
+
+
+def _alias_drift_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    matched_rows = [row for row in rows if _candidate_match(row)]
+    unmatched_rows = [row for row in rows if not _candidate_match(row)]
+    total = len(matched_rows)
+    unknown = int(sum(_alias_drift_decision(row) == "unknown" for row in matched_rows))
+    return {
+        "counts": dict(Counter(_alias_drift_decision(row) for row in matched_rows)),
+        "unknown_rows": unknown,
+        "unknown_rate": float(unknown / total) if total else 0.0,
+        "candidate_match_rows": int(len(matched_rows)),
+        "candidate_match_false_rows": int(len(unmatched_rows)),
+        "candidate_match_false_rate": float(len(unmatched_rows) / len(rows)) if rows else 0.0,
+        "coverage_bucket_counts": dict(Counter(_candidate_coverage_bucket(row) for row in unmatched_rows)),
+    }
 
 
 def _plot_episode(ep_tag: str, rows: list[dict[str, Any]], output_dir: Path) -> None:
@@ -542,6 +631,8 @@ def _bucket_summary(
     horizon_steps: int,
 ) -> dict[str, Any]:
     active = _active_probe_rows(rows)
+    candidate_match_rows = [r for r in rows if _candidate_match(r)]
+    candidate_match_false_rows = [r for r in rows if not _candidate_match(r)]
     prior_only = [r for r in rows if _row_group_value(r, "grasp_probe_visibility_bucket", "prior_only") == "prior_only"]
     visual = [r for r in rows if _row_group_value(r, "grasp_probe_visibility_bucket", "") == "visual_observable"]
     partial = [r for r in rows if _row_group_value(r, "grasp_probe_visibility_bucket", "") == "partial_observable"]
@@ -568,6 +659,8 @@ def _bucket_summary(
     return {
         "count": int(len(rows)),
         "active_count": int(active_count),
+        "candidate_match_rows": int(len(candidate_match_rows)),
+        "candidate_match_false_rows": int(len(candidate_match_false_rows)),
         "xy_contraction_rate": float(active_xy_rate),
         "xy_contraction_lower_ci": float(_wilson_lower_bound(contracted_count, len(active_xy))),
         "xy_contracted_count": int(contracted_count),
@@ -635,6 +728,7 @@ def _bucket_summary(
         "active_pullback_axes_hist": dict(Counter(_hist_key(r.get("grasp_probe_pullback_ready_axes", [])) for r in active)),
         "stage_source_counts": dict(Counter(_row_group_value(r, "grasp_probe_stage_source", "") for r in rows)),
         "reason_counts": dict(Counter(_row_group_value(r, "grasp_probe_reason", "") for r in rows)),
+        "coverage_bucket_counts": dict(Counter(_candidate_coverage_bucket(r) for r in candidate_match_false_rows)),
     }
 
 
@@ -718,6 +812,32 @@ def audit(
             ),
         })
 
+    by_alias_drift_decision: list[dict[str, Any]] = []
+    for key, subset in sorted(_group_rows_by_alias(probe_rows).items()):
+        by_alias_drift_decision.append({
+            "alias_drift_decision": key[0],
+            **_bucket_summary(
+                subset,
+                near_grasp_xy_threshold=near_grasp_xy_threshold,
+                near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+                max_xy_step=max_xy_step,
+                horizon_steps=horizon_steps,
+            ),
+        })
+
+    by_candidate_coverage_bucket: list[dict[str, Any]] = []
+    for key, subset in sorted(_group_rows_by_coverage_bucket(probe_rows).items()):
+        by_candidate_coverage_bucket.append({
+            "candidate_coverage_bucket": key[0],
+            **_bucket_summary(
+                subset,
+                near_grasp_xy_threshold=near_grasp_xy_threshold,
+                near_grasp_yaw_threshold=near_grasp_yaw_threshold,
+                max_xy_step=max_xy_step,
+                horizon_steps=horizon_steps,
+            ),
+        })
+
     overall = {
         "num_rows": int(len(rows)),
         "probe_rows": int(len(probe_rows)),
@@ -741,6 +861,7 @@ def audit(
         "horizon_close_ready_after_count": int(sum(_probe_bool(r, "close_ready_after", horizon=True) for r in active_rows)),
         "horizon_overshoot_rate": float(np.mean([_probe_bool(r, "overshoot", horizon=True) for r in active_rows])) if active_rows else 0.0,
         "horizon_overshoot_count": int(sum(_probe_bool(r, "overshoot", horizon=True) for r in active_rows)),
+        **_xy_metric_summary(active_rows),
         "prior_only_abstain_rate": float(np.mean([
             _row_group_value(r, "grasp_probe_reason", "") == "prior_only_abstain"
             for r in probe_rows
@@ -788,6 +909,7 @@ def audit(
         },
         "reason_counts": dict(Counter(_row_group_value(r, "grasp_probe_reason", "") for r in probe_rows)),
         "stage_source_counts": dict(Counter(_row_group_value(r, "grasp_probe_stage_source", "") for r in probe_rows)),
+        "alias_drift_decision": _alias_drift_summary(probe_rows),
     }
 
     return {
@@ -802,6 +924,8 @@ def audit(
         "by_visibility_bucket": by_visual,
         "by_episode": by_episode,
         "by_episode_failure_bucket": by_episode_failure_bucket,
+        "by_alias_drift_decision": by_alias_drift_decision,
+        "by_candidate_coverage_bucket": by_candidate_coverage_bucket,
         "runtime_invariants": {
             "uses_privileged_target": False,
             "uses_privileged_runtime": False,
@@ -942,6 +1066,28 @@ def main() -> None:
     ])
     for axis, value in report["overall"]["axis_abs_contraction_rate"].items():
         md_lines.append(f"- `{axis}`: `{float(value):.3f}`")
+    md_lines.append("")
+    md_lines.append("## Alias/Drift Split")
+    md_lines.append(f"- counts: `{report['overall']['alias_drift_decision']['counts']}`")
+    md_lines.append(f"- unknown_rows: `{report['overall']['alias_drift_decision']['unknown_rows']}`")
+    md_lines.append(f"- unknown_rate: `{report['overall']['alias_drift_decision']['unknown_rate']:.3f}`")
+    for item in report["by_alias_drift_decision"]:
+        md_lines.append(
+            f"- `{item['alias_drift_decision']}`: active={int(item['active_count'])}, "
+            f"horizon_xy={float(item['horizon_xy_contraction_rate']):.3f}, "
+            f"near={float(item['horizon_near_grasp_after_rate']):.3f}, "
+            f"overshoot={float(item['horizon_overshoot_rate']):.3f}"
+        )
+    md_lines.append("")
+    md_lines.append("## Candidate Coverage")
+    md_lines.append(f"- candidate_match_rows: `{report['overall']['alias_drift_decision']['candidate_match_rows']}`")
+    md_lines.append(f"- candidate_match_false_rows: `{report['overall']['alias_drift_decision']['candidate_match_false_rows']}`")
+    md_lines.append(f"- candidate_match_false_rate: `{report['overall']['alias_drift_decision']['candidate_match_false_rate']:.3f}`")
+    for item in report.get("by_candidate_coverage_bucket", []):
+        md_lines.append(
+            f"- `{item['candidate_coverage_bucket']}`: rows={int(item['count'])}, active={int(item['active_count'])}, "
+            f"candidate_match_false={int(item['candidate_match_false_rows'])}"
+        )
     md_lines.append("")
     md_lines.append("## Failure Buckets")
     for item in report["by_failure_bucket"]:

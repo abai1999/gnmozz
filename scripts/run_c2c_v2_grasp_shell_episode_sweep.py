@@ -193,6 +193,16 @@ def _summarize_sweep_reports(
     hard_support_bucket_counter: Counter[str] = Counter()
     hard_support_bucket_episode_counter: Counter[tuple[int, str]] = Counter()
     blocked_reason_bucket_counter: Counter[tuple[str, str]] = Counter()
+    alias_rows_total: Counter[str] = Counter()
+    alias_active_total: Counter[str] = Counter()
+    alias_xy_contracted: Counter[str] = Counter()
+    alias_near_after: Counter[str] = Counter()
+    alias_overshoot: Counter[str] = Counter()
+    coverage_rows_total: Counter[str] = Counter()
+    coverage_active_total: Counter[str] = Counter()
+    coverage_xy_contracted: Counter[str] = Counter()
+    coverage_near_after: Counter[str] = Counter()
+    coverage_overshoot: Counter[str] = Counter()
     selected_episode_indices: set[int] = set()
     selected_failure_buckets: set[str] = set()
 
@@ -234,6 +244,63 @@ def _summarize_sweep_reports(
                 bucket = str(item.get("failure_bucket", ""))
                 for reason, count in dict(item.get("blocked_reason_counts", {})).items():
                     blocked_reason_bucket_counter[(bucket, str(reason))] += int(count)
+        for item in chunk_report.get("by_alias_drift_decision", []):
+            alias = str(item.get("alias_drift_decision", "unknown") or "unknown")
+            rows = int(item.get("count", item.get("num_rows", 0)) or 0)
+            active = int(item.get("active_count", item.get("active_failure_tail_rows", 0)) or 0)
+            alias_rows_total[alias] += rows
+            alias_active_total[alias] += active
+            alias_xy_contracted[alias] += int(
+                item.get(
+                    "horizon_xy_contracted_count",
+                    item.get("xy_contracted_count", round(float(item.get("horizon_xy_contraction_rate", item.get("xy_contraction_rate", 0.0))) * float(active))),
+                )
+                or 0
+            )
+            alias_near_after[alias] += int(
+                item.get(
+                    "horizon_near_grasp_after_count",
+                    round(float(item.get("horizon_near_grasp_after_rate", item.get("near_grasp_after_rate", 0.0))) * float(active)),
+                )
+                or 0
+            )
+            alias_overshoot[alias] += int(
+                item.get(
+                    "horizon_overshoot_count",
+                    round(float(item.get("horizon_overshoot_rate", item.get("overshoot_rate", 0.0))) * float(active)),
+                )
+                or 0
+            )
+        for item in chunk_report.get("by_candidate_coverage_bucket", []):
+            bucket = str(item.get("candidate_coverage_bucket", "candidate_match_false") or "candidate_match_false")
+            rows = int(item.get("count", item.get("num_rows", 0)) or 0)
+            active = int(item.get("active_count", item.get("active_failure_tail_rows", 0)) or 0)
+            coverage_rows_total[bucket] += rows
+            coverage_active_total[bucket] += active
+            coverage_xy_contracted[bucket] += int(
+                item.get(
+                    "horizon_xy_contracted_count",
+                    item.get("xy_contracted_count", round(float(item.get("horizon_xy_contraction_rate", item.get("xy_contraction_rate", 0.0))) * float(active))),
+                )
+                or 0
+            )
+            coverage_near_after[bucket] += int(
+                item.get(
+                    "horizon_near_grasp_after_count",
+                    round(float(item.get("horizon_near_grasp_after_rate", item.get("near_grasp_after_rate", 0.0))) * float(active)),
+                )
+                or 0
+            )
+            coverage_overshoot[bucket] += int(
+                item.get(
+                    "horizon_overshoot_count",
+                    round(float(item.get("horizon_overshoot_rate", item.get("overshoot_rate", 0.0))) * float(active)),
+                )
+                or 0
+            )
+        alias_overall = dict(chunk_report.get("overall", {}).get("alias_drift_decision", {}) or {})
+        for alias, count in dict(alias_overall.get("counts", {}) or {}).items():
+            alias_rows_total.setdefault(str(alias), 0)
 
     ranked_episodes = _top_hits(
         episode_rows,
@@ -317,6 +384,28 @@ def _summarize_sweep_reports(
         bucket: {reason: int(count) for (bucket_key, reason), count in sorted(blocked_reason_bucket_counter.items()) if bucket_key == bucket}
         for bucket in sorted({bucket for bucket, _ in blocked_reason_bucket_counter.keys()})
     }
+    alias_drift_decision_summary = {
+        alias: {
+            "rows": int(alias_rows_total[alias]),
+            "active_rows": int(alias_active_total[alias]),
+            "horizon_xy_contraction_rate": float(alias_xy_contracted[alias] / alias_active_total[alias]) if alias_active_total[alias] else 0.0,
+            "horizon_near_grasp_after_rate": float(alias_near_after[alias] / alias_active_total[alias]) if alias_active_total[alias] else 0.0,
+            "horizon_overshoot_rate": float(alias_overshoot[alias] / alias_active_total[alias]) if alias_active_total[alias] else 0.0,
+        }
+        for alias in sorted(alias_rows_total.keys())
+    }
+    candidate_coverage_summary = {
+        bucket: {
+            "rows": int(coverage_rows_total[bucket]),
+            "active_rows": int(coverage_active_total[bucket]),
+            "horizon_xy_contraction_rate": float(coverage_xy_contracted[bucket] / coverage_active_total[bucket]) if coverage_active_total[bucket] else 0.0,
+            "horizon_near_grasp_after_rate": float(coverage_near_after[bucket] / coverage_active_total[bucket]) if coverage_active_total[bucket] else 0.0,
+            "horizon_overshoot_rate": float(coverage_overshoot[bucket] / coverage_active_total[bucket]) if coverage_active_total[bucket] else 0.0,
+        }
+        for bucket in sorted(coverage_rows_total.keys())
+    }
+    alias_unknown_rows = int(alias_rows_total.get("unknown", 0))
+    alias_total_rows = int(sum(alias_rows_total.values()))
     collection_target = {
         "active_rows": total_active_rows,
         "yaw_feasible_rows": total_yaw_feasible_rows,
@@ -373,6 +462,10 @@ def _summarize_sweep_reports(
             "yaw_observable_rows": total_yaw_observable_rows,
             "yaw_blocked_rows": total_yaw_blocked_rows,
             "blocked_reason_counts_by_failure_bucket": blocked_reason_counts_by_failure_bucket,
+            "alias_drift_decision": alias_drift_decision_summary,
+            "alias_drift_unknown_rows": alias_unknown_rows,
+            "alias_drift_unknown_rate": float(alias_unknown_rows / alias_total_rows) if alias_total_rows else 0.0,
+            "candidate_coverage_bucket": candidate_coverage_summary,
             "contraction_lower_ci_by_tier": contraction_lower_ci_by_tier,
             "contraction_rate_by_tier": contraction_rate_by_tier,
             "frame_contract_report_count": int(len(frame_reports)),
@@ -408,6 +501,12 @@ def _write_markdown(summary: dict[str, Any], out_path: Path) -> None:
         f"- frame_contract_report_count: `{summary['frame_contract_summary']['frame_contract_report_count']}`",
         f"- contraction_lower_ci_by_tier: `{summary['frame_contract_summary']['contraction_lower_ci_by_tier']}`",
         f"- contraction_rate_by_tier: `{summary['frame_contract_summary']['contraction_rate_by_tier']}`",
+        f"- alias_drift_unknown_rows: `{summary['frame_contract_summary']['alias_drift_unknown_rows']}`",
+        f"- alias_drift_unknown_rate: `{summary['frame_contract_summary']['alias_drift_unknown_rate']:.3f}`",
+        f"- alias_drift_decision: `{summary['frame_contract_summary']['alias_drift_decision']}`",
+        "",
+        "## Candidate Coverage Bucket",
+        f"- candidate_coverage_bucket: `{summary['frame_contract_summary'].get('candidate_coverage_bucket', {})}`",
         "",
         "## Blocked Reasons By Failure Bucket",
     ]
@@ -526,8 +625,16 @@ def main() -> None:
     ap.add_argument("--close_ready_xy_threshold", type=float, default=0.005)
     ap.add_argument("--close_ready_yaw_threshold", type=float, default=0.03)
     ap.add_argument("--c2c_grasp_probe_xy_gain", type=float, default=0.35)
+    ap.add_argument(
+        "--c2c_grasp_probe_smoke_type",
+        type=str,
+        default="diagnostic_privileged_probe",
+        choices=["diagnostic_privileged_probe", "runtime_style_c2c"],
+    )
     ap.add_argument("--c2c_grasp_probe_max_xy_step", type=float, default=0.003)
     ap.add_argument("--c2c_grasp_probe_horizon", type=int, default=3)
+    ap.add_argument("--c2c_grasp_probe_micro_deadband", type=float, default=0.005)
+    ap.add_argument("--c2c_grasp_probe_micro_hysteresis_alpha", type=float, default=0.45)
     ap.add_argument("--c2c_grasp_probe_flush_planner_queue", action="store_true", default=False)
     ap.add_argument("--c2c_grasp_probe_window_mode", type=str, default="forced_shell", choices=["stage", "forced_shell"])
     ap.add_argument(
@@ -611,10 +718,16 @@ def main() -> None:
             "replay_oracle_xy",
             "--c2c_grasp_probe_xy_gain",
             str(args.c2c_grasp_probe_xy_gain),
+            "--c2c_grasp_probe_smoke_type",
+            str(args.c2c_grasp_probe_smoke_type),
             "--c2c_grasp_probe_max_xy_step",
             str(args.c2c_grasp_probe_max_xy_step),
             "--c2c_grasp_probe_horizon",
             str(args.c2c_grasp_probe_horizon),
+            "--c2c_grasp_probe_micro_deadband",
+            str(args.c2c_grasp_probe_micro_deadband),
+            "--c2c_grasp_probe_micro_hysteresis_alpha",
+            str(args.c2c_grasp_probe_micro_hysteresis_alpha),
             *(
                 ["--c2c_grasp_probe_flush_planner_queue"]
                 if bool(args.c2c_grasp_probe_flush_planner_queue)
@@ -779,9 +892,12 @@ def main() -> None:
             },
             "sweep_config": {
                 "c2c_grasp_probe_window_mode": args.c2c_grasp_probe_window_mode,
+                "c2c_grasp_probe_smoke_type": args.c2c_grasp_probe_smoke_type,
                 "c2c_grasp_probe_shell_filter": args.c2c_grasp_probe_shell_filter,
                 "c2c_grasp_probe_candidate_jsonl": str(args.c2c_grasp_probe_candidate_jsonl),
                 "c2c_grasp_probe_horizon": int(args.c2c_grasp_probe_horizon),
+                "c2c_grasp_probe_micro_deadband": float(args.c2c_grasp_probe_micro_deadband),
+                "c2c_grasp_probe_micro_hysteresis_alpha": float(args.c2c_grasp_probe_micro_hysteresis_alpha),
                 "c2c_grasp_probe_flush_planner_queue": bool(args.c2c_grasp_probe_flush_planner_queue),
                 "c2c_grasp_probe_xy_gain": float(args.c2c_grasp_probe_xy_gain),
                 "c2c_grasp_probe_max_xy_step": float(args.c2c_grasp_probe_max_xy_step),

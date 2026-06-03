@@ -379,6 +379,114 @@ Suggested next steps:
    - guarded slide
    - force-triggered recovery
 
+## Latest Implementation Guardrails
+
+- MP4 smoke is now explicitly split into two evidence types:
+  `diagnostic_privileged_probe` and `runtime_style_c2c`. Diagnostic probes may
+  use privileged oracle residuals for eval-only intervention analysis. Runtime
+  style smoke cannot use `forced_shell`, and while `replay_oracle_xy` remains
+  active it must be described as a runtime-style eval probe, not true
+  non-privileged closed-loop recovery.
+- The latest random failure-tail MP4 check (`ep000/003/011/018`) showed that
+  broad diagnostic support was being mistaken for runtime takeover evidence.
+  After enforcing mature runtime-stage windows and excluding frontier/coarse
+  support tiers, early coarse-trajectory takeover is blocked, but active rows
+  drop to zero because mature candidate rows mostly become
+  `prior_only_abstain`.
+- A representative `prior_only_abstain` row is not a missing-ring case:
+  `local_geometry_error.grasp.valid=true` with usable confidence/observability,
+  but `EstimatedBasinError` marks all axes invalid under
+  `basin_axis_policy={x: abstain, y/z: diagnostic_only, yaw: abstain}`. The
+  current blocker is therefore calibrated runtime XY residual semantics, not
+  merely MP4 smoothing or action gain.
+- `scripts/diagnose_c2c_v2_prior_only_abstain.py` is the official diagnostic
+  for this failure mode. It classifies prior-only rows without using privileged
+  residuals, separating missing/weak localizer evidence from estimator-axis
+  policy abstain and trace plumbing mismatches.
+- `prismatic.robot.coarse2contact_v2.runtime_xy_residual` defines the current
+  non-privileged XY residual evidence boundary. It intentionally keeps yaw and
+  close disabled and only reports whether visual evidence plus calibrated proxy
+  axes are ready for bounded XY pullback.
+- Runtime XY pullback calibration is now explicit. When a report-loaded basin
+  calibration would otherwise keep `x/y` in `abstain/diagnostic_only`, the
+  evaluator can enable an XY-only override that marks `x/y` as
+  `trusted_control` for bounded pullback while keeping `z=diagnostic_only` and
+  `yaw=abstain`. This fixes the prior-only plumbing gap without reopening yaw
+  or close.
+- On the v25 runtime-style trace replay for `ep000/003/011/018`, prior-only
+  abstain dropped from `315/880` rows to `0/880`. Active rows appeared only
+  after the stage matured (`first_active_stage_age >= 20`), with
+  `z_valid_rows=0`, `yaw_valid_rows=0`, and `close_ready_rows=0` in every
+  episode. This is the first clean evidence that local visual evidence plus
+  XY-only calibration can open bounded pullback windows without unlocking
+  yaw/close.
+- Focused hard-bucket summaries must now expose `alias_drift_decision` directly:
+  `stable_alias_control`, `frame_drift_abstain`, and `unknown` each get their
+  own active/contraction/near-entry/overshoot read. A large `unknown` share is
+  an audit plumbing problem, not yaw evidence.
+- Runtime gripper traces keep privileged pose/frame metadata under
+  `offline_eval_only`. The supervisor still reports
+  `uses_privileged_runtime=false`; offline relabel/probe fields are not runtime
+  observations.
+- C2C alignment handoff is now a first-class lifecycle concept. The runtime
+  smoke path emits `takeover_session_id`, `takeover_lifecycle_state`,
+  `terminal_state`, `alignment_ready_for_handoff`, `safe_abstain_open`,
+  `failed_retryable`, `failed_terminal`, `budget_used`, and
+  `final_axis_readiness`. Sticky smoothing no longer defines semantic success
+  or exit; it only smooths correction commands.
+- C2C still does not own gripper closing. It only decides whether planner
+  gripper handoff is allowed. In precision alignment windows, planner close
+  requests must pass `alignment_ready_for_handoff`; otherwise the trace records
+  `planner_gripper_close_blocked` and keeps the gripper open.
+- `TaskFrameResidualEstimate` is the new target abstraction for generalized
+  alignment. It records `reference_frame`, `target_frame`, `active_dofs`,
+  `dx/dy/dz/dyaw`, per-axis validity/confidence, and explicit `z_semantics` /
+  `yaw_semantics`. `dz` is task approach-axis residual, not a global world-z
+  threshold, and image/PCA yaw remains diagnostic until a held-out yaw estimator
+  passes validation.
+- Supervisor traces now include a runtime proxy takeover-contract view so
+  reviewers can compare `pullback_gate_ready / micro_entry_ready / close_ready`
+  against the formal tier language. This is a contract-alignment diagnostic,
+  not proof that the proxy residual is a true jaw-local estimator.
+- Grasp runtime residual semantics remain explicitly marked as
+  `calibrated_proxy`: mask centroid, median depth, and image-axis yaw are visual
+  evidence, not a solved frame residual estimator.
+- Failure-tail manifests are not sufficient to activate C2C by themselves. The
+  eval probe now also requires the row to be inside the configured
+  high-precision XY activation window, so coarse-approach rows cannot become
+  takeover evidence just because they appear in a manifest.
+- MP4 close-handoff smoke must distinguish close command, observed closed
+  gripper state, and task reward. A close command or handoff is not counted as
+  successful grasp/close evidence unless the trace also shows physical closure
+  and success evidence.
+- Runtime XY estimator status, as of the latest v36 check:
+  - `runtime_xy_affine_calibration_v25.json` remains the default runtime smoke
+    calibration. It is a small-data affine calibrator trained on 60 active rows
+    from `ep000/003/011/018`, so it is useful but not final generalization
+    evidence.
+  - `runtime_xy_affine_calibration_hard_occlusion_v34_stable.json` used wider
+    hard-bucket / occlusion data, but failed runtime A/B. On the same MP4 smoke
+    set it dropped estimator direction alignment from `0.989` to `0.031` and
+    raised `step_too_small_rate` to `0.816`; it must not replace v25.
+  - The training script now supports a direction-first / control-aware
+    objective and JSON-serialized MLP checkpoints. The v36 MLP candidate
+    strongly improves offline direction metrics but has not passed runtime
+    replacement criteria: MP4 contraction was `0.793` vs v25 `0.826`, and
+    hard-bucket contraction was `0.826` vs v25 `0.913`, despite a modest
+    near-entry gain. It remains a candidate, not the default.
+  - Any future XY estimator upgrade must pass both MP4 runtime A/B and
+    hard-bucket runtime A/B before replacing v25. Offline MAE, pooled cosine,
+    or posthoc direction scores are insufficient by themselves.
+- Current project bottleneck:
+  - XY correction is now visibly useful but not robust enough to declare solved.
+    The best next XY work is a control-aware estimator that preserves v25-like
+    direction reliability while widening hard-bucket / occlusion coverage.
+  - The larger blocker for task success is still `z/yaw` readiness. The
+    alignment lifecycle correctly blocks planner gripper handoff when
+    `alignment_ready_for_handoff=false`; the remaining gap is to learn
+    non-privileged task-frame `z_readiness` and `yaw_readiness`, not to loosen
+    the close gate.
+
 ## Suggested Evaluation Commands
 
 Smoke planner-only baseline:
@@ -402,6 +510,23 @@ Unit tests:
 conda run -n vla-adapter python -m unittest tests.test_coarse2contact_v2 -v
 ```
 
+Alignment takeover smoke summary:
+
+```bash
+conda run -n vla-adapter python scripts/summarize_c2c_v2_alignment_takeover_smoke.py \
+  --trace_dir runtime_artifacts/coarse2contact_v2/<smoke_run>/gripper_traces \
+  --output_dir runtime_artifacts/coarse2contact_v2/reports/<smoke_run>_alignment_takeover
+```
+
+XY + alignment lifecycle diagnostic:
+
+```bash
+conda run -n vla-adapter python scripts/diagnose_c2c_v2_xy_correction_hard_validation.py \
+  --trace_dir runtime_artifacts/coarse2contact_v2/<smoke_run>/gripper_traces \
+  --runtime_obs_dir runtime_artifacts/coarse2contact_v2/<smoke_run>/runtime_observations \
+  --output_dir runtime_artifacts/coarse2contact_v2/reports/<smoke_run>_xy_alignment
+```
+
 ## Ground Rules For Future Agents
 
 - Do not use RLBench masks, object handles, success poses, or teacher targets
@@ -411,6 +536,8 @@ conda run -n vla-adapter python -m unittest tests.test_coarse2contact_v2 -v
 - Do not judge recovery by pooled shadow MAE alone.
 - Always split results by visual observability and failure bucket.
 - Always inspect MP4 and trace together.
+- Do not treat `shell_filter=off` coarse-window probes as high-precision
+  takeover evidence unless the run is explicitly labeled diagnostic-only.
 - Always compare `planner_action_world` to `pre_clip_action_world_6d` for
   ownership; do not compare relative planner deltas to absolute executed poses.
 - Keep learned depth apply diagnostic-only until trusted axis evidence exists.

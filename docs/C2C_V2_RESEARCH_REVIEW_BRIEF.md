@@ -133,9 +133,9 @@ Interpretation:
   points more toward step-size / horizon / frame-alignment refinement.
 - Queue flushing helps in some slices, but the current bottleneck is not simply
   queue protocol. The next audit must keep support/window/step-size separated.
-- Some aggregate reports still lack complete `alias_drift_decision` splits.
-  That audit plumbing gap should be fixed before drawing strong yaw/frame drift
-  conclusions from focused sweeps.
+- Focused aggregate reports now expose `alias_drift_decision` as a first-class
+  split. Remaining `unknown` rows are reported explicitly and should be treated
+  as an audit coverage gap, not silently mixed into yaw/frame conclusions.
 
 ## What Reviewers Should Not Count As Final Proof
 
@@ -148,7 +148,8 @@ Interpretation:
 
 ## Current Bottlenecks
 
-The main bottleneck is still semantic coverage, not model size.
+The main bottleneck is still semantic coverage and runtime readiness, not raw
+model size.
 
 The system has a better takeover contract now, but it still needs to prove that
 non-privileged observations can reliably produce the jaw-local residual needed
@@ -156,13 +157,22 @@ for control across the hard failure-tail support surface.
 
 Current hard points:
 
+- runtime XY: the v25 affine calibrator is still the best runtime default, but
+  it is a small-data smoke calibrator and should not be treated as final
+  generalization evidence. The v34 wider affine and v36 direction-first MLP did
+  not pass replacement A/B. Future estimator work must improve runtime
+  contraction and overshoot, not only offline direction or MAE.
 - `large_xy_large_yaw`: entry support has started to exist, but the active
   surface is not broad enough yet.
 - `small_xy_large_yaw`: active support exists, but contraction and near-entry
   remain sensitive to step-size, horizon, and frame/sign conventions.
 - yaw/frame: stable alias and frame drift are conceptually separated, but the
   split must appear consistently in candidate, trace, and aggregate audit.
-- close: must remain blocked until near-basin and close-ready evidence is real.
+- z/yaw readiness: current alignment lifecycle blocks planner close correctly,
+  but it cannot hand off because task-frame `z_readiness` and `yaw_readiness`
+  are not yet learned with non-privileged runtime inputs.
+- close: must remain planner-owned and blocked until
+  `alignment_ready_for_handoff` is true.
 
 ## Direction-Drift Review Questions
 
@@ -184,15 +194,17 @@ A useful external review should answer these questions:
    metric, not the older descent-cosine compatibility metric?
 9. Are MP4 smoke tests being selected from active, contractive failure-tail
    rows rather than arbitrary failed episodes?
-10. Is the next work aimed at expanding hard-bucket support and fixing
-    frame/residual semantics, rather than training a larger model prematurely?
+10. Are runtime XY estimator upgrades being accepted only after MP4 and
+    hard-bucket runtime A/B, rather than offline MAE/cosine alone?
+11. Is the next work aimed at solving task-frame z/yaw readiness and robust XY
+    generalization, rather than loosening handoff/close gates?
 
 ## Recommended Next Work
 
 The next useful implementation work is:
 
-1. Make `alias_drift_decision` appear in every focused sweep aggregate:
-   candidate manifest, trace rows, failure-tail audit, and summary table.
+1. Use the alias-aware focused aggregates to reduce remaining `unknown` rows
+   before drawing yaw/frame drift conclusions.
 2. Continue widening `large_xy_large_yaw` entry support around episodes that
    already show active evidence.
 3. Keep `small_xy_large_yaw` on a narrow step-size / horizon bracket and use
@@ -200,6 +212,13 @@ The next useful implementation work is:
    frame/sign errors.
 4. Generate MP4 comparisons only from rows that are active and contractive in
    the audit, with trace summaries attached.
-5. Do not reopen runtime close or yaw control until the non-privileged
+5. Align runtime gate traces with the formal takeover contract and keep
+   privileged eval metadata under `offline_eval_only`.
+6. Do not reopen runtime close or yaw control until the non-privileged
    estimator and audit evidence support it.
-
+7. Keep v25 as the runtime XY default until a candidate improves both MP4
+   runtime A/B and hard-bucket runtime A/B on contraction, near-entry, and
+   overshoot.
+8. Prioritize a non-privileged task-frame readiness dataset/model for z/yaw:
+   C2C should hand off to planner gripper only when alignment is ready, not
+   because sticky takeover expired.

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
+from scripts.c2c_v2_grasp_probe_metrics import grasp_probe_xy_metric_fields, safe_float, safe_int, trace_vec, xy_norm
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -46,51 +47,34 @@ def _load_trace_rows_from_dirs(trace_dirs: list[Path]) -> list[dict[str, Any]]:
     return rows
 
 
-def _safe_float(value: Any, default: float = float("nan")) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-
-
 def _xy_from_mapping(mapping: Mapping[str, Any]) -> float:
-    dx = _safe_float(mapping.get("dx", float("nan")))
-    dy = _safe_float(mapping.get("dy", float("nan")))
+    dx = safe_float(mapping.get("dx", float("nan")))
+    dy = safe_float(mapping.get("dy", float("nan")))
     if not np.isfinite(dx) or not np.isfinite(dy):
         return float("nan")
     return float(np.hypot(dx, dy))
 
 
-def _trace_vec(row: Mapping[str, Any], key: str) -> np.ndarray:
-    value = row.get(key)
-    if value is None:
-        return np.full((4,), np.nan, dtype=np.float32)
-    arr = np.asarray(value, dtype=np.float32).reshape(-1)
-    if arr.size < 4:
-        arr = np.pad(arr, (0, 4 - arr.size), constant_values=np.nan)
-    return arr[:4]
-
-
 def _trace_horizon_post(row: Mapping[str, Any]) -> np.ndarray:
     if row.get("grasp_probe_horizon_final_true_error_t") is not None:
-        return _trace_vec(row, "grasp_probe_horizon_final_true_error_t")
-    return _trace_vec(row, "grasp_probe_post_true_error_t")
+        return trace_vec(row, "grasp_probe_horizon_final_true_error_t")
+    return trace_vec(row, "grasp_probe_post_true_error_t")
 
 
 def _candidate_key(row: Mapping[str, Any]) -> tuple[int, int]:
-    return (int(row.get("episode_idx", -1)), int(row.get("step_idx", row.get("step", -1))))
+    return (safe_int(row.get("episode_idx", -1)), safe_int(row.get("step_idx", row.get("step", -1))))
 
 
 def _trace_key(row: Mapping[str, Any]) -> tuple[int, int]:
-    return (int(row.get("episode_idx", -1)), int(row.get("step", row.get("step_idx", -1))))
+    return (safe_int(row.get("episode_idx", -1)), safe_int(row.get("step", row.get("step_idx", -1))))
 
 
 def _planner_xy(row: Mapping[str, Any]) -> tuple[float, float]:
-    return (_safe_float(row.get("xy_error", float("nan"))), _safe_float(row.get("next_xy_error", float("nan"))))
+    return (safe_float(row.get("xy_error", float("nan"))), safe_float(row.get("next_xy_error", float("nan"))))
 
 
 def _oracle_xy(row: Mapping[str, Any]) -> tuple[float, float]:
-    pre = _trace_vec(row, "grasp_probe_pre_true_error_t")
+    pre = trace_vec(row, "grasp_probe_pre_true_error_t")
     post = _trace_horizon_post(row)
     if not np.all(np.isfinite(pre[:2])) or not np.all(np.isfinite(post[:2])):
         return (float("nan"), float("nan"))
@@ -104,8 +88,8 @@ def _oracle_near(row: Mapping[str, Any]) -> bool:
 
 
 def _planner_near_next(row: Mapping[str, Any], *, near_xy: float = 0.015, near_yaw: float = 0.08) -> bool:
-    xy = _safe_float(row.get("next_xy_error", float("nan")))
-    yaw = _safe_float(row.get("next_yaw_abs", float("nan")))
+    xy = safe_float(row.get("next_xy_error", float("nan")))
+    yaw = safe_float(row.get("next_yaw_abs", float("nan")))
     return bool(np.isfinite(xy) and np.isfinite(yaw) and xy <= near_xy and yaw <= near_yaw)
 
 
@@ -137,6 +121,7 @@ def _joined_rows(candidates: list[dict[str, Any]], trace_rows: list[dict[str, An
         trace = trace_by_key.get(_candidate_key(cand), {})
         planner_pre, planner_next = _planner_xy(cand)
         oracle_pre, oracle_next = _oracle_xy(trace) if trace else (float("nan"), float("nan"))
+        xy_metrics = grasp_probe_xy_metric_fields(trace or cand)
         planner_delta = planner_next - planner_pre if np.isfinite(planner_pre) and np.isfinite(planner_next) else float("nan")
         oracle_delta = oracle_next - oracle_pre if np.isfinite(oracle_pre) and np.isfinite(oracle_next) else float("nan")
         joined.append(
@@ -173,6 +158,17 @@ def _joined_rows(candidates: list[dict[str, Any]], trace_rows: list[dict[str, An
                     and np.isfinite(oracle_next)
                     and oracle_next < planner_next - 1.0e-9
                 ),
+                "scalar_xy_before": xy_metrics["scalar_xy_before"],
+                "scalar_xy_after": xy_metrics["scalar_xy_after"],
+                "scalar_xy_delta": xy_metrics["scalar_xy_delta"],
+                "scalar_xy_contracted": xy_metrics["scalar_xy_contracted"],
+                "vector_xy_before": xy_metrics["vector_xy_before"],
+                "vector_xy_after": xy_metrics["vector_xy_after"],
+                "vector_xy_delta": xy_metrics["vector_xy_delta"],
+                "vector_norm_contracted": xy_metrics["vector_norm_contracted"],
+                "scalar_vector_xy_agree": xy_metrics["scalar_vector_xy_agree"],
+                "scalar_xy_before_source": xy_metrics["scalar_xy_before_source"],
+                "scalar_xy_after_source": xy_metrics["scalar_xy_after_source"],
             }
         )
     return joined
@@ -206,6 +202,11 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "oracle_intervention_contraction_rate": _rate(active, "oracle_contracted"),
         "oracle_intervention_contraction_lower_ci": _wilson_lower_bound(oracle_contract_count, len(active)),
         "intervention_vs_planner_improvement_rate": _rate(active, "intervention_vs_planner_improvement"),
+        "scalar_xy_contraction_rate": _rate(active, "scalar_xy_contracted"),
+        "vector_norm_contraction_rate": _rate(active, "vector_norm_contracted"),
+        "scalar_vector_xy_agreement_rate": _rate(active, "scalar_vector_xy_agree"),
+        "mean_scalar_xy_delta": float(np.mean([float(r.get("scalar_xy_delta", float("nan"))) for r in active if np.isfinite(float(r.get("scalar_xy_delta", float("nan"))))])) if active else 0.0,
+        "mean_vector_xy_delta": float(np.mean([float(r.get("vector_xy_delta", float("nan"))) for r in active if np.isfinite(float(r.get("vector_xy_delta", float("nan"))))])) if active else 0.0,
         "planner_natural_near_grasp_next_rate": _rate(rows, "planner_natural_near_grasp_next"),
         "oracle_near_grasp_after_rate": _rate(active, "oracle_near_grasp_after"),
         "near_grasp_entry_gain": _rate(active, "oracle_near_grasp_after") - _rate(rows, "planner_natural_near_grasp_next"),
@@ -303,6 +304,19 @@ def main() -> None:
     lines.extend(["", "## Blocked Reasons"])
     for item in report["by_blocked_reason"]:
         lines.append(f"- `{item['blocked_reason']}`: `{item['num_rows']}`")
+    lines.extend(["", "## Alias/Drift Split"])
+    alias_unknown = next((item for item in report["active_by_alias_drift_decision"] if item["alias_drift_decision"] == "unknown"), None)
+    total_alias_rows = sum(int(item["num_rows"]) for item in report["active_by_alias_drift_decision"])
+    unknown_rows = int(alias_unknown["num_rows"]) if alias_unknown is not None else 0
+    lines.append(f"- unknown_rows: `{unknown_rows}`")
+    lines.append(f"- unknown_rate: `{(unknown_rows / total_alias_rows) if total_alias_rows else 0.0:.3f}`")
+    for item in report["active_by_alias_drift_decision"]:
+        lines.append(
+            f"- `{item['alias_drift_decision']}`: active={int(item['active_failure_tail_rows'])}, "
+            f"xy_contract={float(item['oracle_intervention_contraction_rate']):.3f}, "
+            f"near={float(item['oracle_near_grasp_after_rate']):.3f}, "
+            f"overshoot={float(item['overshoot_rate']):.3f}"
+        )
     out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(out_json)
     print(out_rows)

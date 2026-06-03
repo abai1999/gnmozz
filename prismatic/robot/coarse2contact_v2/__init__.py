@@ -51,7 +51,24 @@ from .recovery_augmentation import (
 )
 from .basin_state import BasinAxisCalibration, BasinStateCalibration, BasinStateEstimator, CalibratedGraspBasinEstimator, EstimatedBasinError, FrameRelabelBasinEstimator, ReplayBasinEstimator, ReplayBasinResult, load_basin_state_calibration_report
 from .takeover_contract import FrameResidual, ObservabilityDecision, TakeoverThresholds, TakeoverTierDecision, classify_yaw_observability, decide_takeover_tier
+from .alignment_takeover import (
+    AlignmentReadiness,
+    AlignmentTakeoverConfig,
+    AlignmentTakeoverSession,
+    TaskFrameResidualEstimate,
+    evaluate_alignment_readiness,
+)
 from .localizers import LocalGeometryError, RingGraspLocalizer, RingSpokeAlignLocalizer
+from .runtime_xy_residual import (
+    DEFAULT_RUNTIME_XY_FEATURE_NAMES,
+    GraspFrameResidualEstimate,
+    RuntimeXYAffineCalibration,
+    RuntimeXYMLPCalibration,
+    calibrated_runtime_xy_residual_from_trace,
+    estimate_runtime_xy_residual,
+    estimate_runtime_xy_residual_from_trace,
+    runtime_xy_feature_vector_from_trace,
+)
 from .mainline import (
     BASIN_RECOVERY_CLOSED_LOOP_REPORT,
     BASIN_RECOVERY_DATASET,
@@ -75,6 +92,14 @@ __all__ = [
     "LocalGeometryError",
     "RingGraspLocalizer",
     "RingSpokeAlignLocalizer",
+    "GraspFrameResidualEstimate",
+    "RuntimeXYAffineCalibration",
+    "RuntimeXYMLPCalibration",
+    "DEFAULT_RUNTIME_XY_FEATURE_NAMES",
+    "runtime_xy_feature_vector_from_trace",
+    "calibrated_runtime_xy_residual_from_trace",
+    "estimate_runtime_xy_residual",
+    "estimate_runtime_xy_residual_from_trace",
     "RECOVERY_MAINLINE_NAME",
     "RECOVERY_MAINLINE_CHECKPOINT",
     "RECOVERY_MAINLINE_DATASET",
@@ -108,6 +133,11 @@ __all__ = [
     "ObservabilityDecision",
     "TakeoverThresholds",
     "TakeoverTierDecision",
+    "TaskFrameResidualEstimate",
+    "AlignmentReadiness",
+    "AlignmentTakeoverConfig",
+    "AlignmentTakeoverSession",
+    "evaluate_alignment_readiness",
     "classify_yaw_observability",
     "decide_takeover_tier",
     "load_basin_state_calibration_report",

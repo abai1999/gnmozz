@@ -90,6 +90,23 @@ def _text_or_default(value: Any, default: str = "unknown") -> str:
     return text
 
 
+def _candidate_match(row: Mapping[str, Any]) -> bool:
+    if "grasp_probe_candidate_match" in row:
+        return bool(row.get("grasp_probe_candidate_match", False))
+    if "candidate_match" in row:
+        return bool(row.get("candidate_match", False))
+    return True
+
+
+def _coverage_bucket(row: Mapping[str, Any]) -> str:
+    if _candidate_match(row):
+        return "candidate_match_true"
+    reason = str(row.get("intervention_reason", row.get("grasp_probe_reason", "")) or "").strip()
+    if reason == "not_failure_tail_candidate":
+        return "not_failure_tail_candidate"
+    return "candidate_match_false"
+
+
 def _row_blocked_reason(row: Mapping[str, Any]) -> str:
     if bool(row.get("intervention_active", False)):
         return "active"
@@ -175,7 +192,12 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     active = [row for row in rows if bool(row.get("intervention_active", False))]
     found = [row for row in rows if bool(row.get("intervention_trace_found", False))]
     missing = [row for row in rows if not bool(row.get("intervention_trace_found", False))]
-    not_failure_tail_candidate = [row for row in rows if str(row.get("intervention_reason", "")) == "not_failure_tail_candidate"]
+    candidate_match_rows = [row for row in rows if _candidate_match(row)]
+    candidate_match_false_rows = [row for row in rows if not _candidate_match(row)]
+    not_failure_tail_candidate = [
+        row for row in rows
+        if not _candidate_match(row) and _coverage_bucket(row) == "not_failure_tail_candidate"
+    ]
     candidate_actionable_blocked = [
         row
         for row in rows
@@ -190,6 +212,8 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_rows": int(len(rows)),
         "trace_found_rows": int(len(found)),
         "active_rows": int(len(active)),
+        "candidate_match_rows": int(len(candidate_match_rows)),
+        "candidate_match_false_rows": int(len(candidate_match_false_rows)),
         "xy_correction_ready_rows": int(len(xy_ready_rows)),
         "missing_trace_rows": int(len(missing)),
         "not_failure_tail_candidate_rows": int(len(not_failure_tail_candidate)),
@@ -199,6 +223,7 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "intervention_reason_counts": dict(Counter(str(row.get("intervention_reason", "")) for row in rows)),
         "blocked_reason_counts": dict(Counter(_classify_gap(row) for row in rows)),
         "row_blocked_reason_counts": dict(Counter(_row_blocked_reason(row) for row in rows)),
+        "coverage_bucket_counts": dict(Counter(_coverage_bucket(row) for row in candidate_match_false_rows)),
         "failure_bucket_counts": _count_by(rows, "failure_bucket"),
         "takeover_tier_counts": _count_by(rows, "takeover_tier"),
         "yaw_observability_counts": _count_by(rows, "yaw_observability_class"),
@@ -216,6 +241,22 @@ def _group_summary(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]
     return out
 
 
+def _group_summary_candidate_match(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    return _group_summary([row for row in rows if _candidate_match(row)], key)
+
+
+def _group_summary_coverage(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if _candidate_match(row):
+            continue
+        grouped[_coverage_bucket(row)].append(row)
+    out: list[dict[str, Any]] = []
+    for value, subset in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+        out.append({"candidate_coverage_bucket": value, **_summarize(subset)})
+    return out
+
+
 def build_gap_report(candidate_rows: list[dict[str, Any]], trace_rows: list[dict[str, Any]]) -> dict[str, Any]:
     joined = _join_candidates(candidate_rows, trace_rows)
     return {
@@ -226,7 +267,8 @@ def build_gap_report(candidate_rows: list[dict[str, Any]], trace_rows: list[dict
         "by_takeover_tier": _group_summary(joined, "takeover_tier"),
         "by_yaw_observability": _group_summary(joined, "yaw_observability_class"),
         "by_window_protocol": _group_summary(joined, "window_protocol"),
-        "by_alias_drift_decision": _group_summary(joined, "alias_drift_decision"),
+        "by_alias_drift_decision": _group_summary_candidate_match(joined, "alias_drift_decision"),
+        "by_candidate_coverage_bucket": _group_summary_coverage(joined),
         "by_intervention_reason": _group_summary(joined, "intervention_reason"),
         "joined_rows": joined,
         "runtime_invariants": {
@@ -278,6 +320,8 @@ def main() -> None:
         "candidate_rows",
         "trace_found_rows",
         "active_rows",
+        "candidate_match_rows",
+        "candidate_match_false_rows",
         "missing_trace_rows",
         "not_failure_tail_candidate_rows",
         "candidate_actionable_blocked_rows",
@@ -325,6 +369,17 @@ def main() -> None:
             f"missing={item['missing_trace_rows']}, actionable={item['candidate_actionable_blocked_rows']}, "
             f"xy_blocked={item['shell_xy_outside_horizon_rows']}, yaw_blocked={item['shell_yaw_blocked_rows']}"
         )
+    md_lines.append("")
+    md_lines.append("## Candidate Coverage Bucket")
+    if report.get("by_candidate_coverage_bucket"):
+        for item in report["by_candidate_coverage_bucket"]:
+            md_lines.append(
+                f"- `{item['candidate_coverage_bucket']}`: candidate={item['candidate_rows']}, trace={item['trace_found_rows']}, active={item['active_rows']}, "
+                f"missing={item['missing_trace_rows']}, actionable={item['candidate_actionable_blocked_rows']}, "
+                f"xy_blocked={item['shell_xy_outside_horizon_rows']}, yaw_blocked={item['shell_yaw_blocked_rows']}"
+            )
+    else:
+        md_lines.append("- none")
     md_lines.append("")
     md_lines.append("## By Intervention Reason")
     for item in report["by_intervention_reason"]:

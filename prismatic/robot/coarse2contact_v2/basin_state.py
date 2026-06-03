@@ -142,6 +142,63 @@ class BasinStateCalibration:
             "frame_consistency_floor": float(self.frame_consistency_floor),
         }
 
+    def with_xy_pullback_trusted(
+        self,
+        *,
+        source: str = "runtime_xy_pullback_calibration",
+        confidence: float = 0.65,
+    ) -> "BasinStateCalibration":
+        """Return an XY-only pullback calibration.
+
+        This is deliberately narrower than a full-axis trusted calibration:
+        x/y may drive bounded pullback, z stays diagnostic-only, and yaw stays
+        abstained unless a separate yaw estimator is explicitly trusted.
+        """
+
+        floor = float(max(min(float(confidence), 1.0), self.xy_confidence_floor, 0.0))
+        return BasinStateCalibration(
+            x=BasinAxisCalibration(
+                valid=True,
+                policy="trusted_control",
+                sign=float(self.x.sign),
+                scale=float(self.x.scale),
+                confidence=floor,
+                source=str(source),
+                reason="runtime_xy_pullback_only",
+            ),
+            y=BasinAxisCalibration(
+                valid=True,
+                policy="trusted_control",
+                sign=float(self.y.sign),
+                scale=float(self.y.scale),
+                confidence=floor,
+                source=str(source),
+                reason="runtime_xy_pullback_only",
+            ),
+            z=BasinAxisCalibration(
+                valid=False,
+                policy="diagnostic_only",
+                sign=float(self.z.sign),
+                scale=float(self.z.scale),
+                confidence=float(max(self.z.confidence, 0.0)),
+                source=str(self.z.source),
+                reason=str(self.z.reason or "z_not_enabled_for_xy_pullback"),
+            ),
+            yaw=BasinAxisCalibration(
+                valid=False,
+                policy="abstain",
+                sign=float(self.yaw.sign),
+                scale=float(self.yaw.scale),
+                confidence=float(max(self.yaw.confidence, 0.0)),
+                source=str(self.yaw.source),
+                reason=str(self.yaw.reason or "yaw_not_enabled_for_xy_pullback"),
+            ),
+            xy_confidence_floor=float(min(self.xy_confidence_floor, floor)),
+            z_confidence_floor=float(self.z_confidence_floor),
+            yaw_confidence_floor=float(self.yaw_confidence_floor),
+            frame_consistency_floor=float(self.frame_consistency_floor),
+        )
+
 
 def load_basin_state_calibration_report(path: str | Path | None) -> BasinStateCalibration | None:
     if path is None:
@@ -324,7 +381,7 @@ class EstimatedBasinError:
         min_frame_consistency: float = 0.0,
     ) -> bool:
         xy = float(np.hypot(float(self.dx), float(self.dy)))
-        z_ok = bool(abs(float(self.dz)) <= float(z_threshold))
+        z_ok = bool(self.z_valid and abs(float(self.dz)) <= float(z_threshold))
         xy_ok = bool(xy <= float(xy_threshold) and self.xy_valid)
         if yaw_required is None:
             yaw_required = bool(self.yaw_valid)

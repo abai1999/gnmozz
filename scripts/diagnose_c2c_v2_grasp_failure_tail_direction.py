@@ -27,6 +27,11 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from scripts.c2c_v2_grasp_probe_metrics import grasp_probe_xy_metric_fields, safe_float, safe_int, trace_vec, xy_norm
+
+_safe_float = safe_float
+_safe_int = safe_int
+
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -38,24 +43,16 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _safe_float(value: Any, default: float = float("nan")) -> float:
-    try:
-        out = float(value)
-    except Exception:
-        return float(default)
-    return out if np.isfinite(out) else float(default)
-
-
-def _safe_int(value: Any, default: int = -1) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
+def _row_step_idx(row: Mapping[str, Any]) -> int:
+    step_idx = row.get("step_idx", None)
+    if step_idx is None:
+        step_idx = row.get("step", None)
+    return safe_int(step_idx, -1)
 
 
 def _xy_norm(dx: Any, dy: Any) -> float:
-    dx_f = _safe_float(dx)
-    dy_f = _safe_float(dy)
+    dx_f = safe_float(dx)
+    dy_f = safe_float(dy)
     return float(np.hypot(dx_f, dy_f)) if np.isfinite(dx_f) and np.isfinite(dy_f) else float("nan")
 
 
@@ -94,6 +91,45 @@ def _text_or_default(value: Any, default: str = "unknown") -> str:
     return text
 
 
+def _rate(rows: list[Mapping[str, Any]], key: str) -> float:
+    return float(np.mean([bool(row.get(key, False)) for row in rows])) if rows else 0.0
+
+
+def _is_active(row: Mapping[str, Any]) -> bool:
+    return bool(row.get("intervention_active", False)) or bool(row.get("grasp_probe_active", False))
+
+
+def _alias_summary(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[_text_or_default(row.get("alias_drift_decision", None), _text_or_default(row.get("yaw_alias_drift_decision", None)))].append(row)
+    out: dict[str, dict[str, Any]] = {}
+    for alias, subset in sorted(groups.items()):
+        active = [row for row in subset if _is_active(row)]
+        out[alias] = {
+            "rows": int(len(subset)),
+            "active_rows": int(len(active)),
+            "oracle_xy_contraction_rate": _rate(active, "oracle_contracted"),
+            "near_grasp_after_rate": _rate(active, "oracle_near_grasp_after"),
+            "overshoot_rate": _rate(active, "overshoot"),
+            "mean_step_ratio_to_residual": _mean(row["step_ratio_to_residual"] for row in active),
+            "mean_oracle_step_cosine_to_residual": _mean(row["oracle_xy_step_cosine_to_residual"] for row in active),
+            "direction_hint_counts": dict(Counter(str(row.get("direction_hint", "")) for row in active)),
+        }
+    if "unknown" not in out:
+        out["unknown"] = {
+            "rows": 0,
+            "active_rows": 0,
+            "oracle_xy_contraction_rate": 0.0,
+            "near_grasp_after_rate": 0.0,
+            "overshoot_rate": 0.0,
+            "mean_step_ratio_to_residual": 0.0,
+            "mean_oracle_step_cosine_to_residual": 0.0,
+            "direction_hint_counts": {},
+        }
+    return out
+
+
 def _episode_filter(text: str | None) -> set[int]:
     if not text:
         return set()
@@ -123,11 +159,11 @@ def _selected_rows(
             continue
         if episodes and int(row.get("episode_idx", -1)) not in episodes:
             continue
-        active = bool(row.get("intervention_active", row.get("grasp_probe_active", False)))
+        active = _is_active(row)
         if active_only and not active:
             continue
         selected.append(dict(row))
-    selected.sort(key=lambda r: (_safe_int(r.get("episode_idx", -1)), _safe_int(r.get("step_idx", r.get("step", -1)))))
+    selected.sort(key=lambda r: (_safe_int(r.get("episode_idx", -1)), _row_step_idx(r)))
     return selected
 
 
@@ -138,22 +174,34 @@ def _merge_with_failure_tail_rows(
     if not failure_tail_rows:
         return rows
     merged: list[dict[str, Any]] = []
-    tail_by_key: dict[tuple[int, int], dict[str, Any]] = {
-        (_safe_int(row.get("episode_idx", -1)), _safe_int(row.get("step_idx", row.get("step", -1)))): dict(row)
+    tail_by_key: dict[tuple[int, int, str], dict[str, Any]] = {
+        (
+            _safe_int(row.get("episode_idx", -1)),
+            _row_step_idx(row),
+            str(row.get("failure_bucket", "")),
+        ): dict(row)
         for row in failure_tail_rows
     }
     for row in rows:
-        key = (_safe_int(row.get("episode_idx", -1)), _safe_int(row.get("step_idx", row.get("step", -1))))
+        key = (
+            _safe_int(row.get("episode_idx", -1)),
+            _row_step_idx(row),
+            str(row.get("failure_bucket", "")),
+        )
         tail_row = tail_by_key.get(key)
         if tail_row is None:
             merged.append(dict(row))
             continue
-        merged.append({**row, **tail_row})
+        combined = dict(row)
+        for field, value in tail_row.items():
+            if value is not None:
+                combined[field] = value
+        merged.append(combined)
     return merged
 
 
 def _direction_hint(row: Mapping[str, Any]) -> str:
-    if not bool(row.get("intervention_active", False)):
+    if not _is_active(row):
         return "inactive"
     step = (_safe_float(row.get("oracle_xy_step_dx")), _safe_float(row.get("oracle_xy_step_dy")))
     pre = (_safe_float(row.get("privileged_dx")), _safe_float(row.get("privileged_dy")))
@@ -204,13 +252,13 @@ def build_direction_diagnostic(
             row.get("grasp_probe_post_true_error_t", row.get("true_basin_error_t_plus_1")),
         )
         privileged_dx, privileged_dy = _vec2(pre_source)
-        oracle_before_xy = _safe_float(row.get("grasp_probe_pre_xy_error", row.get("oracle_xy_before", float("nan"))))
-        oracle_after_xy = _safe_float(row.get("grasp_probe_horizon_final_xy_error", row.get("oracle_xy_after", float("nan"))))
+        metrics = grasp_probe_xy_metric_fields(row)
+        oracle_before_xy = _safe_float(metrics["scalar_xy_before"])
+        oracle_after_xy = _safe_float(metrics["scalar_xy_after"])
         planner_before_xy = _safe_float(row.get("xy_error", row.get("planner_xy_before", oracle_before_xy)))
         planner_after_xy = _safe_float(row.get("next_xy_error", row.get("planner_xy_after", oracle_after_xy)))
         if after_source is None:
-            after_dx = _safe_float(row.get("next_privileged_dx", float("nan")))
-            after_dy = _safe_float(row.get("next_privileged_dy", float("nan")))
+            after_dx, after_dy = _safe_float(row.get("next_privileged_dx", float("nan"))), _safe_float(row.get("next_privileged_dy", float("nan")))
         else:
             after_dx, after_dy = _vec2(after_source)
         pre_dx, pre_dy = privileged_dx, privileged_dy
@@ -220,6 +268,8 @@ def build_direction_diagnostic(
         oracle_step_cosine_to_residual = _cosine((step_dx, step_dy), (pre_dx, pre_dy))
         oracle_step_cosine_to_descent = _cosine((step_dx, step_dy), (-pre_dx, -pre_dy))
         after_xy_norm = _xy_norm(after_dx, after_dy)
+        if not np.isfinite(oracle_after_xy) and np.isfinite(after_xy_norm):
+            oracle_after_xy = after_xy_norm
         after_minus_before = after_xy_norm - privileged_xy_norm if np.isfinite(after_xy_norm) and np.isfinite(privileged_xy_norm) else float("nan")
         step_ratio = oracle_xy_step_norm / privileged_xy_norm if np.isfinite(oracle_xy_step_norm) and np.isfinite(privileged_xy_norm) and privileged_xy_norm > 1.0e-12 else float("nan")
         planner_delta = planner_after_xy - planner_before_xy if np.isfinite(planner_before_xy) and np.isfinite(planner_after_xy) else float("nan")
@@ -227,12 +277,12 @@ def build_direction_diagnostic(
         per_row.append(
             {
                 "episode_idx": _safe_int(row.get("episode_idx", -1)),
-                "step_idx": _safe_int(row.get("step_idx", row.get("step", -1))),
+                "step_idx": _row_step_idx(row),
                 "failure_bucket": str(row.get("failure_bucket", "")),
                 "takeover_tier": str(row.get("takeover_tier", "")),
                 "alias_drift_decision": _text_or_default(row.get("alias_drift_decision", None), _text_or_default(row.get("yaw_alias_drift_decision", None))),
                 "window_protocol": str(row.get("window_protocol", row.get("grasp_probe_window_protocol", ""))),
-                "intervention_active": bool(row.get("intervention_active", row.get("grasp_probe_active", False))),
+                "intervention_active": _is_active(row),
                 "intervention_reason": str(row.get("intervention_reason", row.get("grasp_probe_reason", ""))),
                 "planner_xy_before": planner_before_xy,
                 "planner_xy_after": planner_after_xy,
@@ -252,6 +302,17 @@ def build_direction_diagnostic(
                 "after_privileged_dy": after_dy,
                 "after_privileged_xy_norm": after_xy_norm,
                 "after_minus_before_xy_norm": after_minus_before,
+                "scalar_xy_before": metrics["scalar_xy_before"],
+                "scalar_xy_after": metrics["scalar_xy_after"],
+                "scalar_xy_delta": metrics["scalar_xy_delta"],
+                "scalar_xy_contracted": metrics["scalar_xy_contracted"],
+                "vector_xy_before": metrics["vector_xy_before"],
+                "vector_xy_after": metrics["vector_xy_after"],
+                "vector_xy_delta": metrics["vector_xy_delta"],
+                "vector_norm_contracted": metrics["vector_norm_contracted"],
+                "scalar_vector_xy_agree": metrics["scalar_vector_xy_agree"],
+                "scalar_xy_before_source": metrics["scalar_xy_before_source"],
+                "scalar_xy_after_source": metrics["scalar_xy_after_source"],
                 "step_ratio_to_residual": step_ratio,
                 "overshoot": bool(row.get("oracle_overshoot", row.get("grasp_probe_horizon_overshoot", row.get("overshoot", False)))),
                 "direction_hint": _direction_hint(
@@ -268,7 +329,14 @@ def build_direction_diagnostic(
             }
         )
 
-    active = [row for row in per_row if bool(row.get("intervention_active", False))]
+    active = [row for row in per_row if _is_active(row)]
+    for row in per_row:
+        row["oracle_contracted"] = bool(np.isfinite(row["oracle_xy_delta"]) and float(row["oracle_xy_delta"]) < -1.0e-9)
+        row["oracle_near_grasp_after"] = bool(
+            np.isfinite(row["oracle_xy_after"])
+            and np.isfinite(row.get("oracle_xy_delta", float("nan")))
+            and float(row["oracle_xy_after"]) <= 0.015
+        )
     by_episode_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in per_row:
         by_episode_rows[int(row["episode_idx"])].append(row)
@@ -296,16 +364,22 @@ def build_direction_diagnostic(
             "overshoot_rate": float(np.mean([bool(row.get("overshoot", False)) for row in active])) if active else 0.0,
             "direction_hint_counts": dict(Counter(str(row.get("direction_hint", "")) for row in active)),
             "by_alias_drift_decision": dict(Counter(_text_or_default(row.get("alias_drift_decision", None), _text_or_default(row.get("yaw_alias_drift_decision", None))) for row in per_row)),
+            "alias_drift_unknown_rows": int(sum(_text_or_default(row.get("alias_drift_decision", None), _text_or_default(row.get("yaw_alias_drift_decision", None))) == "unknown" for row in per_row)),
+            "alias_drift_unknown_rate": float(
+                sum(_text_or_default(row.get("alias_drift_decision", None), _text_or_default(row.get("yaw_alias_drift_decision", None))) == "unknown" for row in per_row)
+                / len(per_row)
+            ) if per_row else 0.0,
+            "alias_drift_decision_summary": _alias_summary(per_row),
         },
         "by_episode": {
             f"ep{ep:03d}": {
                 "num_rows": int(len(subset)),
-                "active_rows": int(sum(bool(row.get("intervention_active", False)) for row in subset)),
-                "mean_oracle_step_cosine_to_residual": _mean(row["oracle_xy_step_cosine_to_residual"] for row in subset if bool(row.get("intervention_active", False))),
-                "mean_oracle_step_cosine_to_descent": _mean(row["oracle_xy_step_cosine_to_descent"] for row in subset if bool(row.get("intervention_active", False))),
-                "mean_step_ratio_to_residual": _mean(row["step_ratio_to_residual"] for row in subset if bool(row.get("intervention_active", False))),
-                "mean_after_privileged_xy_norm": _mean(row["after_privileged_xy_norm"] for row in subset if bool(row.get("intervention_active", False))),
-                "direction_hint_counts": dict(Counter(str(row.get("direction_hint", "")) for row in subset if bool(row.get("intervention_active", False)))),
+                "active_rows": int(sum(_is_active(row) for row in subset)),
+                "mean_oracle_step_cosine_to_residual": _mean(row["oracle_xy_step_cosine_to_residual"] for row in subset if _is_active(row)),
+                "mean_oracle_step_cosine_to_descent": _mean(row["oracle_xy_step_cosine_to_descent"] for row in subset if _is_active(row)),
+                "mean_step_ratio_to_residual": _mean(row["step_ratio_to_residual"] for row in subset if _is_active(row)),
+                "mean_after_privileged_xy_norm": _mean(row["after_privileged_xy_norm"] for row in subset if _is_active(row)),
+                "direction_hint_counts": dict(Counter(str(row.get("direction_hint", "")) for row in subset if _is_active(row))),
             }
             for ep, subset in sorted(by_episode_rows.items())
         },
@@ -329,11 +403,23 @@ def _write_markdown(report: Mapping[str, Any], output_path: Path) -> None:
         f"- mean_after_privileged_xy_norm: `{report['overall']['mean_after_privileged_xy_norm']:.6f}`",
         f"- mean_after_minus_before_xy_norm: `{report['overall']['mean_after_minus_before_xy_norm']:.6f}`",
         f"- overshoot_rate: `{report['overall']['overshoot_rate']:.3f}`",
+        f"- alias_drift_unknown_rows: `{report['overall']['alias_drift_unknown_rows']}`",
+        f"- alias_drift_unknown_rate: `{report['overall']['alias_drift_unknown_rate']:.3f}`",
         "",
         "## Direction Hints",
     ]
     for name, count in report["overall"]["direction_hint_counts"].items():
         lines.append(f"- `{name}`: `{count}`")
+    lines.extend(["", "## Alias/Drift Split"])
+    for alias, item in report["overall"]["alias_drift_decision_summary"].items():
+        lines.append(
+            f"- `{alias}`: rows={int(item['rows'])}, active={int(item['active_rows'])}, "
+            f"xy_contract={float(item['oracle_xy_contraction_rate']):.3f}, "
+            f"near={float(item['near_grasp_after_rate']):.3f}, "
+            f"overshoot={float(item['overshoot_rate']):.3f}, "
+            f"step_ratio={float(item['mean_step_ratio_to_residual']):.3f}, "
+            f"step_cos={float(item['mean_oracle_step_cosine_to_residual']):.3f}"
+        )
     lines.extend(["", "## Per-Step Rows", "", "| ep | step | bucket | tier | alias | pre_xy | step_xy | step_cos | after_xy | overshoot | hint |", "| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |"])
     for row in report["rows"]:
         lines.append(
