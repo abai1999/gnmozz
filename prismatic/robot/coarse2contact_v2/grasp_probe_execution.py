@@ -22,7 +22,6 @@ DEFAULT_PRECISION_TAKEOVER_TIERS = {
     "outer_pullback_candidate",
     "near_basin_shell",
     "micro_entry_ready",
-    "close_ready",
     "yaw_entry_blocked",
 }
 

@@ -686,8 +686,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--c2c_grasp_probe_runtime_takeover_tiers",
         type=str,
-        default="outer_pullback_candidate,near_basin_shell,micro_entry_ready,close_ready,yaw_entry_blocked",
-        help="Comma-separated takeover tiers allowed to activate runtime-style precision takeover.",
+        default="outer_pullback_candidate,near_basin_shell,micro_entry_ready,yaw_entry_blocked",
+        help=(
+            "Comma-separated takeover tiers allowed to activate runtime-style precision takeover. "
+            "close_ready is intentionally excluded here and remains a diagnostic/offline bucket."
+        ),
     )
     parser.add_argument(
         "--c2c_grasp_probe_require_queue_empty",

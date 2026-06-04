@@ -1098,6 +1098,24 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(reason, "ready")
 
+    def test_precision_takeover_activation_excludes_close_ready_by_default(self) -> None:
+        candidate = {
+            "label_valid": True,
+            "sample_role": "failure_tail_candidate",
+            "takeover_tier": "close_ready",
+            "xy_correction_ready": True,
+            "xy_error": 0.02,
+        }
+        ready, reason = precision_takeover_activation_status(
+            candidate,
+            stage_age=20,
+            queue_len=0,
+            max_xy_error=0.18,
+            min_stage_age=12,
+        )
+        self.assertFalse(ready)
+        self.assertEqual(reason, "takeover_tier_not_runtime_precision")
+
     def test_precision_takeover_activation_can_require_empty_planner_queue(self) -> None:
         candidate = {
             "label_valid": True,
