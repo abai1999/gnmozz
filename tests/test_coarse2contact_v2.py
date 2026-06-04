@@ -1637,6 +1637,106 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertIn("z_not_ready", readiness.block_reason)
         self.assertIn("yaw_not_ready", readiness.block_reason)
 
+    def test_takeover_contract_requires_yaw_observability_for_close_tier(self) -> None:
+        decision = decide_takeover_tier(
+            FrameResidual(
+                dx=0.001,
+                dy=0.001,
+                dz=0.002,
+                dyaw=0.0,
+                reference_frame="gripper_jaw_frame",
+                target_frame="ring_grasp_frame",
+                z_semantics="task_approach_axis_residual",
+                source="unit_test",
+            ),
+            classify_yaw_observability(
+                {"wrist_is_occluded": False},
+                {"frame_confidence": 0.0, "frame_observability": 0.0, "frame_axis_strength": 0.0},
+                visual_observability_class="runtime_estimated",
+            ),
+            precision_row=True,
+            requires_yaw_observability=True,
+            xy_contracted=True,
+            thresholds=TakeoverThresholds(),
+        )
+        self.assertFalse(decision.close_ready_ready)
+        self.assertFalse(decision.micro_entry_ready)
+        self.assertEqual(decision.yaw_entry_block_reason, "yaw_unobservable")
+        self.assertIn("yaw_unobservable", decision.close_ready_block_reason)
+
+    def test_supervisor_handoff_blocks_legacy_close_ready_without_yaw(self) -> None:
+        spec = load_precision_task_spec("insert_onto_square_peg")
+        assert spec is not None
+        supervisor = PrecisionSkillSupervisor(spec)
+        stage = spec.get_stage("RING_GRASP_ALIGN")
+        assert stage is not None
+        skill = spec.get_skill("precision_grasp_ring")
+        assert skill is not None
+        est = EstimatedBasinError(
+            valid=True,
+            confidence=0.9,
+            dx=0.001,
+            dy=0.001,
+            dz=0.001,
+            dyaw=0.0,
+            x_valid=True,
+            y_valid=True,
+            z_valid=True,
+            yaw_valid=False,
+            x_confidence=0.9,
+            y_confidence=0.9,
+            z_confidence=0.9,
+            yaw_confidence=0.0,
+            frame_consistency=0.9,
+            source="unit_test",
+            reason="calibrated_xy_z_supported",
+            target_entity=skill.target_entity,
+            reference_entity=skill.reference_entity,
+            stage_name=stage.name,
+        )
+        self.assertTrue(
+            est.close_ready(
+                xy_threshold=float(skill.xy_tolerance),
+                z_threshold=float(skill.z_tolerance),
+                yaw_threshold=float(skill.yaw_tolerance),
+                yaw_required=None,
+                min_frame_consistency=0.20,
+            )
+        )
+        dummy = LocalGeometryError(
+            valid=True,
+            confidence=1.0,
+            dx=0.0,
+            dy=0.0,
+            dz=0.0,
+            dyaw=0.0,
+            observability=1.0,
+            fit_residual=0.0,
+            inlier_ratio=1.0,
+            reason="unit_test",
+        )
+        aligned = supervisor._evaluate_condition(
+            "grasp_aligned",
+            stage=stage,
+            observation=PrecisionObservationBundle(gripper_open=1.0),
+            robot_state={},
+            grasp_error=dummy,
+            spoke_error=dummy,
+            estimated_basin_error=est,
+            grasp_ctrl=None,
+            slide_ctrl=None,
+        )
+        self.assertFalse(aligned)
+        rule = supervisor._grasp_contact_rule_table(
+            stage=stage,
+            observation=PrecisionObservationBundle(gripper_open=1.0),
+            grasp_error=dummy,
+            estimated_basin_error=est,
+            grasp_ctrl=None,
+        )
+        self.assertFalse(rule["rules"][1]["passed"])
+        self.assertIn("yaw_not_ready", rule["rules"][1]["threshold"]["alignment_handoff_block_reason"])
+
     def test_task_frame_residual_declares_z_and_yaw_semantics(self) -> None:
         residual = TaskFrameResidualEstimate(
             skill_id="precision_align",

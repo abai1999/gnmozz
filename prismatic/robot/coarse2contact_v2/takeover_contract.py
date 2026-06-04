@@ -332,9 +332,10 @@ def decide_takeover_tier(
     t = thresholds or TakeoverThresholds()
     pullback_allowed = bool(precision_row and not observability.reacquire_needed)
     finite = bool(precision_row and residual.finite)
+    yaw_control_observable = bool(precision_row and observability.yaw_observable)
+    yaw_evidence_ready = bool((not bool(requires_yaw_observability)) or yaw_control_observable)
     yaw_entry_feasible = bool(finite and residual.yaw_abs <= float(t.near_yaw) + 1.0e-9)
     close_yaw_entry_feasible = bool(finite and residual.yaw_abs <= float(t.close_yaw) + 1.0e-9)
-    yaw_control_observable = bool(precision_row and observability.yaw_observable)
 
     near_shell = bool(
         finite
@@ -347,6 +348,7 @@ def decide_takeover_tier(
         and pullback_allowed
         and _near_grasp(residual.dx, residual.dy, residual.dyaw, xy_threshold=t.near_xy, yaw_threshold=t.near_yaw)
         and yaw_entry_feasible
+        and yaw_evidence_ready
     )
     close_ready = bool(
         finite
@@ -354,6 +356,7 @@ def decide_takeover_tier(
         and _near_grasp(residual.dx, residual.dy, residual.dyaw, xy_threshold=t.close_xy, yaw_threshold=t.close_yaw)
         and abs(float(residual.dz)) <= float(t.close_z)
         and close_yaw_entry_feasible
+        and yaw_evidence_ready
     )
     coarse_candidate = bool(
         finite
@@ -407,7 +410,11 @@ def decide_takeover_tier(
             close_blocks.append("xy")
         if abs(float(residual.dz)) > float(t.close_z):
             close_blocks.append("z")
-        if not yaw_entry_feasible:
+        if bool(requires_yaw_observability) and not yaw_control_observable:
+            micro_blocks.append("yaw_unobservable")
+            close_blocks.append("yaw_unobservable")
+            yaw_entry_block_reason = "yaw_unobservable"
+        elif not yaw_entry_feasible:
             micro_blocks.append("yaw_entry")
             close_blocks.append("yaw_entry")
             yaw_entry_block_reason = "yaw_abs_gt_near_threshold"

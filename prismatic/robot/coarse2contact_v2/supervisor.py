@@ -20,6 +20,7 @@ from .controllers import GuardedSlideController, GraspContactController, Recover
 from .learned_force import LearnedForceClassifierAdapter
 from .localizers import LocalGeometryError, RingGraspLocalizer, RingSpokeAlignLocalizer
 from .specs import PrecisionSkillSpec, PrecisionTaskSpec, StageTransition
+from .alignment_takeover import AlignmentTakeoverConfig, AlignmentReadiness, TaskFrameResidualEstimate, evaluate_alignment_readiness
 from .takeover_contract import FrameResidual, ObservabilityDecision, TakeoverThresholds, decide_takeover_tier
 
 
@@ -120,6 +121,102 @@ def _runtime_contract_decision_from_estimate(
         }
     )
     return decision
+
+
+def _skill_requires_axis(skill: PrecisionSkillSpec | None, axis: str) -> bool:
+    if skill is None:
+        return False
+    dofs = {str(dof) for dof in skill.controlled_dofs}
+    if axis == "z":
+        return bool("z" in dofs or "dz" in dofs or "z_micro" in dofs)
+    if axis == "yaw":
+        return bool("yaw" in dofs or "yaw_micro" in dofs or bool(skill.requires_yaw_observability))
+    return bool(axis in dofs or f"{axis}_micro" in dofs)
+
+
+def _alignment_readiness_from_estimate(
+    est: EstimatedBasinError | None,
+    skill: PrecisionSkillSpec | None,
+    *,
+    min_frame_consistency: float = 0.20,
+) -> AlignmentReadiness:
+    """Strict task-frame handoff predicate derived from runtime estimates.
+
+    This is the single supervisor-side predicate for planner gripper handoff.
+    The older EstimatedBasinError.close_ready() remains available as a
+    diagnostic bucket, but it must not silently drop yaw/z requirements when
+    the task-frame contract asks for those axes.
+    """
+
+    if est is None or skill is None:
+        residual = TaskFrameResidualEstimate(
+            skill_id="" if skill is None else str(skill.skill_type),
+            stage_name="" if est is None else str(est.stage_name),
+            reference_frame="" if skill is None else str(skill.reference_entity),
+            target_frame="" if skill is None else str(skill.target_entity),
+            active_dofs=tuple(() if skill is None else skill.controlled_dofs),
+            dx=float("inf"),
+            dy=float("inf"),
+            dz=float("inf"),
+            dyaw=float("inf"),
+            axis_validity={"x": False, "y": False, "z": False, "yaw": False},
+            axis_confidence={"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+            observability=0.0,
+            frame_consistency=0.0,
+            abstain_reason="missing_estimate" if est is None else "missing_skill",
+            uses_privileged_runtime=False,
+        )
+        cfg = AlignmentTakeoverConfig(
+            xy_threshold=float(skill.xy_tolerance if skill is not None else 0.005),
+            z_threshold=float(skill.z_tolerance if skill is not None else 0.010),
+            yaw_threshold=float(skill.yaw_tolerance if skill is not None else 0.03),
+            min_observability=float(max(skill.confidence_threshold if skill is not None else 0.30, 0.30)),
+            min_frame_consistency=float(min_frame_consistency),
+            z_required=True,
+            yaw_required=True,
+        )
+        return evaluate_alignment_readiness(residual, cfg)
+
+    residual = TaskFrameResidualEstimate(
+        skill_id=str(skill.skill_type),
+        stage_name=str(est.stage_name),
+        reference_frame=str(skill.reference_entity or est.reference_entity),
+        target_frame=str(skill.target_entity or est.target_entity),
+        active_dofs=tuple(str(dof) for dof in skill.controlled_dofs),
+        dx=float(est.dx),
+        dy=float(est.dy),
+        dz=float(est.dz),
+        dyaw=float(est.dyaw),
+        axis_validity={
+            "x": bool(est.x_valid),
+            "y": bool(est.y_valid),
+            "z": bool(est.z_valid),
+            "yaw": bool(est.yaw_valid),
+        },
+        axis_confidence={
+            "x": float(est.x_confidence),
+            "y": float(est.y_confidence),
+            "z": float(est.z_confidence),
+            "yaw": float(est.yaw_confidence),
+        },
+        observability=float(est.confidence),
+        frame_consistency=float(est.frame_consistency),
+        abstain_reason=str(est.reason) if str(est.reason) in {"prior_only", "prior_only_reacquire", "reacquire_needed"} else "",
+        z_semantics=str(skill.z_semantics or "task_approach_axis_residual"),
+        yaw_semantics="task_frame_yaw_residual",
+        source=str(est.source),
+        uses_privileged_runtime=False,
+    )
+    cfg = AlignmentTakeoverConfig(
+        xy_threshold=float(skill.xy_tolerance),
+        z_threshold=float(skill.z_tolerance),
+        yaw_threshold=float(skill.yaw_tolerance),
+        min_observability=float(max(float(skill.confidence_threshold), 0.30)),
+        min_frame_consistency=float(min_frame_consistency),
+        z_required=bool(_skill_requires_axis(skill, "z")),
+        yaw_required=bool(_skill_requires_axis(skill, "yaw")),
+    )
+    return evaluate_alignment_readiness(residual, cfg)
 
 
 @dataclass
@@ -458,15 +555,12 @@ class PrecisionSkillSupervisor:
                 and depth_near
                 and error_depth <= micro_z_max
             )
-            close_ready = bool(
-                est.close_ready(
-                    xy_threshold=float(skill.xy_tolerance),
-                    z_threshold=float(skill.z_tolerance),
-                    yaw_threshold=float(skill.yaw_tolerance),
-                    yaw_required=bool(est.yaw_valid),
-                    min_frame_consistency=self.basin_recovery.config.visual_observability_threshold,
-                )
+            alignment_readiness = _alignment_readiness_from_estimate(
+                est,
+                skill,
+                min_frame_consistency=self.basin_recovery.config.visual_observability_threshold,
             )
+            close_ready = bool(alignment_readiness.alignment_ready_for_handoff)
             pullback_blocks: list[str] = []
             if not visible:
                 pullback_blocks.append("visibility")
@@ -489,10 +583,7 @@ class PrecisionSkillSupervisor:
                     close_blocks.append("xy")
                 if error_depth > float(skill.z_tolerance) or not est.z_valid:
                     close_blocks.append("z")
-                if est.yaw_valid and abs(float(est.dyaw)) > float(skill.yaw_tolerance):
-                    close_blocks.append("yaw")
-                if est.frame_consistency < self.basin_recovery.config.visual_observability_threshold:
-                    close_blocks.append("frame_consistency")
+                close_blocks.extend(str(alignment_readiness.block_reason).split("+"))
         else:
             visible = bool(local_error.valid and local_error.confidence >= conf_min and local_error.observability >= obs_min)
             error_xy = float(np.hypot(float(local_error.dx), float(local_error.dy))) if np.isfinite(local_error.dx) and np.isfinite(local_error.dy) else float("inf")
@@ -540,7 +631,7 @@ class PrecisionSkillSupervisor:
             close_ready=bool(close_ready),
             pullback_block_reason="+".join(dict.fromkeys(pullback_blocks)) if pullback_blocks else "ready",
             micro_entry_block_reason="+".join(dict.fromkeys(micro_blocks)) if micro_blocks else "ready",
-            close_block_reason="+".join(dict.fromkeys(close_blocks)) if close_blocks else "ready",
+            close_block_reason="+".join(dict.fromkeys(part for part in close_blocks if part)) if close_blocks else "ready",
             takeover_gate_kind="pullback" if pullback_ready else "none",
         )
         if stable_frames >= required_frames:
@@ -754,14 +845,11 @@ class PrecisionSkillSupervisor:
             if est is None:
                 return False
             ready_now = bool(
-                est.close_ready(
-                    xy_threshold=float(skill.xy_tolerance),
-                    z_threshold=float(skill.z_tolerance),
-                    yaw_threshold=float(skill.yaw_tolerance),
-                    yaw_required=bool(est.yaw_valid),
+                _alignment_readiness_from_estimate(
+                    est,
+                    skill,
                     min_frame_consistency=0.20,
-                )
-                and est.confidence >= max(float(skill.confidence_threshold), 0.30)
+                ).alignment_ready_for_handoff
             )
             if ready_now:
                 self._grasp_ready_stable_frames += 1
@@ -819,17 +907,8 @@ class PrecisionSkillSupervisor:
         xy_tol = float(skill.xy_tolerance if skill is not None else 0.004)
         yaw_tol = float(skill.yaw_tolerance if skill is not None else 0.14)
         est = estimated_basin_error
-        close_ready = bool(
-            est is not None
-            and est.close_ready(
-                xy_threshold=xy_tol,
-                z_threshold=float(skill.z_tolerance if skill is not None else 0.010),
-                yaw_threshold=yaw_tol,
-                yaw_required=bool(est.yaw_valid),
-                min_frame_consistency=0.20,
-            )
-            and est.confidence >= conf_threshold
-        )
+        alignment_readiness = _alignment_readiness_from_estimate(est, skill, min_frame_consistency=0.20)
+        close_ready = bool(alignment_readiness.alignment_ready_for_handoff)
         force_ready = bool(force_norm <= force_threshold)
         contact_confirmed = bool(grasp_ctrl.contact_confirmed if grasp_ctrl is not None else force_norm > force_threshold)
         gripper_override = None if grasp_ctrl is None else grasp_ctrl.gripper_override
@@ -856,6 +935,7 @@ class PrecisionSkillSupervisor:
                     "xy_tolerance": xy_tol,
                     "z_tolerance": float(skill.z_tolerance if skill is not None else 0.010),
                     "yaw_tolerance": yaw_tol,
+                    "alignment_handoff_block_reason": str(alignment_readiness.block_reason),
                 },
             },
             {
@@ -1277,6 +1357,22 @@ class PrecisionSkillSupervisor:
             requires_yaw_observability=bool(active_skill is not None and "yaw" in set(active_skill.controlled_dofs)),
             pullback_xy_threshold=float(gate_info.get("target_xy_error_max", active_skill.xy_tolerance if active_skill is not None else 0.005)),
         )
+        strict_alignment_readiness = _alignment_readiness_from_estimate(
+            estimated_basin_error,
+            active_skill,
+            min_frame_consistency=0.20,
+        )
+        legacy_basin_close_ready = bool(
+            estimated_basin_error.close_ready(
+                xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
+                z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
+                yaw_threshold=float(active_skill.yaw_tolerance if active_skill is not None else 0.03),
+                yaw_required=bool(estimated_basin_error.yaw_valid) if estimated_basin_error is not None else False,
+                min_frame_consistency=0.20,
+            )
+            if estimated_basin_error is not None
+            else False
+        )
         localizer_semantics = _local_geometry_semantics(localizer_active, skill_type=active_skill.skill_type if active_skill is not None else "none")
 
         self._last_trace = {
@@ -1336,14 +1432,16 @@ class PrecisionSkillSupervisor:
             "basin_micro_entry_ready": bool(gate_info.get("micro_entry_ready", False)),
             "basin_micro_entry_block_reason": str(gate_info.get("micro_entry_block_reason", "not_evaluated")),
             "basin_entry_gate_ready": bool(gate_info.get("micro_entry_ready", False)),
-            "basin_close_ready": bool(estimated_basin_error.close_ready(
-                xy_threshold=float(active_skill.xy_tolerance if active_skill is not None else 0.005),
-                z_threshold=float(active_skill.z_tolerance if active_skill is not None else 0.010),
-                yaw_threshold=float(active_skill.yaw_tolerance if active_skill is not None else 0.03),
-                yaw_required=bool(estimated_basin_error.yaw_valid) if estimated_basin_error is not None else False,
-                min_frame_consistency=0.20,
-            ) if estimated_basin_error is not None else False),
-            "basin_close_block_reason": str(gate_info.get("close_block_reason", "not_evaluated")),
+            "basin_close_ready": bool(strict_alignment_readiness.alignment_ready_for_handoff),
+            "basin_close_ready_diagnostic_legacy": bool(legacy_basin_close_ready),
+            "basin_close_block_reason": str(strict_alignment_readiness.block_reason),
+            "alignment_ready_for_handoff": bool(strict_alignment_readiness.alignment_ready_for_handoff),
+            "alignment_handoff_block_reason": str(strict_alignment_readiness.block_reason),
+            "alignment_xy_ready": bool(strict_alignment_readiness.xy_ready),
+            "alignment_z_ready": bool(strict_alignment_readiness.z_ready),
+            "alignment_yaw_ready": bool(strict_alignment_readiness.yaw_ready),
+            "alignment_observability_ready": bool(strict_alignment_readiness.observability_ready),
+            "alignment_frame_consistency_ready": bool(strict_alignment_readiness.frame_consistency_ready),
             "runtime_takeover_contract": _jsonable_value(runtime_contract_decision),
             "runtime_takeover_tier": str(runtime_contract_decision.get("takeover_tier", "invalid")),
             "runtime_takeover_contract_source": str(runtime_contract_decision.get("contract_source", "unknown")),
@@ -1354,7 +1452,7 @@ class PrecisionSkillSupervisor:
                 bool(gate_info.get("micro_entry_ready", False)) == bool(runtime_contract_decision.get("micro_entry_ready", False))
             ),
             "runtime_gate_contract_close_consistent": bool(
-                bool(gate_info.get("close_ready", False)) == bool(runtime_contract_decision.get("close_ready_ready", False))
+                bool(strict_alignment_readiness.alignment_ready_for_handoff) == bool(runtime_contract_decision.get("close_ready_ready", False))
             ),
             "phase_owner": stage.owner if stage_apply_allowed else "planner",
             "phase_reason": stage.transition_on if stage_apply_allowed else str(gate_info.get("reason", "waiting_precision_gate")),
