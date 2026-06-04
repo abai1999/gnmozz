@@ -384,7 +384,7 @@ class EstimatedBasinError:
         z_ok = bool(self.z_valid and abs(float(self.dz)) <= float(z_threshold))
         xy_ok = bool(xy <= float(xy_threshold) and self.xy_valid)
         if yaw_required is None:
-            yaw_required = bool(self.yaw_valid)
+            yaw_required = True
         yaw_ok = bool((not yaw_required) or (self.yaw_valid and abs(float(self.dyaw)) <= float(yaw_threshold)))
         frame_ok = bool(float(self.frame_consistency) >= float(min_frame_consistency))
         return bool(self.valid and xy_ok and z_ok and yaw_ok and frame_ok)

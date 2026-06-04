@@ -1712,7 +1712,7 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             reference_entity=skill.reference_entity,
             stage_name=stage.name,
         )
-        self.assertTrue(
+        self.assertFalse(
             est.close_ready(
                 xy_threshold=float(skill.xy_tolerance),
                 z_threshold=float(skill.z_tolerance),
@@ -5080,8 +5080,9 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             reference_entity="gripper_jaw_frame",
             stage_name="RING_GRASP_ALIGN",
         )
-        self.assertTrue(est.close_ready(xy_threshold=0.005, z_threshold=0.010, yaw_threshold=0.03, yaw_required=None))
+        self.assertFalse(est.close_ready(xy_threshold=0.005, z_threshold=0.010, yaw_threshold=0.03, yaw_required=None))
         self.assertFalse(est.close_ready(xy_threshold=0.005, z_threshold=0.010, yaw_threshold=0.03, yaw_required=True))
+        self.assertTrue(est.close_ready(xy_threshold=0.005, z_threshold=0.010, yaw_threshold=0.03, yaw_required=False))
         trace = est.to_trace()
         self.assertIn("estimated_basin_error_close_ready", trace)
         self.assertFalse(trace["estimated_basin_error_yaw_valid"])
