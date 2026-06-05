@@ -102,6 +102,27 @@ then uses the resulting strict handoff state rather than legacy
 The review did not find v43/v44 opening new Z/Yaw control authority or direct
 close authority.
 
+### Updated: close ownership is now planner-owned
+
+The runtime has been tightened so `c2c_force` and
+`GraspContactController.gripper_override` no longer directly write close into
+`final_action[6]`. Instead, both supervisor and evaluator route gripper output
+through `planner_gripper_authority_decision(...)`.
+
+The resulting semantics are:
+
+- planner close intent is required for any close command
+- the first close handoff requires `alignment_ready_for_handoff=true`
+- C2C contact/force logic may request open for safety
+- C2C close recommendations are recorded, but ignored unless planner intent
+  and strict handoff authority allow close
+- after a strict handoff has occurred, a latched planner-owned close may remain
+  closed in later verify/contact stages, still subject to C2C open safety
+
+This resolves the previous middle state where the documents described
+planner-owned close while the contact stage could still behave like a
+C2C-owned direct-close path.
+
 ### Still limited: v43/v44 do not prove successful handoff
 
 The held-out metrics are promising:
@@ -139,6 +160,8 @@ The current stack is:
 4. `alignment_ready_for_handoff` combines XY, Z, Yaw, observability, and frame
    consistency.
 5. Planner close remains blocked whenever strict handoff is false.
+6. Contact/force stages monitor stability and safety; they do not own direct
+   close.
 
 The newest 120-step MP4 smoke reached C2C later than the earlier 60-step smoke,
 but it still mostly demonstrates readiness gating and close blocking, not Z/Yaw
@@ -260,6 +283,7 @@ readiness into guarded Z micro-servo, then repeat the same pattern for Yaw.
 
 - Do not loosen `alignment_ready_for_handoff` thresholds to make MP4s close.
 - Do not use legacy `close_ready` as runtime close permission.
+- Do not reintroduce direct C2C close writes through `gripper_override`.
 - Do not open yaw servo from v44 readiness alone.
 - Do not use privileged pose, teacher residual, or RLBench mask at runtime.
 - Do not retune v42 XY while auditing v43/v44 handoff unless a trace proves XY

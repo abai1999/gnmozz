@@ -21,6 +21,7 @@ from .learned_force import LearnedForceClassifierAdapter
 from .localizers import LocalGeometryError, RingGraspLocalizer, RingSpokeAlignLocalizer
 from .specs import PrecisionSkillSpec, PrecisionTaskSpec, StageTransition
 from .alignment_takeover import AlignmentTakeoverConfig, AlignmentReadiness, TaskFrameResidualEstimate, evaluate_alignment_readiness
+from .grasp_probe_execution import planner_gripper_authority_decision
 from .takeover_contract import FrameResidual, ObservabilityDecision, TakeoverThresholds, decide_takeover_tier
 
 
@@ -315,6 +316,7 @@ class PrecisionSkillSupervisor:
         self._precision_gate_active: dict[str, bool] = {"precision_grasp": False, "precision_align": False}
         self._precision_gate_stable_frames: dict[str, int] = {"precision_grasp": 0, "precision_align": 0}
         self._last_precision_gate_info: dict[str, Any] = {}
+        self._planner_gripper_handoff_latched = False
 
     def reset(self) -> None:
         self.stage_index = 0
@@ -341,6 +343,7 @@ class PrecisionSkillSupervisor:
         self._precision_gate_active = {"precision_grasp": False, "precision_align": False}
         self._precision_gate_stable_frames = {"precision_grasp": 0, "precision_align": 0}
         self._last_precision_gate_info = {}
+        self._planner_gripper_handoff_latched = False
 
     def current_stage(self) -> Optional[str]:
         if self.task_spec is None or not self.stage_names:
@@ -912,7 +915,7 @@ class PrecisionSkillSupervisor:
         force_ready = bool(force_norm <= force_threshold)
         contact_confirmed = bool(grasp_ctrl.contact_confirmed if grasp_ctrl is not None else force_norm > force_threshold)
         gripper_override = None if grasp_ctrl is None else grasp_ctrl.gripper_override
-        close_triggered = bool(gripper_override is not None and float(gripper_override) <= 0.0)
+        close_recommended = bool(gripper_override is not None and float(gripper_override) <= 0.0)
         rules = [
             {
                 "rule": "stage_is_RING_GRASP_CONTACT",
@@ -951,18 +954,19 @@ class PrecisionSkillSupervisor:
                 "threshold": True,
             },
             {
-                "rule": "gripper_override_close",
-                "passed": bool(close_triggered),
+                "rule": "gripper_close_recommendation",
+                "passed": bool(close_recommended),
                 "value": None if gripper_override is None else float(gripper_override),
                 "threshold": 0.0,
             },
         ]
         return {
-            "decision": "close" if close_triggered else "hold",
-            "reason": "contact_close" if close_triggered else ("contact_hold" if stage.name == "RING_GRASP_CONTACT" else "not_contact_stage"),
+            "decision": "recommend_close" if close_recommended else "hold",
+            "reason": "contact_close_recommendation" if close_recommended else ("contact_hold" if stage.name == "RING_GRASP_CONTACT" else "not_contact_stage"),
             "force_norm": float(force_norm),
             "force_threshold": float(force_threshold),
             "gripper_override": None if gripper_override is None else float(gripper_override),
+            "close_recommended": bool(close_recommended),
             "contact_confirmed": bool(contact_confirmed),
             "stable": bool(grasp_ctrl.stable if grasp_ctrl is not None else False),
             "rules": rules,
@@ -1024,6 +1028,8 @@ class PrecisionSkillSupervisor:
                 self._skill_entry_z[skill.skill_type] = None
             if stage.name in {"COARSE_TO_RING", "RING_GRASP_ALIGN", "RING_GRASP_CONTACT"}:
                 self._grasp_ready_stable_frames = 0
+            if stage.name == "RING_GRASP_ALIGN":
+                self._planner_gripper_handoff_latched = False
             if stage.name == "RECOVER":
                 # Preserve the target resume stage until recovery completes.
                 pass
@@ -1297,8 +1303,6 @@ class PrecisionSkillSupervisor:
                 )
                 self._sync_recovery_from_control_result(grasp_ctrl, stage)
                 local_out = local_base + grasp_ctrl.delta_local
-                if grasp_ctrl.gripper_override is not None:
-                    bundle.gripper_open = float(grasp_ctrl.gripper_override)
             else:
                 slide_ctrl = self.slide_controller.step(
                     error=spoke_error,
@@ -1315,6 +1319,48 @@ class PrecisionSkillSupervisor:
             rec = self.recovery.step(force_reading=filtered_force, local_base=local_base, invalid_action=invalid_action_flag, jam=jam_flag)
             local_out = local_base + rec.delta_local
 
+        strict_alignment_readiness = _alignment_readiness_from_estimate(
+            estimated_basin_error,
+            active_skill,
+            min_frame_consistency=0.20,
+        )
+        c2c_close_recommendation = bool(
+            grasp_ctrl is not None and grasp_ctrl.gripper_override is not None and float(grasp_ctrl.gripper_override) <= 0.0
+        )
+        c2c_open_safety_requested = bool(
+            stage.owner in {"c2c_force", "c2c_recovery"}
+            and (
+                self.recovery.phase != RecoveryPhase.IDLE
+                or invalid_action_flag
+                or (
+                    grasp_ctrl is not None
+                    and grasp_ctrl.state_name in {"REGRASP", "RECOVER", "FAILED"}
+                )
+                or (
+                    slide_ctrl is not None
+                    and slide_ctrl.state_name in {"RECOVER", "FAILED"}
+                )
+            )
+        )
+        gripper_authority = planner_gripper_authority_decision(
+            planner_gripper_value=float(planner_delta_7d[6]) if len(planner_delta_7d) > 6 else 1.0,
+            planner_close_threshold=0.5,
+            alignment_ready_for_handoff=bool(strict_alignment_readiness.alignment_ready_for_handoff),
+            stage_name=str(stage.name),
+            enabled=bool(not self.shadow_only),
+            guard_active=bool(gate_active),
+            active=bool(stage_apply_allowed),
+            candidate_match=bool(stage.owner in {"c2c_force", "c2c_recovery"}),
+            gripper_mode=str(stage.gripper_mode),
+            c2c_open_safety_requested=bool(c2c_open_safety_requested),
+            c2c_close_recommendation=bool(c2c_close_recommendation),
+            handoff_already_latched=bool(self._planner_gripper_handoff_latched),
+        )
+        if bool(gripper_authority["planner_gripper_close_allowed"]) and bool(
+            gripper_authority["planner_gripper_strict_handoff_ready"]
+        ):
+            self._planner_gripper_handoff_latched = True
+
         if self.shadow_only or not stage_apply_allowed:
             local_out = local_base.copy()
             if not self.shadow_only and stage.owner == "c2c_force" and active_skill is not None:
@@ -1326,8 +1372,8 @@ class PrecisionSkillSupervisor:
         world_out = local_delta_to_world(local_out, current_quat).astype(np.float32)
         final_action = planner_delta_7d.copy()
         final_action[:6] = world_out[:6]
-        if not self.shadow_only and stage.owner in {"c2c_force", "c2c_recovery"} and bundle.gripper_open is not None:
-            final_action[6] = 1.0 if float(bundle.gripper_open) > 0.5 else 0.0
+        if not self.shadow_only:
+            final_action[6] = float(gripper_authority["gripper_open"])
         final_action = self.safety.clip_final_action(final_action)
 
         self._maybe_transition(
@@ -1458,6 +1504,7 @@ class PrecisionSkillSupervisor:
             "phase_reason": stage.transition_on if stage_apply_allowed else str(gate_info.get("reason", "waiting_precision_gate")),
             "invalid_action_flag": invalid_action_flag,
             "planner_action_world": planner_delta_7d[:6].tolist(),
+            "planner_gripper_intent": float(planner_delta_7d[6]) if len(planner_delta_7d) > 6 else 1.0,
             "planner_chunk_local_6d": local_base.astype(np.float32).tolist(),
             "local_command_local_6d": local_out.astype(np.float32).tolist(),
             "local_residual_vs_planner_local_6d": (local_out - local_base).astype(np.float32).tolist(),
@@ -1474,8 +1521,21 @@ class PrecisionSkillSupervisor:
             "grasp_contact_rule_force_norm": grasp_close_trace["force_norm"],
             "grasp_contact_rule_force_threshold": grasp_close_trace["force_threshold"],
             "grasp_contact_rule_gripper_override": grasp_close_trace["gripper_override"],
+            "grasp_contact_rule_close_recommended": bool(grasp_close_trace.get("close_recommended", False)),
             "grasp_contact_rule_contact_confirmed": grasp_close_trace["contact_confirmed"],
             "grasp_contact_rule_stable": grasp_close_trace["stable"],
+            "planner_gripper_close_requested": bool(gripper_authority["planner_gripper_close_requested"]),
+            "planner_gripper_close_allowed": bool(gripper_authority["planner_gripper_close_allowed"]),
+            "planner_gripper_close_blocked": bool(gripper_authority["planner_gripper_close_blocked"]),
+            "planner_gripper_handoff_allowed": bool(gripper_authority["planner_gripper_handoff_allowed"]),
+            "planner_gripper_strict_handoff_ready": bool(gripper_authority["planner_gripper_strict_handoff_ready"]),
+            "planner_gripper_handoff_latched": bool(gripper_authority["planner_gripper_handoff_latched"]),
+            "c2c_gripper_open_safety_requested": bool(gripper_authority["c2c_gripper_open_safety_requested"]),
+            "c2c_gripper_close_recommendation": bool(gripper_authority["c2c_gripper_close_recommendation"]),
+            "c2c_gripper_close_recommendation_ignored": bool(gripper_authority["c2c_gripper_close_recommendation_ignored"]),
+            "gripper_authority_source": str(gripper_authority["gripper_authority_source"]),
+            "gripper_authority_reason": str(gripper_authority["reason"]),
+            "gripper_authority_decision": str(gripper_authority["decision"]),
             "c2c_stage_age": int(self.stage_age),
             "c2c_gate_skill": str(gate_info.get("skill", "none")),
             "c2c_gate_skill_name": str(gate_info.get("skill_name", "none")),

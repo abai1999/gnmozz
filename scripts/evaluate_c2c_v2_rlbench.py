@@ -81,6 +81,7 @@ from prismatic.robot.coarse2contact_v2.grasp_probe_execution import (
     candidate_xy_correction_ready,
     grasp_probe_close_arbiter_decision,
     grasp_probe_close_ready_with_z,
+    planner_gripper_authority_decision,
     precision_takeover_activation_status,
     smooth_grasp_probe_xy_step,
 )
@@ -97,8 +98,20 @@ from prismatic.robot.coarse2contact_v2.task_frame_readiness import (
     load_task_frame_readiness_checkpoint,
     task_frame_readiness_feature_vector,
 )
+from prismatic.robot.coarse2contact_v2.task_frame_v45_candidate import (
+    TaskFrameV45CandidateNet,
+    TaskFrameV45CandidateEstimate,
+    TaskFrameV45MicroServoDecision,
+    load_task_frame_v45_candidate_checkpoint,
+    task_frame_v45_candidate_feature_vector,
+    task_frame_v45_micro_servo_step,
+)
 from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin, recovery_overshoot_flag
-from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RuntimeXYAffineCalibration, calibrated_runtime_xy_residual_from_trace
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import (
+    RUNTIME_XY_SOFT_ACTIVATION_RADIUS,
+    RuntimeXYAffineCalibration,
+    calibrated_runtime_xy_residual_from_trace,
+)
 
 from prismatic.robot.coarse2contact_v2 import BasinRecoveryConfig, PrecisionSkillSupervisor, load_precision_task_spec, load_basin_state_calibration_report
 from prismatic.robot.coarse2contact_v2.learned_force import LearnedForceClassifierAdapter
@@ -690,6 +703,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional non-privileged yaw readiness checkpoint used to gate strict handoff.",
     )
     parser.add_argument(
+        "--task_frame_v45_ckpt",
+        type=str,
+        default="",
+        help="Optional non-privileged task-frame dz/dyaw checkpoint used for guarded micro-servo.",
+    )
+    parser.add_argument(
+        "--enable_v45_task_frame_micro_servo",
+        action="store_true",
+        default=False,
+        help="Enable the guarded task-frame Z/Yaw micro-servo for smoke/replay only.",
+    )
+    parser.add_argument("--v45_task_frame_z_gain", type=float, default=0.35)
+    parser.add_argument("--v45_task_frame_yaw_gain", type=float, default=0.25)
+    parser.add_argument("--v45_task_frame_max_z_step", type=float, default=0.0030)
+    parser.add_argument("--v45_task_frame_max_yaw_step", type=float, default=0.020)
+    parser.add_argument("--v45_task_frame_min_z_confidence", type=float, default=0.45)
+    parser.add_argument("--v45_task_frame_min_yaw_confidence", type=float, default=0.45)
+    parser.add_argument("--v45_task_frame_min_step_scale", type=float, default=0.05)
+    parser.add_argument("--v45_task_frame_force_safe_threshold", type=float, default=0.18)
+    parser.add_argument(
         "--c2c_grasp_probe_smoke_type",
         type=str,
         default="diagnostic_privileged_probe",
@@ -788,11 +821,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--c2c_grasp_probe_block_planner_close_until_ready",
         action="store_true",
-        default=False,
+        default=True,
         help=(
-            "Smoke/eval close arbiter: in RING_GRASP_ALIGN failure-tail windows, keep the gripper open "
-            "when the planner asks to close before strict close-ready is true."
+            "Smoke/eval close arbiter, enabled by default: in C2C handoff windows, keep the gripper open "
+            "when the planner asks to close before strict alignment_ready_for_handoff is true."
         ),
+    )
+    parser.add_argument(
+        "--disable_c2c_grasp_probe_block_planner_close_until_ready",
+        dest="c2c_grasp_probe_block_planner_close_until_ready",
+        action="store_false",
+        help="Debug escape hatch: allow planner close without the C2C probe close arbiter.",
     )
     parser.add_argument(
         "--c2c_grasp_probe_close_arbiter_guard_steps",
@@ -904,6 +943,7 @@ def evaluate(args: argparse.Namespace) -> float:
     runtime_xy_calibration_window_size = max(1, int(getattr(runtime_xy_calibration, "window_size", 1) if runtime_xy_calibration is not None else 1))
     task_frame_z_readiness_model = None
     task_frame_yaw_readiness_model = None
+    task_frame_v45_model = None
     if str(getattr(args, "task_frame_z_readiness_ckpt", "") or ""):
         task_frame_z_readiness_model, task_frame_z_readiness_meta = load_task_frame_readiness_checkpoint(
             getattr(args, "task_frame_z_readiness_ckpt"),
@@ -918,6 +958,13 @@ def evaluate(args: argparse.Namespace) -> float:
         )
     else:
         task_frame_yaw_readiness_meta = {}
+    if str(getattr(args, "task_frame_v45_ckpt", "") or ""):
+        task_frame_v45_model, task_frame_v45_meta = load_task_frame_v45_candidate_checkpoint(
+            getattr(args, "task_frame_v45_ckpt"),
+            map_location="cpu",
+        )
+    else:
+        task_frame_v45_meta = {}
 
     vla, processor, action_head, proprio_projector, norm_stats = load_checkpoint(
         args.checkpoint_dir,
@@ -1029,6 +1076,14 @@ def evaluate(args: argparse.Namespace) -> float:
         "task_frame_yaw_readiness_ckpt": str(getattr(args, "task_frame_yaw_readiness_ckpt", "")),
         "task_frame_yaw_readiness_loaded": bool(task_frame_yaw_readiness_model is not None),
         "task_frame_yaw_readiness_meta": _jsonable_value(task_frame_yaw_readiness_meta),
+        "task_frame_v45_ckpt": str(getattr(args, "task_frame_v45_ckpt", "")),
+        "task_frame_v45_loaded": bool(task_frame_v45_model is not None),
+        "task_frame_v45_meta": _jsonable_value(task_frame_v45_meta),
+        "enable_v45_task_frame_micro_servo": bool(args.enable_v45_task_frame_micro_servo),
+        "v45_task_frame_z_gain": float(args.v45_task_frame_z_gain),
+        "v45_task_frame_yaw_gain": float(args.v45_task_frame_yaw_gain),
+        "v45_task_frame_max_z_step": float(args.v45_task_frame_max_z_step),
+        "v45_task_frame_max_yaw_step": float(args.v45_task_frame_max_yaw_step),
         "depth_error_trend": [],
     }
 
@@ -1258,6 +1313,19 @@ def evaluate(args: argparse.Namespace) -> float:
                         and "y" in {str(axis) for axis in probe_candidate_axes}
                     )
                 )
+                probe_current_xy_error = float(probe_shell_fields.get("grasp_probe_pre_xy_error", float("nan")))
+                if not np.isfinite(probe_current_xy_error):
+                    probe_current_xy_error = float(probe_shell_fields.get("grasp_probe_horizon_final_xy_error", float("nan")))
+                probe_runtime_soft_xy_ready = bool(
+                    str(args.c2c_grasp_probe_policy) == "runtime_estimator_xy"
+                    and bool(runtime_xy_estimate.entry_ready)
+                    and probe_stage_ok
+                    and probe_visibility_bucket != "prior_only"
+                    and probe_has_error
+                    and probe_finite_xy
+                    and np.isfinite(probe_current_xy_error)
+                    and float(probe_current_xy_error) <= float(RUNTIME_XY_SOFT_ACTIVATION_RADIUS) + 1.0e-9
+                )
                 probe_runtime_allowed_tiers = {
                     str(part).strip()
                     for part in str(args.c2c_grasp_probe_runtime_takeover_tiers).split(",")
@@ -1319,13 +1387,13 @@ def evaluate(args: argparse.Namespace) -> float:
                     and probe_visibility_bucket != "prior_only"
                     and probe_has_error
                     and probe_finite_xy
-                    and probe_candidate_match
-                    and probe_precision_ready
-                    and (probe_shell_ok or small_xy_large_yaw_candidate_relaxed)
-                    and (probe_candidate_actionable or small_xy_large_yaw_candidate_relaxed)
+                    and (probe_candidate_match or probe_runtime_soft_xy_ready)
+                    and (probe_precision_ready or probe_runtime_soft_xy_ready)
+                    and (probe_shell_ok or small_xy_large_yaw_candidate_relaxed or probe_runtime_soft_xy_ready)
+                    and (probe_candidate_actionable or small_xy_large_yaw_candidate_relaxed or probe_runtime_soft_xy_ready)
                     and (
                         str(args.c2c_grasp_probe_policy) != "runtime_estimator_xy"
-                        or bool(runtime_xy_estimate.entry_ready)
+                        or bool(runtime_xy_estimate.entry_ready or probe_runtime_soft_xy_ready)
                     )
                 )
                 trace_entry["grasp_probe_policy"] = str(args.c2c_grasp_probe_policy)
@@ -1342,6 +1410,8 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_candidate_required"] = bool(probe_candidate_required)
                 trace_entry["grasp_probe_candidate_match"] = bool(probe_candidate_match)
                 trace_entry["grasp_probe_candidate_actionable"] = bool(probe_candidate_actionable)
+                trace_entry["grasp_probe_runtime_soft_xy_ready"] = bool(probe_runtime_soft_xy_ready)
+                trace_entry["grasp_probe_soft_xy_activation_radius"] = float(RUNTIME_XY_SOFT_ACTIVATION_RADIUS)
                 trace_entry["grasp_probe_xy_correction_ready"] = bool(probe_candidate_xy_ready)
                 trace_entry["grasp_probe_candidate_within_xy_activation_window"] = bool(probe_candidate_within_xy_window)
                 trace_entry["grasp_probe_precision_activation_ready"] = bool(probe_precision_ready)
@@ -1368,11 +1438,17 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_stage_ok"] = bool(probe_stage_ok)
                 trace_entry["grasp_probe_stage_source"] = "runtime_stage" if probe_stage == "RING_GRASP_ALIGN" else ("forced_shell" if probe_stage_ok else "not_grasp_align")
                 if probe_eligible:
-                    trace_entry["grasp_probe_reason"] = str(args.c2c_grasp_probe_policy)
+                    trace_entry["grasp_probe_reason"] = (
+                        "runtime_estimator_xy_soft_gate"
+                        if probe_runtime_soft_xy_ready
+                        else str(args.c2c_grasp_probe_policy)
+                    )
                 elif probe_candidate_required and not probe_candidate_match:
                     trace_entry["grasp_probe_reason"] = "not_failure_tail_candidate"
                 elif str(args.c2c_grasp_probe_policy) == "runtime_estimator_xy" and not bool(runtime_xy_estimate.entry_ready):
                     trace_entry["grasp_probe_reason"] = str(runtime_xy_estimate.reason)
+                elif probe_runtime_soft_xy_ready:
+                    trace_entry["grasp_probe_reason"] = "runtime_estimator_xy_soft_gate"
                 elif probe_candidate_required and not probe_precision_ready:
                     trace_entry["grasp_probe_reason"] = str(probe_precision_block_reason)
                 elif small_xy_large_yaw_candidate_relaxed:
@@ -1422,6 +1498,37 @@ def evaluate(args: argparse.Namespace) -> float:
                     yaw_readiness=yaw_readiness if isinstance(yaw_readiness, TaskFrameYawReadinessEstimate) else None,
                 )
                 alignment_readiness = evaluate_alignment_readiness(task_frame_residual, alignment_config)
+                task_frame_v45_estimate = None
+                task_frame_v45_decision = None
+                task_frame_v45_local_step = np.zeros(6, dtype=np.float32)
+                if bool(args.enable_v45_task_frame_micro_servo) and task_frame_v45_model is not None:
+                    raw_force_norm = float(np.linalg.norm(np.asarray(raw_force if raw_force is not None else np.zeros(6, dtype=np.float32), dtype=np.float32)))
+                    trace_entry["task_frame_v45_force_norm"] = float(raw_force_norm)
+                    task_frame_v45_estimate, task_frame_v45_decision, task_frame_v45_local_step = task_frame_v45_micro_servo_step(
+                        trace_entry,
+                        model=task_frame_v45_model,
+                        history_rows=list(runtime_xy_history),
+                        xy_ready=bool(alignment_readiness.xy_ready),
+                        z_readiness=z_readiness if isinstance(z_readiness, TaskFrameZReadinessEstimate) else None,
+                        yaw_readiness=yaw_readiness if isinstance(yaw_readiness, TaskFrameYawReadinessEstimate) else None,
+                        force_safe=bool(raw_force_norm < float(args.v45_task_frame_force_safe_threshold)),
+                        z_gain=float(args.v45_task_frame_z_gain),
+                        yaw_gain=float(args.v45_task_frame_yaw_gain),
+                        max_z_step=float(args.v45_task_frame_max_z_step),
+                        max_yaw_step=float(args.v45_task_frame_max_yaw_step),
+                        min_z_confidence=float(args.v45_task_frame_min_z_confidence),
+                        min_yaw_confidence=float(args.v45_task_frame_min_yaw_confidence),
+                        min_step_scale=float(args.v45_task_frame_min_step_scale),
+                    )
+                    trace_entry.update(_jsonable_value(task_frame_v45_estimate.to_dict()))
+                    trace_entry.update(_jsonable_value(task_frame_v45_decision.to_dict()))
+                else:
+                    trace_entry["task_frame_v45_applied"] = False
+                    trace_entry["task_frame_v45_block_reason"] = "disabled"
+                    trace_entry["task_frame_v45_z_block_reason"] = "disabled"
+                    trace_entry["task_frame_v45_yaw_block_reason"] = "disabled"
+                    trace_entry["task_frame_v45_step_scale"] = 0.0
+                trace_entry["task_frame_v45_enabled"] = bool(args.enable_v45_task_frame_micro_servo and task_frame_v45_model is not None)
                 lifecycle_enabled = bool(args.c2c_grasp_probe_policy != "off" and not args.disable_c2c_grasp_probe_alignment_lifecycle)
                 if lifecycle_enabled and probe_eligible and not alignment_session.active:
                     alignment_session_counter += 1
@@ -1472,7 +1579,7 @@ def evaluate(args: argparse.Namespace) -> float:
                         and probe_finite_xy
                         and (
                             str(args.c2c_grasp_probe_policy) != "runtime_estimator_xy"
-                            or bool(runtime_xy_estimate.entry_ready)
+                            or bool(runtime_xy_estimate.entry_ready or probe_runtime_soft_xy_ready)
                         )
                     )
                 )
@@ -1594,6 +1701,14 @@ def evaluate(args: argparse.Namespace) -> float:
                     probe_local_command = current_local_command.copy()
                     probe_local_command[0] += float(probe_applied_correction_local[0])
                     probe_local_command[1] += float(probe_applied_correction_local[1])
+                    if bool(task_frame_v45_decision is not None and task_frame_v45_decision.applied):
+                        probe_local_command[2] += float(task_frame_v45_local_step[2])
+                        probe_local_command[5] += float(task_frame_v45_local_step[5])
+                        trace_entry["task_frame_v45_applied_local_6d"] = _jsonable_value(task_frame_v45_local_step)
+                        trace_entry["task_frame_v45_applied"] = True
+                    else:
+                        trace_entry.setdefault("task_frame_v45_applied_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32)))
+                        trace_entry["task_frame_v45_applied"] = False
                     probe_world_delta = local_delta_to_world(probe_local_command, np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
                     delta_action = delta_action.copy()
                     delta_action[:6] = probe_world_delta[:6]
@@ -1682,22 +1797,44 @@ def evaluate(args: argparse.Namespace) -> float:
                 close_arbiter_ready = bool(runtime_close_ready)
                 if bool(probe_close_handoff_latched):
                     close_arbiter_ready = True
-                decision = grasp_probe_close_arbiter_decision(
-                    planner_gripper_value=float(base_delta_action[6]) if len(base_delta_action) > 6 else 1.0,
+                planner_gripper_value = float(base_delta_action[6]) if len(base_delta_action) > 6 else 1.0
+                if bool(probe_close_handoff_latched):
+                    planner_gripper_value = 0.0
+                authority = planner_gripper_authority_decision(
+                    planner_gripper_value=planner_gripper_value,
                     planner_close_threshold=0.5,
-                    close_ready=bool(close_arbiter_ready),
+                    alignment_ready_for_handoff=bool(close_arbiter_ready),
                     stage_name=str(trace_entry.get("c2c_v2_stage", "")),
                     enabled=bool(args.c2c_grasp_probe_block_planner_close_until_ready),
                     guard_active=bool(probe_close_arbiter_guard_steps_remaining > 0),
                     active=bool(trace_entry.get("grasp_probe_active", False)),
                     candidate_match=bool(trace_entry.get("grasp_probe_candidate_match", False)),
                     gripper_mode=str(args.c2c_grasp_probe_gripper_mode),
+                    c2c_open_safety_requested=bool(
+                        bool(trace_entry.get("safe_abstain_open", False))
+                        or bool(trace_entry.get("failed_retryable", False))
+                        or bool(trace_entry.get("failed_terminal", False))
+                        or str(args.c2c_grasp_probe_gripper_mode) == "lock_open"
+                    ),
+                    c2c_close_recommendation=bool(probe_close_handoff_latched),
+                    handoff_already_latched=bool(probe_close_handoff_latched),
                 )
-                if bool(decision["blocked"]) and delta_action.shape[0] > 6:
+                if delta_action.shape[0] > 6:
                     delta_action = delta_action.copy()
-                    delta_action[6] = 1.0
-                trace_entry["grasp_probe_planner_close_requested"] = bool(decision["planner_close_requested"])
-                trace_entry["planner_gripper_close_requested"] = bool(decision["planner_close_requested"])
+                    delta_action[6] = float(authority["gripper_open"])
+                trace_entry["grasp_probe_planner_close_requested"] = bool(authority["planner_gripper_close_requested"])
+                trace_entry["planner_gripper_close_requested"] = bool(authority["planner_gripper_close_requested"])
+                trace_entry["planner_gripper_close_allowed"] = bool(authority["planner_gripper_close_allowed"])
+                trace_entry["planner_gripper_close_blocked"] = bool(authority["planner_gripper_close_blocked"])
+                trace_entry["planner_gripper_handoff_allowed"] = bool(authority["planner_gripper_handoff_allowed"])
+                trace_entry["planner_gripper_strict_handoff_ready"] = bool(authority["planner_gripper_strict_handoff_ready"])
+                trace_entry["planner_gripper_handoff_latched"] = bool(authority["planner_gripper_handoff_latched"])
+                trace_entry["c2c_gripper_open_safety_requested"] = bool(authority["c2c_gripper_open_safety_requested"])
+                trace_entry["c2c_gripper_close_recommendation"] = bool(authority["c2c_gripper_close_recommendation"])
+                trace_entry["c2c_gripper_close_recommendation_ignored"] = bool(authority["c2c_gripper_close_recommendation_ignored"])
+                trace_entry["gripper_authority_source"] = str(authority["gripper_authority_source"])
+                trace_entry["gripper_authority_reason"] = str(authority["reason"])
+                trace_entry["gripper_authority_decision"] = str(authority["decision"])
                 trace_entry["grasp_probe_close_arbiter_enabled"] = bool(args.c2c_grasp_probe_block_planner_close_until_ready)
                 trace_entry["grasp_probe_close_arbiter_source"] = (
                     "alignment_takeover_lifecycle"
@@ -1711,13 +1848,12 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["grasp_probe_close_arbiter_xy_norm"] = float(close_arbiter_xy_norm)
                 trace_entry["grasp_probe_close_arbiter_z_abs"] = float(close_arbiter_z_abs)
                 trace_entry["grasp_probe_close_arbiter_yaw_abs"] = float(close_arbiter_yaw_abs)
-                trace_entry["grasp_probe_close_blocked_by_c2c"] = bool(decision["blocked"])
-                trace_entry["planner_gripper_close_blocked"] = bool(decision["blocked"])
-                trace_entry["grasp_probe_close_block_reason"] = str(decision["reason"])
+                trace_entry["grasp_probe_close_blocked_by_c2c"] = bool(authority["planner_gripper_close_blocked"])
+                trace_entry["grasp_probe_close_block_reason"] = str(authority["reason"])
                 trace_entry["alignment_gripper_handoff_block_reason"] = str(
-                    "ready" if close_arbiter_ready else trace_entry.get("alignment_handoff_block_reason", decision["reason"])
+                    "ready" if close_arbiter_ready else trace_entry.get("alignment_handoff_block_reason", authority["reason"])
                 )
-                trace_entry["grasp_probe_close_arbiter_protected_window"] = bool(decision["protected_window"])
+                trace_entry["grasp_probe_close_arbiter_protected_window"] = bool(authority["protected_window"])
                 if not bool(trace_entry.get("grasp_probe_active", False)) and probe_close_arbiter_guard_steps_remaining > 0:
                     probe_close_arbiter_guard_steps_remaining = max(probe_close_arbiter_guard_steps_remaining - 1, 0)
 
@@ -2063,10 +2199,17 @@ def evaluate(args: argparse.Namespace) -> float:
                         "grasp_probe_horizon",
                     )
                     trace_entry.update(horizon_metric_fields)
+                    strict_handoff_ready_for_eval_close = bool(
+                        alignment_session.alignment_ready_for_handoff
+                        or alignment_readiness.alignment_ready_for_handoff
+                        or trace_entry.get("alignment_ready_for_handoff", False)
+                    )
                     close_handoff_ready = bool(
                         horizon_metric_fields.get("grasp_probe_horizon_close_ready_after", False)
+                        and strict_handoff_ready_for_eval_close
                     )
                     trace_entry["grasp_probe_close_handoff_ready"] = bool(close_handoff_ready)
+                    trace_entry["grasp_probe_close_handoff_strict_ready"] = bool(strict_handoff_ready_for_eval_close)
                     if (
                         str(args.c2c_grasp_probe_gripper_mode) == "eval_close_after_near"
                         and close_handoff_ready

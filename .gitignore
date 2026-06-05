@@ -150,10 +150,12 @@ dmypy.json
 
 # Caches and Datasets
 cache/
+data
 data/
 
 # Rollout videos and wandb logs
 rollouts/
+wandb
 wandb/
 outputs
 outputs/
@@ -162,6 +164,7 @@ figure/
 
 # Local RLBench/VLA experiment artifacts. Keep source code, configs, and docs in
 # git; publish selected small artifacts explicitly with `git add -f` if needed.
+eval_logs
 eval_logs/
 logs/
 runtime_artifacts/

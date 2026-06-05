@@ -79,6 +79,108 @@ def grasp_probe_close_ready_with_z(
     )
 
 
+def planner_gripper_authority_decision(
+    *,
+    planner_gripper_value: float,
+    planner_close_threshold: float = 0.5,
+    alignment_ready_for_handoff: bool,
+    stage_name: str,
+    enabled: bool,
+    guard_active: bool,
+    active: bool,
+    candidate_match: bool,
+    gripper_mode: str,
+    c2c_open_safety_requested: bool,
+    c2c_close_recommendation: bool,
+    handoff_already_latched: bool = False,
+) -> dict[str, object]:
+    """Resolve the final gripper command under planner-owned close semantics.
+
+    The planner still owns the close intent. C2C may only request the gripper
+    to remain open for safety, or emit a close recommendation that the arbiter
+    can ignore unless strict handoff is ready.
+    """
+
+    planner_close_requested = bool(
+        np.isfinite(float(planner_gripper_value))
+        and float(planner_gripper_value) < float(planner_close_threshold)
+    )
+    planner_strict_handoff_ready = bool(alignment_ready_for_handoff)
+    planner_handoff_allowed = bool(planner_strict_handoff_ready or handoff_already_latched)
+    handoff_stage = str(stage_name) in {"RING_GRASP_ALIGN", "RING_GRASP_CONTACT"}
+    protected_window = bool(
+        handoff_stage
+        and str(gripper_mode) in {"planner_after_handoff", "planner_after_near", "eval_close_after_near", "close"}
+        and (bool(active) or bool(guard_active) or bool(candidate_match))
+    )
+    c2c_open_safety_requested = bool(c2c_open_safety_requested)
+    c2c_close_recommendation = bool(c2c_close_recommendation)
+
+    if not bool(enabled):
+        final_gripper_open = 0.0 if planner_close_requested else 1.0
+        blocked = False
+        reason = "disabled"
+        authority_source = "arbiter_disabled"
+    elif not planner_close_requested:
+        final_gripper_open = 1.0
+        blocked = False
+        reason = "planner_open"
+        authority_source = "planner_open"
+    elif c2c_open_safety_requested:
+        final_gripper_open = 1.0
+        blocked = True
+        reason = "c2c_open_safety"
+        authority_source = "c2c_open_safety"
+    elif planner_strict_handoff_ready:
+        final_gripper_open = 0.0
+        blocked = False
+        reason = "ready"
+        authority_source = "strict_handoff"
+    elif bool(handoff_already_latched):
+        final_gripper_open = 0.0
+        blocked = False
+        reason = "prior_handoff_latched"
+        authority_source = "planner_after_prior_handoff"
+    elif not handoff_stage:
+        final_gripper_open = 1.0
+        blocked = True
+        reason = "not_handoff_stage"
+        authority_source = "planner_close_blocked"
+    elif str(gripper_mode) not in {"planner_after_handoff", "planner_after_near", "eval_close_after_near", "close"}:
+        final_gripper_open = 1.0
+        blocked = True
+        reason = "gripper_mode_not_arbited"
+        authority_source = "planner_close_blocked"
+    elif not (bool(active) or bool(guard_active) or bool(candidate_match)):
+        final_gripper_open = 1.0
+        blocked = True
+        reason = "outside_guard_window"
+        authority_source = "planner_close_blocked"
+    else:
+        final_gripper_open = 1.0
+        blocked = True
+        reason = "not_close_ready"
+        authority_source = "planner_close_blocked"
+
+    close_recommendation_ignored = bool(c2c_close_recommendation and float(final_gripper_open) > 0.5)
+    return {
+        "planner_gripper_close_requested": bool(planner_close_requested),
+        "planner_gripper_close_allowed": bool(enabled and planner_close_requested and planner_handoff_allowed and not c2c_open_safety_requested),
+        "planner_gripper_close_blocked": bool(blocked),
+        "planner_gripper_handoff_allowed": bool(planner_handoff_allowed),
+        "planner_gripper_strict_handoff_ready": bool(planner_strict_handoff_ready),
+        "planner_gripper_handoff_latched": bool(handoff_already_latched),
+        "c2c_gripper_open_safety_requested": bool(c2c_open_safety_requested),
+        "c2c_gripper_close_recommendation": bool(c2c_close_recommendation),
+        "c2c_gripper_close_recommendation_ignored": bool(close_recommendation_ignored),
+        "gripper_authority_source": str(authority_source),
+        "gripper_open": float(final_gripper_open),
+        "decision": "close" if float(final_gripper_open) <= 0.5 else "open",
+        "reason": str(reason),
+        "protected_window": bool(protected_window),
+    }
+
+
 def grasp_probe_close_arbiter_decision(
     *,
     planner_gripper_value: float,

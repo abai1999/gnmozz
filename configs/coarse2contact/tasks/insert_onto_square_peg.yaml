@@ -22,8 +22,9 @@ runtime_flags:
   precision_align_takeover_observability_min: 0.0008
 notes:
   - v2 task contract for a multi-stage precision ring-on-spoke assembly
-  - planner handles coarse approach and transfer only
-  - C2C owns all high-precision local skills
+  - planner handles coarse approach, transfer, and all close intents
+  - C2C owns high-precision local alignment, contact monitoring, and open-only safety
+  - any gripper close must pass strict alignment_ready_for_handoff
 
 entities:
   gripper_jaw_frame:
@@ -121,7 +122,8 @@ skills:
     max_dz_step: 0.0006
     max_yaw_step: 0.020
     notes:
-      - verify contact and stable grasp after the ring closes
+      - monitor contact and stable grasp after planner-owned close handoff
+      - may recommend close or request open for safety, but never directly owns close
 
   precision_align_ring_to_spoke:
     skill_type: precision_align
@@ -212,7 +214,7 @@ stages:
     min_steps: 1
     max_steps: 30
     recover_to_stage: RING_GRASP_ALIGN
-    gripper_mode: close
+    gripper_mode: planner_after_handoff
 
   - name: RING_LIFT_VERIFY
     owner: c2c_force

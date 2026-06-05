@@ -17,6 +17,10 @@ from prismatic.robot.coarse2contact_v2 import (
     PrecisionObservationBundle,
     PrecisionSkillSupervisor,
     TaskFrameResidualEstimate,
+    TASK_FRAME_V45_RISK_CLASSES,
+    TaskFrameV45CandidateEstimate,
+    TaskFrameV45CandidateNet,
+    TaskFrameV45MicroServoDecision,
     DepthGeometryLocalizerNet,
     LocalGeometryError,
     RECOVERY_MAINLINE_CHECKPOINT,
@@ -40,6 +44,9 @@ from prismatic.robot.coarse2contact_v2 import (
     classify_basin_label,
     classify_visual_evidence_for_basin,
     load_precision_task_spec,
+    load_task_frame_v45_candidate_checkpoint,
+    save_task_frame_v45_candidate_checkpoint,
+    task_frame_v45_micro_servo_step,
 )
 from prismatic.robot.coarse2contact_v2.recovery_audit import planner_bias_xyyaw, recovery_phase_label, trace_episode_index
 from prismatic.robot.coarse2contact_v2.recovery_audit import (
@@ -100,6 +107,7 @@ from prismatic.robot.coarse2contact_v2.grasp_probe_execution import candidate_wi
 from prismatic.robot.coarse2contact_v2.grasp_probe_execution import candidate_xy_correction_ready
 from prismatic.robot.coarse2contact_v2.grasp_probe_execution import grasp_probe_close_arbiter_decision
 from prismatic.robot.coarse2contact_v2.grasp_probe_execution import grasp_probe_close_ready_with_z
+from prismatic.robot.coarse2contact_v2.grasp_probe_execution import planner_gripper_authority_decision
 from prismatic.robot.coarse2contact_v2.grasp_probe_execution import precision_takeover_activation_status
 from prismatic.robot.coarse2contact_v2.grasp_probe_execution import smooth_grasp_probe_xy_step
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_shell_fields
@@ -1503,6 +1511,40 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertFalse(ready_single)
         self.assertEqual(support_single, 1)
         self.assertEqual(reason_single, "support_insufficient_for_low_visibility")
+        soft_current = {
+            "local_geometry_error": {
+                "grasp": {
+                    "valid": False,
+                    "dx": 0.0,
+                    "dy": 0.0,
+                    "confidence": 0.0,
+                    "observability": 0.0,
+                    "fit_residual": 0.0,
+                    "inlier_ratio": 0.0,
+                }
+            },
+            "estimated_basin_error": {
+                "estimated_basin_error_valid": False,
+                "estimated_basin_error_x_valid": False,
+                "estimated_basin_error_y_valid": False,
+                "estimated_basin_error_frame_consistency": 0.0,
+                "estimated_basin_error_proxy_dx": 0.0,
+                "estimated_basin_error_proxy_dy": 0.0,
+            },
+            "grasp_probe_pre_xy_error": 0.030,
+            "wrist_is_low_visibility": True,
+            "visual_observability_class": "low_visibility",
+        }
+        soft_ready, soft_reason, soft_support = loaded.context_ready_from_trace(soft_current, [history])
+        self.assertTrue(soft_ready)
+        self.assertEqual(soft_support, 1)
+        self.assertEqual(soft_reason, "low_visibility_soft_gate")
+        soft_estimate = calibrated_runtime_xy_residual_from_trace(soft_current, loaded, history_rows=[history])
+        self.assertTrue(soft_estimate.entry_ready)
+        self.assertEqual(soft_estimate.reason, "low_visibility_soft_gate")
+        self.assertAlmostEqual(float(soft_estimate.xy_step_scale), 0.12, places=6)
+        self.assertEqual(soft_estimate.xy_risk_reason, "low_visibility_temporal_support")
+        self.assertEqual(soft_estimate.xy_stall_reason, "low_visibility_soft_gate")
         estimate = calibrated_runtime_xy_residual_from_trace(current, loaded, history_rows=[history, history2])
         self.assertTrue(estimate.entry_ready)
         self.assertAlmostEqual(float(estimate.dx), 0.0084, places=6)
@@ -1649,6 +1691,102 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertTrue(all(str(row["source_eval_root"]) != "train_anchor" for row in split.val_records))
         self.assertTrue(all(str(row["source_eval_root"]) != "train_anchor" for row in split.test_records))
         self.assertTrue(any(str(row["source_eval_root"]) == "train_anchor" for row in split.train_records))
+
+    def test_task_frame_v45_checkpoint_roundtrip_and_micro_servo_evaluates_axes_independently(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            model = TaskFrameV45CandidateNet(
+                feature_dim=len(TASK_FRAME_READINESS_FEATURE_NAMES),
+                hidden_dim=32,
+            )
+            for param in model.parameters():
+                torch.nn.init.zeros_(param)
+            with torch.no_grad():
+                model.dz_head.bias.fill_(1.0)
+                model.dyaw_head.bias.fill_(1.0)
+                model.step_scale_head.bias.fill_(-5.5)
+            checkpoint = tmpdir / "v45.pt"
+            metadata = {"schema_version": "unit_test_v45"}
+            save_task_frame_v45_candidate_checkpoint(checkpoint, model, metadata=metadata)
+            loaded, loaded_meta = load_task_frame_v45_candidate_checkpoint(checkpoint)
+            self.assertEqual(loaded_meta["schema_version"], "unit_test_v45")
+            self.assertEqual(loaded.feature_dim, model.feature_dim)
+            self.assertEqual(loaded.hidden_dim, model.hidden_dim)
+            estimate = loaded.predict_numpy(np.ones((len(TASK_FRAME_READINESS_FEATURE_NAMES),), dtype=np.float32))
+            self.assertIsInstance(estimate, TaskFrameV45CandidateEstimate)
+            self.assertFalse(estimate.uses_privileged_runtime)
+            self.assertIn(estimate.risk_reason, TASK_FRAME_V45_RISK_CLASSES)
+            z_readiness = SimpleNamespace(z_observable=True, z_confidence=0.8)
+            yaw_readiness = SimpleNamespace(yaw_observable=True, yaw_ambiguous=False, yaw_confidence=0.8)
+            _, decision_partial, _ = task_frame_v45_micro_servo_step(
+                {
+                    "runtime_features": {"force_norm": 0.01},
+                    "offline_labels": {"dz": 0.01, "dyaw": 0.02, "z_ready": True, "yaw_ready": True, "yaw_ambiguous": False},
+                },
+                model=loaded,
+                history_rows=[],
+                xy_ready=False,
+                z_readiness=z_readiness,
+                yaw_readiness=yaw_readiness,
+                force_safe=True,
+                min_z_confidence=0.2,
+                min_yaw_confidence=0.2,
+                min_step_scale=0.003,
+            )
+            self.assertTrue(decision_partial.z_allowed)
+            self.assertFalse(decision_partial.yaw_allowed)
+            self.assertTrue(decision_partial.applied)
+            self.assertEqual(decision_partial.z_block_reason, "ready")
+            self.assertEqual(decision_partial.yaw_block_reason, "yaw_history_not_stable")
+            _, decision_ready, step = task_frame_v45_micro_servo_step(
+                {
+                    "runtime_features": {"force_norm": 0.01},
+                    "offline_labels": {"dz": 0.01, "dyaw": 0.02, "z_ready": True, "yaw_ready": True, "yaw_ambiguous": False},
+                },
+                model=loaded,
+                history_rows=[
+                    {"task_frame_v45_dyaw": 0.1},
+                    {"task_frame_v45_dyaw": 0.08},
+                ],
+                xy_ready=False,
+                z_readiness=z_readiness,
+                yaw_readiness=yaw_readiness,
+                force_safe=True,
+                min_z_confidence=0.2,
+                min_yaw_confidence=0.2,
+                min_step_scale=0.003,
+            )
+            self.assertTrue(decision_ready.applied)
+            self.assertTrue(decision_ready.yaw_allowed)
+            self.assertGreater(float(step[2]), 0.0)
+            self.assertGreater(float(step[5]), 0.0)
+            _, decision_low_vis, step_low_vis = task_frame_v45_micro_servo_step(
+                {
+                    "runtime_features": {"force_norm": 0.01},
+                    "offline_labels": {"dz": 0.01, "dyaw": 0.02, "z_ready": True, "yaw_ready": True, "yaw_ambiguous": False},
+                    "wrist_is_low_visibility": True,
+                    "visual_observability_class": "low_visibility",
+                },
+                model=loaded,
+                history_rows=[
+                    {"task_frame_v45_dyaw": 0.1},
+                    {"task_frame_v45_dyaw": 0.08},
+                ],
+                xy_ready=False,
+                z_readiness=z_readiness,
+                yaw_readiness=yaw_readiness,
+                force_safe=True,
+                min_z_confidence=0.2,
+                min_yaw_confidence=0.2,
+                min_step_scale=0.2,
+            )
+            self.assertTrue(decision_low_vis.applied)
+            self.assertTrue(decision_low_vis.z_allowed)
+            self.assertTrue(decision_low_vis.yaw_allowed)
+            self.assertGreater(float(step_low_vis[2]), 0.0)
+            self.assertGreater(float(step_low_vis[5]), 0.0)
+            decision_payload = decision_ready.to_dict()
+            self.assertTrue(all("close" not in key for key in decision_payload))
 
     def test_xy_spatial_temporal_generalization_manifest_builds_gate_and_holdout(self) -> None:
         records: list[dict[str, object]] = []
@@ -2186,6 +2324,98 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         )
         self.assertFalse(decision["blocked"])
         self.assertEqual(decision["reason"], "ready")
+
+    def test_planner_gripper_authority_ignores_c2c_close_recommendation_without_planner_close(self) -> None:
+        decision = planner_gripper_authority_decision(
+            planner_gripper_value=1.0,
+            alignment_ready_for_handoff=True,
+            stage_name="RING_GRASP_CONTACT",
+            enabled=True,
+            guard_active=True,
+            active=True,
+            candidate_match=True,
+            gripper_mode="planner_after_handoff",
+            c2c_open_safety_requested=False,
+            c2c_close_recommendation=True,
+        )
+        self.assertEqual(decision["decision"], "open")
+        self.assertFalse(decision["planner_gripper_close_requested"])
+        self.assertTrue(decision["c2c_gripper_close_recommendation_ignored"])
+        self.assertEqual(decision["gripper_authority_source"], "planner_open")
+
+    def test_planner_gripper_authority_blocks_planner_close_until_strict_handoff(self) -> None:
+        decision = planner_gripper_authority_decision(
+            planner_gripper_value=0.0,
+            alignment_ready_for_handoff=False,
+            stage_name="RING_GRASP_CONTACT",
+            enabled=True,
+            guard_active=True,
+            active=True,
+            candidate_match=True,
+            gripper_mode="planner_after_handoff",
+            c2c_open_safety_requested=False,
+            c2c_close_recommendation=True,
+        )
+        self.assertEqual(decision["decision"], "open")
+        self.assertTrue(decision["planner_gripper_close_requested"])
+        self.assertTrue(decision["planner_gripper_close_blocked"])
+        self.assertTrue(decision["c2c_gripper_close_recommendation_ignored"])
+        self.assertEqual(decision["gripper_authority_source"], "planner_close_blocked")
+
+    def test_planner_gripper_authority_allows_planner_close_only_after_handoff(self) -> None:
+        decision = planner_gripper_authority_decision(
+            planner_gripper_value=0.0,
+            alignment_ready_for_handoff=True,
+            stage_name="RING_GRASP_CONTACT",
+            enabled=True,
+            guard_active=True,
+            active=True,
+            candidate_match=True,
+            gripper_mode="planner_after_handoff",
+            c2c_open_safety_requested=False,
+            c2c_close_recommendation=False,
+        )
+        self.assertEqual(decision["decision"], "close")
+        self.assertTrue(decision["planner_gripper_close_allowed"])
+        self.assertTrue(decision["planner_gripper_strict_handoff_ready"])
+        self.assertEqual(decision["gripper_authority_source"], "strict_handoff")
+
+    def test_planner_gripper_authority_open_safety_overrides_planner_close(self) -> None:
+        decision = planner_gripper_authority_decision(
+            planner_gripper_value=0.0,
+            alignment_ready_for_handoff=True,
+            stage_name="RING_GRASP_CONTACT",
+            enabled=True,
+            guard_active=True,
+            active=True,
+            candidate_match=True,
+            gripper_mode="planner_after_handoff",
+            c2c_open_safety_requested=True,
+            c2c_close_recommendation=False,
+        )
+        self.assertEqual(decision["decision"], "open")
+        self.assertTrue(decision["planner_gripper_close_blocked"])
+        self.assertEqual(decision["gripper_authority_source"], "c2c_open_safety")
+
+    def test_planner_gripper_authority_latched_handoff_preserves_planner_close(self) -> None:
+        decision = planner_gripper_authority_decision(
+            planner_gripper_value=0.0,
+            alignment_ready_for_handoff=False,
+            stage_name="RING_LIFT_VERIFY",
+            enabled=True,
+            guard_active=False,
+            active=True,
+            candidate_match=True,
+            gripper_mode="hold",
+            c2c_open_safety_requested=False,
+            c2c_close_recommendation=False,
+            handoff_already_latched=True,
+        )
+        self.assertEqual(decision["decision"], "close")
+        self.assertTrue(decision["planner_gripper_close_allowed"])
+        self.assertFalse(decision["planner_gripper_strict_handoff_ready"])
+        self.assertTrue(decision["planner_gripper_handoff_latched"])
+        self.assertEqual(decision["gripper_authority_source"], "planner_after_prior_handoff")
 
     def test_alignment_takeover_sticky_expiry_does_not_end_session(self) -> None:
         cfg = AlignmentTakeoverConfig(max_control_steps=24, reacquire_steps=8)

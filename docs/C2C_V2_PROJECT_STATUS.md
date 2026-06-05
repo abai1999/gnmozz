@@ -36,9 +36,20 @@ Current objective:
   - `runtime_artifacts/coarse2contact_v2/checkpoints/v44_task_frame_yaw_readiness.pt`
 - The current readiness dataset is:
   - `runtime_artifacts/coarse2contact_v2/datasets/task_frame_readiness_v43_v44.jsonl`
+- Close ownership has been tightened to planner-owned close plus C2C open-only
+  safety. C2C contact/force stages may monitor contact, request open for
+  safety, or emit a close recommendation for trace/debug, but they may not
+  directly write a close command to `final_action[6]`.
+- The unified gripper authority trace now records
+  `planner_gripper_close_requested`, `planner_gripper_close_blocked`,
+  `planner_gripper_handoff_allowed`,
+  `planner_gripper_strict_handoff_ready`, `planner_gripper_handoff_latched`,
+  `c2c_gripper_open_safety_requested`,
+  `c2c_gripper_close_recommendation_ignored`, and
+  `gripper_authority_source`.
 - The latest review and smoke verification show the strict handoff gate still
   blocks planner close correctly under v43/v44; `pytest tests/test_coarse2contact_v2.py -q`
-  currently passes with `172` tests.
+  currently passes with `178` tests.
 - The first v43/v44 handoff audit found 5 offline-ready rows in the selected
   random/generalization slices, all on the same random10 trace tail
   (`ep009`, steps `156-160`). Those source traces do not contain the current
@@ -61,6 +72,8 @@ Success means:
 - v44 Yaw readiness blocks ambiguous / alias-drift rows instead of forcing them
   ready
 - no reopening of `alignment_ready_for_handoff` or `close_ready`
+- no direct C2C close ownership; every close command must be planner intent
+  allowed by strict handoff or by an already latched prior strict handoff
 - the runtime gate eventually recovers some of the offline-ready rows without
   reopening false positives
 
@@ -153,7 +166,12 @@ The desired division of labor is:
 - The VLA planner performs coarse motion toward task subgoals.
 - C2C activates only after the planner reaches a configured precision region.
 - C2C takes ownership of high-precision subskills such as small-object grasp
-  alignment, aperture-to-spoke alignment, guarded slide, and recovery.
+  alignment, aperture-to-spoke alignment, guarded slide, recovery, contact
+  monitoring, and open-only gripper safety.
+- The planner owns close intent. C2C can allow that intent only through
+  `alignment_ready_for_handoff`; after a valid handoff, later closed-gripper
+  hold still comes from planner intent and can still be overridden open by C2C
+  safety.
 - C2C must be non-privileged at runtime: no RLBench object handles, teacher
   targets, success poses, or mask-driven control.
 - Privileged masks/poses may be used only offline for audit, relabeling,

@@ -4,6 +4,8 @@ This document is the next concrete action plan after promoting
 `v42_expanded_v4pilot` to the active XY baseline. The goal is to turn the
 current XY-only precision pullback into a strict, non-privileged
 `alignment_ready_for_handoff` path without loosening close authority.
+The current close authority policy is planner-owned close plus C2C open-only
+safety.
 
 ## Clear Objective
 
@@ -19,6 +21,31 @@ all satisfied on held-out failure tails.**
 
 This is a readiness milestone first, not a new control milestone. C2C still
 does not own close. `close_ready` remains legacy/offline diagnostic only.
+
+## Close Ownership Contract
+
+Runtime close authority is now centralized in
+`planner_gripper_authority_decision(...)`.
+
+- Planner close intent is the only source that can close the gripper.
+- `alignment_ready_for_handoff=true` is required for the first close handoff.
+- After a valid strict handoff, a latched planner close may remain closed in
+  later contact/verify stages, but the source is still planner intent.
+- C2C can request open for safety during reacquire, recovery, invalid action,
+  unstable contact, or failed contact monitoring.
+- C2C close recommendations are trace/debug signals and are ignored unless the
+  planner also requests close and strict handoff policy allows it.
+
+Required trace fields for every runtime smoke:
+
+- `planner_gripper_close_requested`
+- `planner_gripper_close_blocked`
+- `planner_gripper_handoff_allowed`
+- `planner_gripper_strict_handoff_ready`
+- `planner_gripper_handoff_latched`
+- `c2c_gripper_open_safety_requested`
+- `c2c_gripper_close_recommendation_ignored`
+- `gripper_authority_source`
 
 ## Implementation Status
 
@@ -194,6 +221,10 @@ Wire v42 XY + v43 Z readiness + v44 Yaw readiness into the existing
 `TaskFrameResidualEstimate` / `AlignmentTakeoverSession` path and verify that
 planner close is allowed only when strict handoff is true.
 
+This phase also keeps the task contract aligned with runtime semantics:
+`RING_GRASP_CONTACT` is a contact/force monitor stage with
+`gripper_mode: planner_after_handoff`, not a C2C-owned direct-close stage.
+
 ### Required Trace Fields
 
 Every smoke and validation trace should include:
@@ -212,6 +243,11 @@ Every smoke and validation trace should include:
 - `alignment_ready_for_handoff`
 - `alignment_handoff_block_reason`
 - `planner_gripper_close_blocked`
+- `planner_gripper_close_requested`
+- `planner_gripper_handoff_allowed`
+- `c2c_gripper_open_safety_requested`
+- `c2c_gripper_close_recommendation_ignored`
+- `gripper_authority_source`
 - `uses_privileged_runtime=false`
 
 ### Acceptance Gate
@@ -230,7 +266,9 @@ The handoff path is acceptable only if:
 
 Only after readiness is validated:
 
-- v46 can test guarded Z micro-servo:
+- v45 can also carry the first guarded Z/Yaw residual-readiness candidate if
+  used strictly as bounded micro-servo plus trace, never as close authority.
+- v46 can test broader guarded Z micro-servo:
   small step, low speed, force guarded, only when v42 XY is ready and v43 says
   Z is observable.
 - v47 can test bounded yaw servo:

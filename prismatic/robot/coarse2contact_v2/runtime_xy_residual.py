@@ -27,6 +27,7 @@ from .learned_localizer import _ImageEncoder, _roi_center_from_prior
 RUNTIME_XY_NORMALIZATION_STD_FLOOR = 1.0e-3
 RUNTIME_XY_NORMALIZED_FEATURE_CLIP = 10.0
 RUNTIME_XY_MAX_RESIDUAL_NORM = 0.18
+RUNTIME_XY_SOFT_ACTIVATION_RADIUS = 0.04
 RUNTIME_XY_DIRECTION_MIN_COSINE = 0.25
 RUNTIME_XY_LOW_VIS_DIRECTION_MIN_COSINE = 0.50
 RUNTIME_XY_SPATIAL_TEMPORAL_HISTORY_WINDOW = 6
@@ -778,6 +779,26 @@ def _runtime_xy_low_visibility(row: Mapping[str, Any], base: GraspFrameResidualE
     return vis in {"occluded", "low_visibility", "low_observability", "partial_observable", "partial_observation"}
 
 
+def _runtime_xy_error_norm(row: Mapping[str, Any], base: GraspFrameResidualEstimate | None = None) -> float:
+    for key in ("grasp_probe_pre_xy_error", "grasp_probe_horizon_final_xy_error", "xy_error", "c2c_gate_target_xy_error"):
+        try:
+            value = float(row.get(key, float("nan")))
+        except Exception:
+            continue
+        if np.isfinite(value):
+            return float(max(0.0, value))
+    if base is not None and (bool(base.entry_ready) or bool(base.visual_evidence_valid) or bool(base.calibrated_proxy_valid)):
+        if np.all(np.isfinite([base.dx, base.dy])):
+            return float(np.hypot(float(base.dx), float(base.dy)))
+    grasp = _nested(row, "local_geometry_error", "grasp")
+    if grasp and _runtime_xy_signal_available(row):
+        dx = _as_float(grasp.get("dx"), float("nan"))
+        dy = _as_float(grasp.get("dy"), float("nan"))
+        if np.isfinite(dx) and np.isfinite(dy):
+            return float(np.hypot(dx, dy))
+    return float("nan")
+
+
 def _runtime_xy_context_support_metrics(
     row: Mapping[str, Any],
     history_rows: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]] | None,
@@ -839,7 +860,21 @@ def _runtime_xy_context_support_ready(
     support_rows = int(metrics["support_rows"])
     recent_support_rows = int(metrics.get("recent_support_rows", 0))
     support_age = int(metrics.get("support_age", window_size))
+    current_xy_error = _runtime_xy_error_norm(row)
+    within_soft_radius = bool(np.isfinite(current_xy_error) and current_xy_error <= float(RUNTIME_XY_SOFT_ACTIVATION_RADIUS) + 1.0e-9)
     if bool(metrics["low_visibility"]):
+        if within_soft_radius:
+            if (
+                support_rows >= 2
+                and recent_support_rows >= 2
+                and support_age <= min(2, max(0, int(window_size) - 1))
+                and float(metrics["direction_confidence"]) >= 0.60
+                and float(metrics["sign_stability"]) >= 0.80
+            ):
+                return True, "history_supported_low_visibility", support_rows
+            if support_rows >= 1:
+                return True, "low_visibility_soft_gate", support_rows
+            return True, "low_visibility_soft_gate", support_rows
         if (
             support_rows >= 2
             and recent_support_rows >= 2
@@ -872,6 +907,8 @@ def _runtime_xy_context_policy(
     direction_confidence = float(metrics["direction_confidence"])
     sign_stability = float(metrics["sign_stability"])
     low_visibility = bool(metrics["low_visibility"])
+    current_xy_error = _runtime_xy_error_norm(row, base)
+    within_soft_radius = bool(np.isfinite(current_xy_error) and current_xy_error <= float(RUNTIME_XY_SOFT_ACTIVATION_RADIUS) + 1.0e-9)
     ready = bool(base.entry_ready)
     reason = str(base.reason)
     step_scale = 1.0
@@ -879,7 +916,7 @@ def _runtime_xy_context_policy(
     stall_reason = ""
     if low_visibility:
         risk_reason = "low_visibility_temporal_support"
-        if (
+        if within_soft_radius and (
             support_rows >= 2
             and recent_support_rows >= 2
             and support_age <= min(2, max(0, int(window_size) - 1))
@@ -889,6 +926,20 @@ def _runtime_xy_context_policy(
             ready = True
             reason = "history_supported_low_visibility"
             step_scale = 0.35
+        elif within_soft_radius:
+            ready = True
+            if support_rows >= 2:
+                reason = "direction_stability_low"
+                step_scale = 0.18
+                stall_reason = "direction_stability_low"
+            elif support_rows >= 1:
+                reason = "low_visibility_soft_gate"
+                step_scale = 0.12
+                stall_reason = "low_visibility_soft_gate"
+            else:
+                reason = "low_visibility_soft_gate"
+                step_scale = 0.08
+                stall_reason = "low_visibility_soft_gate"
         else:
             ready = False
             if support_rows >= 2:
@@ -1263,6 +1314,8 @@ def _spatial_temporal_policy(
     direction_confidence = float(metrics["direction_confidence"])
     sign_stability = float(metrics["sign_stability"])
     low_visibility = bool(metrics["low_visibility"])
+    current_xy_error = _runtime_xy_error_norm(row, base)
+    within_soft_radius = bool(np.isfinite(current_xy_error) and current_xy_error <= float(RUNTIME_XY_SOFT_ACTIVATION_RADIUS) + 1.0e-9)
     ready = bool(base.entry_ready)
     step_scale = 1.0
     risk_reason = ""
@@ -1270,25 +1323,38 @@ def _spatial_temporal_policy(
     reason = str(base.reason)
     if low_visibility:
         risk_reason = "low_visibility"
-        if support_rows >= 2 and recent_support_rows >= 2 and direction_confidence >= 0.60 and sign_stability >= 0.80:
+        if within_soft_radius and support_rows >= 2 and recent_support_rows >= 2 and direction_confidence >= 0.60 and sign_stability >= 0.80:
             ready = True
             reason = "history_supported_low_visibility"
             step_scale = 0.35
-        elif support_rows >= 2:
-            ready = False
-            reason = "direction_stability_low"
-            step_scale = 0.15
-            stall_reason = "direction_stability_low"
-        elif support_rows >= 1:
-            ready = False
-            reason = "support_insufficient_for_low_visibility"
-            step_scale = 0.08
-            stall_reason = "support_insufficient_for_low_visibility"
+        elif within_soft_radius:
+            ready = True
+            if support_rows >= 2:
+                reason = "direction_stability_low"
+                step_scale = 0.18
+                stall_reason = "direction_stability_low"
+            elif support_rows >= 1:
+                reason = "low_visibility_soft_gate"
+                step_scale = 0.12
+                stall_reason = "low_visibility_soft_gate"
+            else:
+                reason = "low_visibility_soft_gate"
+                step_scale = 0.08
+                stall_reason = "low_visibility_soft_gate"
         else:
             ready = False
-            reason = "low_visibility_no_support"
-            step_scale = 0.0
-            stall_reason = "low_visibility_no_support"
+            if support_rows >= 2:
+                reason = "direction_stability_low"
+                step_scale = 0.15
+                stall_reason = "direction_stability_low"
+            elif support_rows >= 1:
+                reason = "support_insufficient_for_low_visibility"
+                step_scale = 0.08
+                stall_reason = "support_insufficient_for_low_visibility"
+            else:
+                reason = "low_visibility_no_support"
+                step_scale = 0.0
+                stall_reason = "low_visibility_no_support"
     if support_age > int(max(1, window_size)) - 1:
         risk_reason = "+".join(x for x in (risk_reason, "stale_support") if x)
         if ready:
