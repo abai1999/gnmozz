@@ -36,6 +36,9 @@ Current objective:
   - `runtime_artifacts/coarse2contact_v2/checkpoints/v44_task_frame_yaw_readiness.pt`
 - The current readiness dataset is:
   - `runtime_artifacts/coarse2contact_v2/datasets/task_frame_readiness_v43_v44.jsonl`
+- The latest review and smoke verification show the strict handoff gate still
+  blocks planner close correctly under v43/v44; `pytest tests/test_coarse2contact_v2.py -q`
+  currently passes with `172` tests.
 
 Success means:
 

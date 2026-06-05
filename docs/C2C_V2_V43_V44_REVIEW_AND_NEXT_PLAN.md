@@ -18,6 +18,18 @@ path, but it is a readiness milestone, not a Z/Yaw control milestone.
 - Planner close must still be allowed only by
   `alignment_ready_for_handoff=true`.
 
+The latest local verification supports that framing:
+
+- `conda run -n vla-adapter pytest tests/test_coarse2contact_v2.py -q`
+  completed with `172 passed`
+- the strict-handoff smoke trace summary on
+  `runtime_artifacts/coarse2contact_v2/eval_z_yaw_v43_v44_mp4_front_wrist_120/gripper_traces`
+  reported `28` planner close requests and `28` blocked close requests, with
+  `0` handoff-allowed rows
+- the dominant block reasons were still Z/Yaw readiness failures such as
+  `z_not_ready+yaw_not_ready+yaw_ambiguous`, which is exactly what we want
+  from a conservative readiness gate
+
 The active checkpoints are:
 
 - `runtime_artifacts/coarse2contact_v2/checkpoints/v43_task_frame_z_readiness.pt`
@@ -59,6 +71,12 @@ same feature contract works for both training rows and runtime rows.
 A regression test now checks that compact readiness dataset rows expose these
 fields through `task_frame_readiness_feature_vector()`.
 
+This fix matters because it removes a real train/runtime asymmetry. Without it,
+the readiness heads could learn from compact rows that had zeroed runtime-visible
+inputs and then be evaluated on runtime traces where those fields were actually
+populated. That would have made the Z/Yaw heads look better or worse for the
+wrong reason.
+
 ### Correct: strict handoff remains the only close source
 
 The evaluator loads v43 and v44, applies them to `TaskFrameResidualEstimate`,
@@ -80,6 +98,11 @@ These are root-held-out readiness metrics, not closed-loop success metrics.
 They show that the readiness heads can classify the offline labels, but they do
 not yet prove that runtime handoff will become true at the right moments or
 that the first task stage succeeds end to end.
+
+The 120-step MP4 smoke reinforces that boundary. It shows the gate is
+conservative and close-blocking is intact, but it does not yet show a real
+handoff event. That is evidence of correctness of the contract, not proof that
+the final first-stage operation has been solved.
 
 ### Risk: yaw labels may be too easy
 
@@ -129,6 +152,12 @@ Run a dedicated v43/v44 handoff audit on:
 - random10 generalization
 - hard-bucket active rows
 - low-visibility and occlusion slices
+
+This phase is the immediate next action. It should be treated as a review gate,
+not as optional diagnostics. The goal is to prove that the current strict
+handoff predicate stays conservative on the failure tails that matter most:
+random slices, hard-bucket active rows, and the low-observability regime where
+false positives would be the most expensive.
 
 Required report fields:
 
@@ -183,6 +212,18 @@ Initial Z control constraints:
 
 Yaw control remains out of scope until yaw readiness is validated on richer
 visual slices and a separate dyaw estimator is trained.
+
+## Review Conclusion
+
+The review outcome is positive but bounded:
+
+1. The implementation is consistent with the project contract.
+2. The compact/runtime feature mismatch was real and is now fixed.
+3. The runtime close gate still behaves conservatively under smoke.
+4. The remaining work is not more close plumbing; it is trace-level proof on
+   the actual failure tails, followed by a cautious decision about guarded Z.
+
+That means the best next move is still to audit, not to widen the gate.
 
 ## Non-Goals
 
