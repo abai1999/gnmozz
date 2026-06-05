@@ -41,9 +41,11 @@ Current objective:
   currently passes with `172` tests.
 - The first v43/v44 handoff audit found 5 offline-ready rows in the selected
   random/generalization slices, all on the same random10 trace tail
-  (`ep009`, steps `156-160`), but runtime still kept them at
-  `alignment_ready_for_handoff=false`. The strict-smoke traces also showed no
-  planner-close leak: every close request was blocked.
+  (`ep009`, steps `156-160`). Those source traces do not contain the current
+  v43/v44 runtime handoff/readiness fields, so they should be treated as replay
+  targets for current-runtime recall, not as proven current-runtime false
+  negatives. The strict-smoke traces did show no planner-close leak: every
+  close request was blocked.
 
 Success means:
 

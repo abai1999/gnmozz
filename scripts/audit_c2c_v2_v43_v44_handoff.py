@@ -128,7 +128,13 @@ def audit_offline_and_runtime(
 
             offline = _offline_labels_from_row(ds)
             offline_ready = bool(offline.get("alignment_ready_for_handoff", False))
-            runtime_ready = bool(tr.get("alignment_ready_for_handoff", False))
+            runtime_handoff_present = "alignment_ready_for_handoff" in tr
+            runtime_readiness_loaded = bool(
+                tr.get("task_frame_z_readiness_loaded", False)
+                or tr.get("task_frame_yaw_readiness_loaded", False)
+                or "task_frame_residual_estimate" in tr
+            )
+            runtime_ready = bool(tr.get("alignment_ready_for_handoff", False)) if runtime_handoff_present else False
             close_requested = bool(tr.get("planner_gripper_close_requested", False))
             close_blocked = bool(tr.get("planner_gripper_close_blocked", False))
             close_reason = str(tr.get("alignment_handoff_block_reason", ""))
@@ -146,10 +152,20 @@ def audit_offline_and_runtime(
                 per_group[group]["offline_ready_rows"] += 1
                 per_bucket[bucket]["offline_ready_rows"] += 1
                 per_obs[obs]["offline_ready_rows"] += 1
-                if runtime_ready:
-                    summary["runtime_ready_on_offline_ready_rows"] += 1
+                if runtime_handoff_present:
+                    summary["runtime_evaluable_offline_ready_rows"] += 1
                 else:
+                    summary["runtime_missing_handoff_field_on_offline_ready_rows"] += 1
+                if runtime_readiness_loaded:
+                    summary["runtime_readiness_loaded_on_offline_ready_rows"] += 1
+                else:
+                    summary["runtime_readiness_missing_on_offline_ready_rows"] += 1
+                if runtime_handoff_present and runtime_ready:
+                    summary["runtime_ready_on_offline_ready_rows"] += 1
+                elif runtime_handoff_present:
                     summary["runtime_not_ready_on_offline_ready_rows"] += 1
+                else:
+                    summary["runtime_ready_unknown_on_offline_ready_rows"] += 1
                 if close_requested:
                     summary["close_requested_on_offline_ready_rows"] += 1
                     if close_blocked:
@@ -169,7 +185,9 @@ def audit_offline_and_runtime(
                             "offline_z_ready": bool(offline.get("z_ready", False)),
                             "offline_yaw_ready": bool(offline.get("yaw_ready", False)),
                             "offline_alignment_ready_for_handoff": offline_ready,
-                            "runtime_alignment_ready_for_handoff": runtime_ready,
+                            "runtime_handoff_field_present": runtime_handoff_present,
+                            "runtime_readiness_loaded": runtime_readiness_loaded,
+                            "runtime_alignment_ready_for_handoff": runtime_ready if runtime_handoff_present else None,
                             "planner_gripper_close_requested": close_requested,
                             "planner_gripper_close_blocked": close_blocked,
                             "alignment_handoff_block_reason": close_reason,
@@ -201,8 +219,13 @@ def audit_offline_and_runtime(
         "rows": int(summary["rows"]),
         "offline_ready_rows": int(summary["offline_ready_rows"]),
         "runtime_ready_rows": int(summary["runtime_ready_rows"]),
+        "runtime_evaluable_offline_ready_rows": int(summary["runtime_evaluable_offline_ready_rows"]),
+        "runtime_missing_handoff_field_on_offline_ready_rows": int(summary["runtime_missing_handoff_field_on_offline_ready_rows"]),
+        "runtime_readiness_loaded_on_offline_ready_rows": int(summary["runtime_readiness_loaded_on_offline_ready_rows"]),
+        "runtime_readiness_missing_on_offline_ready_rows": int(summary["runtime_readiness_missing_on_offline_ready_rows"]),
         "runtime_ready_on_offline_ready_rows": int(summary["runtime_ready_on_offline_ready_rows"]),
         "runtime_not_ready_on_offline_ready_rows": int(summary["runtime_not_ready_on_offline_ready_rows"]),
+        "runtime_ready_unknown_on_offline_ready_rows": int(summary["runtime_ready_unknown_on_offline_ready_rows"]),
         "runtime_ready_offline_mismatch_rows": int(summary["runtime_ready_offline_mismatch_rows"]),
         "close_requested_on_offline_ready_rows": int(summary["close_requested_on_offline_ready_rows"]),
         "close_blocked_on_offline_ready_rows": int(summary["close_blocked_on_offline_ready_rows"]),
@@ -273,6 +296,9 @@ def write_report(report: Mapping[str, Any], output_dir: Path) -> None:
         "",
         f"- offline_ready_rows: `{report['offline_audit']['offline_ready_rows']}`",
         f"- runtime_ready_rows: `{report['offline_audit']['runtime_ready_rows']}`",
+        f"- runtime_evaluable_offline_ready_rows: `{report['offline_audit']['runtime_evaluable_offline_ready_rows']}`",
+        f"- runtime_ready_unknown_on_offline_ready_rows: `{report['offline_audit']['runtime_ready_unknown_on_offline_ready_rows']}`",
+        f"- runtime_readiness_missing_on_offline_ready_rows: `{report['offline_audit']['runtime_readiness_missing_on_offline_ready_rows']}`",
         f"- runtime_ready_offline_mismatch_rows: `{report['offline_audit']['runtime_ready_offline_mismatch_rows']}`",
         f"- close_requested_on_offline_ready_rows: `{report['offline_audit']['close_requested_on_offline_ready_rows']}`",
         f"- close_allowed_on_offline_ready_rows: `{report['offline_audit']['close_allowed_on_offline_ready_rows']}`",
@@ -281,13 +307,17 @@ def write_report(report: Mapping[str, Any], output_dir: Path) -> None:
         "",
         "The audit stays conservative: no runtime handoff false positives were found in the selected slices, and the strict-smoke traces kept planner close blocked whenever the gate was active.",
         "",
+        "Offline-ready rows whose source traces lack current v43/v44 runtime handoff/readiness fields are recall targets for replay, not current-runtime false negatives.",
+        "",
         "## Offline Ready Examples",
     ]
     for item in report["offline_audit"]["offline_ready_examples"]:
         lines.append(
             f"- ep`{item['episode_idx']:03d}` step=`{item['step']}` group=`{item['group']}` "
             f"bucket=`{item['bucket']}` obs=`{item['observability_bucket']}` "
-            f"offline=`{item['offline_alignment_ready_for_handoff']}` runtime=`{item['runtime_alignment_ready_for_handoff']}` "
+            f"offline=`{item['offline_alignment_ready_for_handoff']}` "
+            f"runtime_field=`{item['runtime_handoff_field_present']}` runtime_readiness=`{item['runtime_readiness_loaded']}` "
+            f"runtime=`{item['runtime_alignment_ready_for_handoff']}` "
             f"close_req=`{item['planner_gripper_close_requested']}` close_blk=`{item['planner_gripper_close_blocked']}` "
             f"reason=`{item['alignment_handoff_block_reason']}`"
         )

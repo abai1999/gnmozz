@@ -35,12 +35,15 @@ The dedicated v43/v44 handoff audit also found:
 - 5 offline-ready rows in the selected random/generalization slices
 - all 5 offline-ready rows came from the same random10 trace tail
   (`ep009`, steps `156-160`)
-- every one of those offline-ready rows stayed `runtime_ready=false`
+- those source traces do not contain current v43/v44 runtime handoff/readiness
+  fields, so they are replay targets for the current runtime rather than proven
+  current-runtime false negatives
 - there were no runtime-ready false positives and no planner-close leaks in
   the strict-smoke traces
 
-That is the right failure mode for now: the gate is conservative, and the
-current task is to keep improving recall without opening a false-positive path.
+That is the right evidence boundary for now: the gate is conservative in the
+strict-smoke traces, and the offline-ready `ep009` tail gives us a concrete
+recall target that must be replayed under the current v42+v43+v44 runtime.
 
 The active checkpoints are:
 
@@ -172,9 +175,10 @@ random slices, hard-bucket active rows, and the low-observability regime where
 false positives would be the most expensive.
 
 The first audit pass already produced a useful boundary condition:
-offline-ready examples exist, but the runtime gate still does not promote
-them to handoff-ready, and strict smoke still blocks every planner close.
-That gives us a safe baseline for the next recall-oriented iteration.
+offline-ready examples exist, but their original source traces do not include
+current v43/v44 runtime readiness fields. Strict smoke still blocks every
+planner close, so the close safety story is intact; the next recall-oriented
+iteration must replay those offline-positive windows under the current runtime.
 
 Required report fields:
 
