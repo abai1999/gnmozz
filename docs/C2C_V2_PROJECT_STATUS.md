@@ -39,6 +39,11 @@ Current objective:
 - The latest review and smoke verification show the strict handoff gate still
   blocks planner close correctly under v43/v44; `pytest tests/test_coarse2contact_v2.py -q`
   currently passes with `172` tests.
+- The first v43/v44 handoff audit found 5 offline-ready rows in the selected
+  random/generalization slices, all on the same random10 trace tail
+  (`ep009`, steps `156-160`), but runtime still kept them at
+  `alignment_ready_for_handoff=false`. The strict-smoke traces also showed no
+  planner-close leak: every close request was blocked.
 
 Success means:
 
@@ -49,6 +54,8 @@ Success means:
 - v44 Yaw readiness blocks ambiguous / alias-drift rows instead of forcing them
   ready
 - no reopening of `alignment_ready_for_handoff` or `close_ready`
+- the runtime gate eventually recovers some of the offline-ready rows without
+  reopening false positives
 
 Current status snapshot:
 
