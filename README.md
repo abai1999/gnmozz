@@ -3,6 +3,12 @@
 VLA2 is a clean planner-oriented fork of the original VLA project, with a
 parallel Coarse2Contact v2 research line for high-precision local skills.
 
+Project defaults:
+
+- Runtime environment: `conda run -n vla-adapter ...`
+- Fixed planner checkpoint:
+  `/home/guoning/code/VLA2/pretrained_models/planner_checkpoints/insert_onto_square_peg_30000_chkpt`
+
 Mainline scope:
 
 - frozen VLA planner training

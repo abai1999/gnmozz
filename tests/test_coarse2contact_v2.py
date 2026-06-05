@@ -85,6 +85,10 @@ from scripts.diagnose_c2c_v2_prior_only_abstain import classify_prior_only_sourc
 from scripts.diagnose_c2c_v2_xy_correction_hard_validation import diagnose_active_row, summarize as summarize_xy_correction_hard_validation
 from scripts.summarize_c2c_v2_alignment_takeover_smoke import summarize as summarize_alignment_takeover_smoke
 from scripts.train_c2c_v2_runtime_xy_calibrator import train as train_runtime_xy_calibrator
+from scripts.train_c2c_v2_xy_spatial_temporal import _load_generalization_gate_roots
+from scripts.train_c2c_v2_xy_spatial_temporal import _selection_score
+from scripts.train_c2c_v2_xy_spatial_temporal import _worst_case_selection_score
+from scripts.train_c2c_v2_xy_spatial_temporal import _step_scale_target_from_xy_error
 from scripts.eval_c2c_v2_frame_yaw_estimator import evaluate as evaluate_frame_yaw_estimator
 from scripts.diagnose_c2c_v2_yaw_frame_alignment import diagnose as diagnose_yaw_frame_alignment
 from scripts.mine_c2c_v2_yaw_positive_windows import mine as mine_yaw_positive_windows
@@ -100,8 +104,17 @@ from prismatic.robot.coarse2contact_v2.grasp_probe_execution import precision_ta
 from prismatic.robot.coarse2contact_v2.grasp_probe_execution import smooth_grasp_probe_xy_step
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_shell_fields
 from prismatic.robot.coarse2contact_v2.grasp_probe_shell import grasp_probe_inactive_reason
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import DEFAULT_RUNTIME_XY_FEATURE_NAMES
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import calibrated_runtime_xy_residual_from_trace
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import estimate_runtime_xy_residual
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RuntimeXYAffineCalibration, RuntimeXYMLPCalibration
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RuntimeXYSpatialTemporalCalibration
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import XYSpatialTemporalHeadNet
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import runtime_xy_context_feature_names, runtime_xy_context_feature_vector_from_trace
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import runtime_xy_spatial_temporal_feature_names
+from prismatic.robot.coarse2contact_v2.task_frame_readiness import TASK_FRAME_READINESS_FEATURE_NAMES
+from prismatic.robot.coarse2contact_v2.task_frame_readiness import task_frame_readiness_feature_vector
+from prismatic.robot.coarse2contact_v2.xy_spatial_temporal_generalization import build_generalization_manifest, split_records_by_source_root
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1366,6 +1379,562 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertTrue(report["runtime_upgrade_gate"]["requires_hard_bucket_runtime_ab"])
         self.assertFalse(report["uses_privileged_runtime"])
 
+    def test_runtime_xy_temporal_context_uses_history_rows(self) -> None:
+        base_feature_names = (
+            "local_dx",
+            "local_dy",
+            "estimated_proxy_dx",
+            "estimated_proxy_dy",
+            "local_confidence",
+            "local_observability",
+            "local_fit_residual",
+            "local_inlier_ratio",
+            "frame_consistency",
+        )
+        current = {
+            "local_geometry_error": {
+                "grasp": {
+                    "dx": 0.024,
+                    "dy": -0.012,
+                    "confidence": 0.2,
+                    "observability": 0.001,
+                    "fit_residual": 0.001,
+                    "inlier_ratio": 0.9,
+                }
+            },
+            "estimated_basin_error": {
+                "proxy_dx": 0.024,
+                "proxy_dy": -0.012,
+                "frame_consistency": 0.9,
+            },
+            "wrist_valid_depth_ratio": 0.1,
+            "wrist_depth_near_fraction": 0.1,
+            "wrist_is_occluded": True,
+            "wrist_is_low_visibility": True,
+            "visual_observability_class": "occluded",
+            "c2c_stage_age": 1,
+            "grasp_probe_pre_xy_error": 0.027,
+            "grasp_probe_residual_norm_xy": 0.027,
+            "grasp_probe_runtime_estimator_residual_norm_xy": 0.0,
+        }
+        history = {
+            "local_geometry_error": {
+                "grasp": {
+                    "dx": 0.024,
+                    "dy": -0.012,
+                    "confidence": 0.9,
+                    "observability": 0.02,
+                    "fit_residual": 0.001,
+                    "inlier_ratio": 0.95,
+                }
+            },
+            "estimated_basin_error": {
+                "proxy_dx": 0.024,
+                "proxy_dy": -0.012,
+                "frame_consistency": 0.9,
+            },
+            "wrist_valid_depth_ratio": 0.8,
+            "wrist_depth_near_fraction": 0.7,
+            "wrist_is_occluded": False,
+            "wrist_is_low_visibility": False,
+            "c2c_stage_age": 8,
+            "grasp_probe_pre_xy_error": 0.027,
+            "grasp_probe_residual_norm_xy": 0.027,
+            "grasp_probe_runtime_estimator_residual_norm_xy": 0.0,
+            "grasp_probe_applied_xy_step_local_6d": [-0.004, 0.002, 0.0, 0.0, 0.0, 0.0],
+            "grasp_probe_local_command_local_6d": [-0.004, 0.002, 0.0, 0.0, 0.0, 0.0],
+            "c2c_gate_localizer_visible": True,
+            "c2c_gate_depth_nearfield": True,
+            "c2c_gate_target_xy_error": 0.027,
+        }
+        names = runtime_xy_context_feature_names(base_feature_names, 2)
+        vec = runtime_xy_context_feature_vector_from_trace(current, [history], base_feature_names=base_feature_names, window_size=2)
+        self.assertEqual(vec.shape[0], len(names))
+        self.assertAlmostEqual(float(vec[names.index("lag0_local_dx")]), 0.024, places=6)
+        self.assertAlmostEqual(float(vec[names.index("lag1_local_dx")]), 0.024, places=6)
+        self.assertAlmostEqual(float(vec[names.index("lag1_grasp_probe_applied_xy_step_x")]), -0.004, places=6)
+
+        weights = np.zeros((2, len(names)), dtype=np.float32)
+        weights[0, names.index("lag1_local_dx")] = 1.0
+        weights[1, names.index("lag1_local_dy")] = 1.0
+        cal = RuntimeXYMLPCalibration(
+            feature_names=names,
+            layers=((weights, np.zeros((2,), dtype=np.float32)),),
+            feature_mean=np.zeros((len(names),), dtype=np.float32),
+            feature_std=np.ones((len(names),), dtype=np.float32),
+            window_size=2,
+            base_feature_names=base_feature_names,
+            source="unit_test",
+        )
+        loaded = RuntimeXYAffineCalibration.from_dict(cal.to_dict())
+        self.assertIsInstance(loaded, RuntimeXYMLPCalibration)
+        pred, features = loaded.predict_from_trace(current, history_rows=[history])
+        self.assertAlmostEqual(float(pred[0]), 0.024, places=6)
+        self.assertAlmostEqual(float(pred[1]), -0.012, places=6)
+        self.assertAlmostEqual(float(features[names.index("lag1_local_dx")]), 0.024, places=6)
+        history2 = dict(history)
+        ready, reason, support_rows = loaded.context_ready_from_trace(current, [history, history2])
+        self.assertTrue(ready)
+        self.assertGreaterEqual(support_rows, 2)
+        self.assertEqual(reason, "history_supported_low_visibility")
+        weak_current = {
+            "local_geometry_error": {
+                "grasp": {
+                    "valid": False,
+                    "dx": 0.0,
+                    "dy": 0.0,
+                    "confidence": 0.0,
+                    "observability": 0.0,
+                    "fit_residual": 0.0,
+                    "inlier_ratio": 0.0,
+                }
+            },
+            "estimated_basin_error": {
+                "estimated_basin_error_valid": False,
+                "estimated_basin_error_x_valid": False,
+                "estimated_basin_error_y_valid": False,
+                "estimated_basin_error_frame_consistency": 0.0,
+                "estimated_basin_error_proxy_dx": 0.0,
+                "estimated_basin_error_proxy_dy": 0.0,
+            },
+            "wrist_is_low_visibility": True,
+        }
+        ready_single, reason_single, support_single = loaded.context_ready_from_trace(weak_current, [history])
+        self.assertFalse(ready_single)
+        self.assertEqual(support_single, 1)
+        self.assertEqual(reason_single, "support_insufficient_for_low_visibility")
+        estimate = calibrated_runtime_xy_residual_from_trace(current, loaded, history_rows=[history, history2])
+        self.assertTrue(estimate.entry_ready)
+        self.assertAlmostEqual(float(estimate.dx), 0.0084, places=6)
+        self.assertAlmostEqual(float(estimate.dy), -0.0042, places=6)
+        self.assertAlmostEqual(float(estimate.xy_step_scale), 0.35, places=6)
+        self.assertGreater(float(estimate.xy_direction_confidence), 0.0)
+        self.assertGreater(float(estimate.xy_sign_stability), 0.0)
+        self.assertEqual(estimate.xy_risk_reason, "low_visibility_temporal_support")
+        self.assertEqual(estimate.xy_stall_reason, "")
+
+    def test_runtime_xy_spatial_temporal_checkpoint_loads_and_predicts(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            base_feature_names = tuple(DEFAULT_RUNTIME_XY_FEATURE_NAMES)
+            history_window_size = 6
+            history_feature_names = runtime_xy_spatial_temporal_feature_names(base_feature_names, history_window_size)
+            model = XYSpatialTemporalHeadNet(
+                image_in_channels=7,
+                image_hidden_dim=32,
+                history_feature_dim=max(1, len(history_feature_names) // history_window_size),
+                history_window_size=history_window_size,
+                proprio_dim=15,
+                planner_prior_dim=6,
+                risk_classes=("normal", "low_visibility", "direction_conflict", "insufficient_support"),
+            )
+            checkpoint = {
+                "schema_version": "c2c_v2_runtime_xy_spatial_temporal_checkpoint_v1",
+                "model_type": "spatial_temporal",
+                "config": {
+                    "feature_names": list(base_feature_names),
+                    "history_feature_names": list(history_feature_names),
+                    "history_window_size": history_window_size,
+                    "image_in_channels": 7,
+                    "image_hidden_dim": 32,
+                    "image_crop_size": 96,
+                    "image_resize_size": 96,
+                    "proprio_dim": 15,
+                    "planner_prior_dim": 6,
+                    "risk_classes": ["normal", "low_visibility", "direction_conflict", "insufficient_support"],
+                },
+                "model_state_dict": model.state_dict(),
+                "source": "unit_test",
+            }
+            path = tmpdir / "runtime_xy_spatial_temporal.pt"
+            torch.save(checkpoint, path)
+            loaded = RuntimeXYSpatialTemporalCalibration.load(path)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            obs = _make_observation()
+            row = {
+                "local_geometry_error": {
+                    "grasp": {
+                        "valid": True,
+                        "dx": 0.02,
+                        "dy": -0.01,
+                        "confidence": 0.75,
+                        "observability": 0.02,
+                        "fit_residual": 0.001,
+                        "inlier_ratio": 0.95,
+                    }
+                },
+                "estimated_basin_error": {
+                    "estimated_basin_error_valid": True,
+                    "estimated_basin_error_x_valid": True,
+                    "estimated_basin_error_y_valid": True,
+                    "estimated_basin_error_frame_consistency": 0.8,
+                    "estimated_basin_error_proxy_dx": 0.02,
+                    "estimated_basin_error_proxy_dy": -0.01,
+                },
+                "wrist_is_low_visibility": False,
+            }
+            pred, features, aux = loaded.predict_from_trace(
+                row,
+                observation=obs,
+                robot_state={"proprio": np.zeros((15,), dtype=np.float32), "planner_delta_7d": np.zeros((6,), dtype=np.float32)},
+                history_rows=[row, row],
+            )
+            self.assertEqual(pred.shape, (2,))
+            self.assertTrue(np.all(np.isfinite(pred)))
+            self.assertGreater(features.size, 0)
+            self.assertIn("estimate", aux)
+            estimate = aux["estimate"]
+            self.assertFalse(estimate.uses_privileged_runtime)
+            self.assertFalse(estimate.yaw_control_allowed)
+            self.assertFalse(estimate.close_control_allowed)
+            self.assertTrue(np.isfinite(float(estimate.xy_step_scale)))
+
+    def test_xy_spatial_temporal_root_split_keeps_roots_intact(self) -> None:
+        records: list[dict[str, object]] = []
+        for root in ("root_a", "root_b", "root_c", "root_d"):
+            for ep in range(2):
+                for step in range(3):
+                    records.append(
+                        {
+                            "source_eval_root": root,
+                            "sequence_id": f"{root}::ep{ep:03d}",
+                            "episode_idx": ep,
+                            "step_idx": step,
+                            "label_available": True,
+                            "grasp_probe_active": True,
+                            "failure_bucket": "small_xy_large_yaw" if ep % 2 == 0 else "large_xy_large_yaw",
+                            "observability_bucket": "visual_observable" if step % 2 == 0 else "partial_observable",
+                        }
+                    )
+        split = split_records_by_source_root(records, split_mode="root", val_fraction=0.25, test_fraction=0.25, seed=7)
+        root_to_split: dict[str, str] = {}
+        for name, rows in (("train", split.train_records), ("val", split.val_records), ("test", split.test_records)):
+            for row in rows:
+                root = str(row["source_eval_root"])
+                if root in root_to_split:
+                    self.assertEqual(root_to_split[root], name)
+                root_to_split[root] = name
+        self.assertEqual(set(root_to_split), {"root_a", "root_b", "root_c", "root_d"})
+        self.assertGreaterEqual(len(split.val_source_eval_roots), 1)
+        self.assertGreaterEqual(len(split.test_source_eval_roots), 1)
+
+    def test_xy_spatial_temporal_root_split_can_force_train_roots(self) -> None:
+        records: list[dict[str, object]] = []
+        for root in ("train_anchor", "val_root", "test_root"):
+            for ep in range(2):
+                records.append(
+                    {
+                        "source_eval_root": root,
+                        "sequence_id": f"{root}::ep{ep:03d}",
+                        "episode_idx": ep,
+                        "step_idx": 0,
+                        "label_available": True,
+                        "grasp_probe_active": True,
+                        "failure_bucket": "small_xy_large_yaw",
+                        "observability_bucket": "visual_observable",
+                    }
+                )
+        split = split_records_by_source_root(
+            records,
+            split_mode="root",
+            val_fraction=0.25,
+            test_fraction=0.25,
+            seed=7,
+            train_source_eval_roots={"train_anchor"},
+        )
+        self.assertIn("train_anchor", split.train_source_eval_roots)
+        self.assertNotIn("train_anchor", split.val_source_eval_roots)
+        self.assertNotIn("train_anchor", split.test_source_eval_roots)
+        self.assertTrue(all(str(row["source_eval_root"]) != "train_anchor" for row in split.val_records))
+        self.assertTrue(all(str(row["source_eval_root"]) != "train_anchor" for row in split.test_records))
+        self.assertTrue(any(str(row["source_eval_root"]) == "train_anchor" for row in split.train_records))
+
+    def test_xy_spatial_temporal_generalization_manifest_builds_gate_and_holdout(self) -> None:
+        records: list[dict[str, object]] = []
+        for root in ("root_a", "root_b"):
+            for ep in range(3):
+                records.append(
+                    {
+                        "source_eval_root": root,
+                        "sequence_id": f"{root}::ep{ep:03d}",
+                        "episode_idx": ep,
+                        "step_idx": 0,
+                        "label_available": True,
+                        "grasp_probe_active": True,
+                        "failure_bucket": "small_xy_large_yaw",
+                        "observability_bucket": "visual_observable",
+                        "trace_path": f"/tmp/{root}/ep{ep:03d}.jsonl",
+                        "runtime_obs_path": f"/tmp/{root}/ep{ep:03d}.npz",
+                    }
+                )
+        for root, name in (("mp4_smoke_v38_alignment_lifecycle_runtime_xy_mlp_temporal_old4", "old4"), ("mp4_smoke_v38_alignment_lifecycle_runtime_xy_mlp_temporal_random5", "random5")):
+            for ep in range(2):
+                records.append(
+                    {
+                        "source_eval_root": root,
+                        "sequence_id": f"{root}::ep{ep:03d}",
+                        "episode_idx": ep,
+                        "step_idx": 0,
+                        "label_available": True,
+                        "grasp_probe_active": True,
+                        "failure_bucket": "large_xy_large_yaw",
+                        "observability_bucket": "partial_observable",
+                        "trace_path": f"/tmp/{name}/ep{ep:03d}.jsonl",
+                        "runtime_obs_path": f"/tmp/{name}/ep{ep:03d}.npz",
+                    }
+                )
+        manifest = build_generalization_manifest(records, random_gate_size=2, random_gate_seed=13)
+        self.assertEqual(manifest["schema_version"], "c2c_v2_xy_spatial_temporal_generalization_manifest_v1")
+        self.assertEqual(len(manifest["random10_generalization"]), 2)
+        self.assertGreaterEqual(len(manifest["random_holdout_pool"]), 1)
+        self.assertGreaterEqual(manifest["summary"]["random10_generalization_episodes"], 2)
+        self.assertGreaterEqual(manifest["summary"]["sentinel_episodes"].get("old4", 0), 1)
+        self.assertGreaterEqual(manifest["summary"]["sentinel_episodes"].get("random5", 0), 1)
+        random_gate_roots = {str(item["source_eval_root"]) for item in manifest["random10_generalization"]}
+        self.assertFalse(any("old4" in root or "random5" in root for root in random_gate_roots))
+
+    def test_xy_spatial_temporal_generalization_manifest_roots_load(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            manifest_path = tmpdir / "manifest.json"
+            payload = {
+                "groups": {
+                    "random10_generalization": [
+                        {"source_eval_root": "gate_root", "episode_idx": 1},
+                        {"source_eval_root": "gate_root", "episode_idx": 2},
+                    ],
+                    "random_holdout_pool": [
+                        {"source_eval_root": "holdout_root", "episode_idx": 3},
+                    ],
+                }
+            }
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+            roots = _load_generalization_gate_roots(manifest_path)
+            self.assertEqual(roots["random10_generalization"], {"gate_root"})
+            self.assertEqual(roots["random_holdout_pool"], {"holdout_root"})
+
+    def test_xy_spatial_temporal_selection_score_uses_worst_case(self) -> None:
+        val = {
+            "cosine_gt_05_rate": 0.85,
+            "sign_match_rate": 0.82,
+            "mae": 0.05,
+            "control_contraction_rate": 0.78,
+            "control_worsen_rate": 0.21,
+            "control_reverse_rate": 0.12,
+            "control_overshoot_rate": 0.10,
+        }
+        gate = {
+            "cosine_gt_05_rate": 0.62,
+            "sign_match_rate": 0.61,
+            "mae": 0.09,
+            "control_contraction_rate": 0.55,
+            "control_worsen_rate": 0.45,
+            "control_reverse_rate": 0.24,
+            "control_overshoot_rate": 0.18,
+        }
+        holdout = {
+            "cosine_gt_05_rate": 0.70,
+            "sign_match_rate": 0.68,
+            "mae": 0.08,
+            "control_contraction_rate": 0.42,
+            "control_worsen_rate": 0.58,
+            "control_reverse_rate": 0.31,
+            "control_overshoot_rate": 0.22,
+        }
+        score = _worst_case_selection_score(val, gate, holdout)
+        self.assertGreaterEqual(score, _selection_score(val))
+        self.assertGreaterEqual(score, _selection_score(gate))
+        self.assertGreaterEqual(score, _selection_score(holdout))
+
+    def test_xy_spatial_temporal_step_scale_target_shrinks_on_small_residuals(self) -> None:
+        target_large = _step_scale_target_from_xy_error(
+            label_norm=0.012,
+            max_xy_step=0.003,
+            low_visibility=False,
+            support_rows=3,
+            recent_support_rows=2,
+        )
+        target_small = _step_scale_target_from_xy_error(
+            label_norm=0.0008,
+            max_xy_step=0.003,
+            low_visibility=False,
+            support_rows=3,
+            recent_support_rows=2,
+        )
+        target_low_vis = _step_scale_target_from_xy_error(
+            label_norm=0.0008,
+            max_xy_step=0.003,
+            low_visibility=True,
+            support_rows=2,
+            recent_support_rows=1,
+        )
+        self.assertAlmostEqual(target_large, 1.0, places=6)
+        self.assertLess(target_small, target_large)
+        self.assertLess(target_low_vis, target_small)
+        self.assertGreater(target_low_vis, 0.0)
+
+    def test_runtime_xy_temporal_mlp_clamps_and_falls_back_on_direction_conflict(self) -> None:
+        base_feature_names = ("local_dx", "local_dy")
+        names = runtime_xy_context_feature_names(base_feature_names, 2)
+        current = {
+            "local_geometry_error": {
+                "grasp": {
+                    "valid": True,
+                    "dx": 0.020,
+                    "dy": 0.000,
+                    "confidence": 0.9,
+                    "observability": 0.02,
+                    "fit_residual": 0.001,
+                    "inlier_ratio": 0.95,
+                }
+            },
+            "estimated_basin_error": {
+                "estimated_basin_error_valid": True,
+                "estimated_basin_error_x_valid": True,
+                "estimated_basin_error_y_valid": True,
+                "estimated_basin_error_frame_consistency": 0.9,
+                "estimated_basin_error_proxy_dx": 0.020,
+                "estimated_basin_error_proxy_dy": 0.000,
+            },
+        }
+        history = {
+            "local_geometry_error": {
+                "grasp": {
+                    "valid": True,
+                    "dx": 0.018,
+                    "dy": 0.000,
+                    "confidence": 0.9,
+                    "observability": 0.02,
+                    "fit_residual": 0.001,
+                    "inlier_ratio": 0.95,
+                }
+            },
+            "estimated_basin_error": {
+                "estimated_basin_error_valid": True,
+                "estimated_basin_error_x_valid": True,
+                "estimated_basin_error_y_valid": True,
+                "estimated_basin_error_frame_consistency": 0.9,
+                "estimated_basin_error_proxy_dx": 0.018,
+                "estimated_basin_error_proxy_dy": 0.000,
+            },
+        }
+        weights = np.zeros((2, len(names)), dtype=np.float32)
+        weights[0, names.index("lag0_local_dx")] = -1.0e6
+        cal = RuntimeXYMLPCalibration(
+            feature_names=names,
+            layers=((weights, np.zeros((2,), dtype=np.float32)),),
+            feature_mean=np.zeros((len(names),), dtype=np.float32),
+            feature_std=np.full((len(names),), 1.0e-12, dtype=np.float32),
+            window_size=2,
+            base_feature_names=base_feature_names,
+            source="unit_test",
+        )
+        loaded = RuntimeXYAffineCalibration.from_dict(cal.to_dict())
+        pred, _ = loaded.predict_from_trace(current, history_rows=[history])
+        self.assertTrue(np.all(np.isfinite(pred)))
+        self.assertLessEqual(float(np.linalg.norm(pred)), 0.180001)
+
+        estimate = calibrated_runtime_xy_residual_from_trace(current, loaded, history_rows=[history])
+        self.assertTrue(np.isfinite(float(estimate.dx)))
+        self.assertLessEqual(float(np.hypot(estimate.dx, estimate.dy)), 0.180001)
+        self.assertIn("mlp_direction_conflict", estimate.xy_risk_reason)
+        self.assertEqual(estimate.xy_stall_reason, "mlp_direction_conflict")
+
+    def test_runtime_xy_temporal_mlp_training_reports_windowed_calibration(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            trace_path = tmpdir / "ep000_gripper_trace.jsonl"
+            rows = []
+            for ep in (0, 1):
+                for step in range(4):
+                    dx = 0.03 - 0.004 * step - 0.002 * ep
+                    dy = -0.015 + 0.002 * step
+                    rows.append(
+                        {
+                            "episode_idx": ep,
+                            "step": step,
+                            "grasp_probe_active": True,
+                            "grasp_probe_pre_true_error_t": [dx, dy, 0.0, 0.0, 0.0, 0.0],
+                            "failure_bucket": "small_xy_large_yaw" if ep == 0 else "large_xy_large_yaw",
+                            "alias_drift_decision": "stable_alias_control",
+                            "visual_observability_class": "visual_observable" if step % 2 == 0 else "partial_observable",
+                            "wrist_valid_depth_ratio": 0.7 - 0.05 * step,
+                            "wrist_depth_near_fraction": 0.6 - 0.04 * step,
+                            "wrist_is_occluded": bool(step % 3 == 0),
+                            "wrist_is_low_visibility": bool(step % 2 == 1),
+                            "c2c_stage_age": step + 1,
+                            "grasp_probe_pre_xy_error": float(np.hypot(dx, dy)),
+                            "grasp_probe_residual_norm_xy": float(np.hypot(dx, dy)),
+                            "grasp_probe_runtime_estimator_residual_norm_xy": float(np.hypot(dx, dy)),
+                            "grasp_probe_applied_xy_step_local_6d": [-0.002 * step, 0.001 * step, 0.0, 0.0, 0.0, 0.0],
+                            "grasp_probe_local_command_local_6d": [-0.002 * step, 0.001 * step, 0.0, 0.0, 0.0, 0.0],
+                            "local_geometry_error": {
+                                "grasp": {
+                                    "dx": dx * 0.8,
+                                    "dy": dy * 0.8,
+                                    "confidence": 0.7,
+                                    "observability": 0.01,
+                                    "fit_residual": 0.001,
+                                    "inlier_ratio": 0.9,
+                                }
+                            },
+                            "estimated_basin_error": {
+                                "proxy_dx": dx * 0.8,
+                                "proxy_dy": dy * 0.8,
+                                "frame_consistency": 0.8,
+                            },
+                        }
+                    )
+            with open(trace_path, "w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+
+            args = SimpleNamespace(
+                trace_paths=[str(trace_path)],
+                output_calibration=tmpdir / "temporal_calibration.json",
+                output_json=tmpdir / "temporal_train.json",
+                output_md=tmpdir / "temporal_train.md",
+                feature_names="local_dx,local_dy,estimated_proxy_dx,estimated_proxy_dy,local_confidence,local_observability,local_fit_residual,local_inlier_ratio,frame_consistency",
+                model_type="temporal_mlp",
+                ridge=1.0e-4,
+                ridge_grid="1e-4",
+                max_abs_weight=1000.0,
+                val_fraction=0.25,
+                active_only=True,
+                direction_weight=1.0,
+                sign_weight=0.5,
+                mae_weight=0.05,
+                contraction_weight=0.15,
+                base_row_weight=1.0,
+                active_contract_weight=3.0,
+                hard_bucket_weight=1.5,
+                occlusion_weight=1.5,
+                low_observability_weight=1.25,
+                hidden_dims="8",
+                window_size=2,
+                epochs=3,
+                batch_size=2,
+                lr=1.0e-3,
+                weight_decay=0.0,
+                seed=3,
+            )
+            report = train_runtime_xy_calibrator(args)
+            payload = json.loads((tmpdir / "temporal_calibration.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(report["model_type"], "temporal_mlp")
+        self.assertEqual(report["window_size"], 2)
+        self.assertGreater(len(report["context_feature_names"]), len(report["feature_names"]))
+        self.assertEqual(payload["schema_version"], "c2c_v2_runtime_xy_context_mlp_calibration_v1")
+        self.assertEqual(payload["model_type"], "temporal_mlp")
+        self.assertEqual(payload["window_size"], 2)
+        self.assertIn("control_config", report)
+        self.assertGreater(report["calibrated_val_control"]["control_contraction_rate"], 0.0)
+        self.assertIn("control_overshoot_rate", report["calibrated_val_control"])
+        self.assertFalse(report["uses_privileged_runtime"])
+        self.assertTrue(report["runtime_upgrade_gate"]["requires_mp4_runtime_ab"])
+        self.assertTrue(report["runtime_upgrade_gate"]["requires_hard_bucket_runtime_ab"])
+
     def test_prior_only_diagnostic_splits_estimator_axis_policy_abstain(self) -> None:
         row = {
             "episode_idx": 0,
@@ -1588,6 +2157,21 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         )
         self.assertTrue(decision["blocked"])
         self.assertEqual(decision["reason"], "not_close_ready")
+
+    def test_grasp_probe_close_arbiter_blocks_outside_guard_window(self) -> None:
+        decision = grasp_probe_close_arbiter_decision(
+            planner_gripper_value=0.42,
+            planner_close_threshold=0.5,
+            close_ready=False,
+            stage_name="RING_GRASP_ALIGN",
+            enabled=True,
+            guard_active=False,
+            active=False,
+            candidate_match=False,
+            gripper_mode="planner_after_near",
+        )
+        self.assertTrue(decision["blocked"])
+        self.assertEqual(decision["reason"], "outside_guard_window")
 
     def test_grasp_probe_close_arbiter_allows_planner_close_when_ready(self) -> None:
         decision = grasp_probe_close_arbiter_decision(
@@ -1829,6 +2413,100 @@ class Coarse2ContactV2Tests(unittest.TestCase):
         self.assertEqual(summary["alias_drift_decision_counts"], {"stable_alias_control": 1})
         self.assertEqual(summary["alignment_ready_for_handoff_rate"], 1.0)
         self.assertFalse(summary["uses_privileged_runtime"])
+
+        rows = build_task_frame_readiness_dataset(
+            [
+                {
+                    "episode_idx": 5,
+                    "step": 9,
+                    "c2c_v2_skill_type": "precision_grasp",
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "failure_bucket": "large_xy_large_yaw",
+                    "alias_drift_decision": "stable_alias_control",
+                    "grasp_probe_pre_true_error_t": [0.040, -0.030, 0.008, 0.0, 0.0, 0.012],
+                    "local_geometry_error": {
+                        "grasp": {
+                            "dx": 0.040,
+                            "dy": -0.030,
+                            "dz": 0.008,
+                            "image_axis_yaw": 0.5,
+                            "confidence": 0.8,
+                            "observability": 0.01,
+                            "fit_residual": 0.001,
+                            "inlier_ratio": 0.9,
+                        }
+                    },
+                    "runtime_xy_estimator": {"dx": 0.040, "dy": -0.030, "entry_ready": False},
+                    "planner_chunk_local_6d": [0.0, 0.0, -0.01, 0.0, 0.0, 0.0],
+                    "wrist_valid_depth_ratio": 0.7,
+                    "wrist_depth_near_fraction": 0.4,
+                    "grasp_contact_rule_force_norm": 0.0,
+                    "grasp_contact_rule_contact_confirmed": False,
+                }
+            ],
+            xy_threshold=0.005,
+            z_threshold=0.020,
+            yaw_threshold=0.030,
+        )
+        self.assertTrue(rows[0]["offline_labels"]["z_ready"])
+        self.assertFalse(rows[0]["offline_labels"]["alignment_ready_for_handoff"])
+
+    def test_task_frame_readiness_features_read_compact_dataset_runtime_fields(self) -> None:
+        rows = build_task_frame_readiness_dataset(
+            [
+                {
+                    "episode_idx": 4,
+                    "step": 18,
+                    "c2c_v2_skill_type": "precision_grasp",
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "alias_drift_decision": "stable_alias_control",
+                    "grasp_probe_pre_true_error_t": [0.001, -0.002, 0.008, 0.0, 0.0, 0.010],
+                    "local_geometry_error": {
+                        "grasp": {
+                            "dx": 0.0008,
+                            "dy": -0.0015,
+                            "dz": 0.010,
+                            "image_axis_yaw": 0.5,
+                            "confidence": 0.8,
+                            "observability": 0.01,
+                            "fit_residual": 0.001,
+                            "inlier_ratio": 0.9,
+                        }
+                    },
+                    "runtime_xy_estimator": {
+                        "dx": 0.0009,
+                        "dy": -0.0018,
+                        "entry_ready": True,
+                        "confidence": 0.7,
+                        "xy_step_scale": 0.4,
+                    },
+                    "planner_chunk_local_6d": [0.0, 0.0, -0.01, 0.0, 0.0, 0.02],
+                    "wrist_valid_depth_ratio": 0.7,
+                    "wrist_depth_near_fraction": 0.4,
+                    "wrist_is_occluded": True,
+                    "wrist_is_low_visibility": True,
+                    "grasp_contact_rule_force_norm": 0.12,
+                    "grasp_contact_rule_contact_confirmed": True,
+                }
+            ],
+            xy_threshold=0.005,
+            z_threshold=0.020,
+            yaw_threshold=0.030,
+        )
+        self.assertEqual(len(rows), 1)
+        vec = task_frame_readiness_feature_vector(rows[0])
+        feature = {name: float(vec[idx]) for idx, name in enumerate(TASK_FRAME_READINESS_FEATURE_NAMES)}
+        self.assertAlmostEqual(feature["local_dz_proxy"], 0.010, places=6)
+        self.assertAlmostEqual(feature["local_confidence"], 0.8, places=6)
+        self.assertAlmostEqual(feature["local_observability"], 0.01, places=6)
+        self.assertAlmostEqual(feature["local_fit_residual"], 0.001, places=6)
+        self.assertAlmostEqual(feature["local_inlier_ratio"], 0.9, places=6)
+        self.assertAlmostEqual(feature["wrist_valid_depth_ratio"], 0.7, places=6)
+        self.assertAlmostEqual(feature["wrist_depth_near_fraction"], 0.4, places=6)
+        self.assertEqual(feature["wrist_is_occluded"], 1.0)
+        self.assertEqual(feature["wrist_is_low_visibility"], 1.0)
+        self.assertAlmostEqual(feature["force_norm"], 0.12, places=6)
+        self.assertEqual(feature["contact_confirmed"], 1.0)
 
     def test_failure_tail_candidate_builder_annotates_alias_drift_decision_from_support_manifest(self) -> None:
         with TemporaryDirectory() as tmpdir:

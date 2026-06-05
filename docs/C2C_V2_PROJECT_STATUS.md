@@ -10,6 +10,121 @@ For a shorter external-review entry point, see
 [`docs/AI_REVIEW_GUIDE.md`](AI_REVIEW_GUIDE.md). For a route-level review of
 whether the project has drifted from its research goal, see
 [`docs/C2C_V2_RESEARCH_REVIEW_BRIEF.md`](C2C_V2_RESEARCH_REVIEW_BRIEF.md).
+For the next concrete XY generalization push, see
+[`docs/C2C_V2_XY_V42_GENERALIZATION_PLAN.md`](C2C_V2_XY_V42_GENERALIZATION_PLAN.md).
+For the next Z/Yaw readiness push after v42, see
+[`docs/C2C_V2_Z_YAW_READINESS_PLAN.md`](C2C_V2_Z_YAW_READINESS_PLAN.md).
+For the current review of v43/v44 and the next handoff audit plan, see
+[`docs/C2C_V2_V43_V44_REVIEW_AND_NEXT_PLAN.md`](C2C_V2_V43_V44_REVIEW_AND_NEXT_PLAN.md).
+
+Operational defaults for this branch:
+
+- Runtime environment: `conda run -n vla-adapter ...`
+- Fixed planner checkpoint:
+  `/home/guoning/code/VLA2/pretrained_models/planner_checkpoints/insert_onto_square_peg_30000_chkpt`
+
+Current objective:
+
+- `v42_expanded_v4pilot` is now the active XY baseline.
+- The concrete active XY checkpoint is
+  `runtime_artifacts/coarse2contact_v2/checkpoints/runtime_xy_spatial_temporal_v42_expanded_v4pilot_candidate.pt`.
+- The immediate engineering target is now to keep strict
+  `alignment_ready_for_handoff` as the only close predicate while feeding it
+  with non-privileged task-frame Z and Yaw readiness.
+- The current readiness checkpoints are:
+  - `runtime_artifacts/coarse2contact_v2/checkpoints/v43_task_frame_z_readiness.pt`
+  - `runtime_artifacts/coarse2contact_v2/checkpoints/v44_task_frame_yaw_readiness.pt`
+- The current readiness dataset is:
+  - `runtime_artifacts/coarse2contact_v2/datasets/task_frame_readiness_v43_v44.jsonl`
+
+Success means:
+
+- v42 XY remains non-regressed on random holdout, hard-bucket, old4/random5,
+  low-visibility, and ep25/26 slices
+- v43 Z readiness reaches high held-out precision on v42-XY-ready rows and is
+  conservative at runtime
+- v44 Yaw readiness blocks ambiguous / alias-drift rows instead of forcing them
+  ready
+- no reopening of `alignment_ready_for_handoff` or `close_ready`
+
+Current status snapshot:
+
+- `v42_expanded_v4pilot` is the active XY baseline after the
+  sentinel-aware warm-start A/B, and it is the first candidate in this line to
+  improve random10, random holdout, old4 reverse, and random5 reverse at the
+  same time.
+- This candidate is also the one favored by the latest hard-bucket A/B on
+  contraction, worsen, overshoot, reverse, and ep25/26 worsen.
+- The hard-bucket report also shows low-visibility worsen improving from
+  `0.199` to `0.055`, with partial-worsen staying at `0.000`.
+- Latest measured comparison against `v41`:
+  - random10 contraction `0.825` vs `0.667`
+  - random holdout contraction `0.896` vs `0.760`
+  - old4 reverse `0.583` vs `0.659`
+  - random5 reverse `0.514` vs `0.538`
+  - hard-bucket contraction `0.945` vs `0.801`
+  - hard-bucket worsen `0.055` vs `0.199`
+  - hard-bucket low-visibility worsen `0.055` vs `0.199`
+  - hard-bucket partial worsen `0.000` vs `0.000`
+  - hard-bucket overshoot `0.059` vs `0.215`
+  - hard-bucket reverse `0.025` vs `0.054`
+  - hard-bucket ep25/26 worsen `0.007` vs `0.127`
+- The current line is still valid, but future changes must still beat the
+  active baseline on worst-slice random generalization and hard-bucket tails,
+  not just on cherry-picked MP4 clips.
+- The gate-aware training path now explicitly separates
+  `random10_generalization` from training roots and scores checkpoints with a
+  worst-case val/gate/holdout rule.
+- Among the measured candidates, `v42_expanded_v4pilot` is the strongest
+  measured XY model so far on the small gate/holdout/sentinel evaluation set
+  and the current baseline to beat.
+- The active XY baseline is now `v42_expanded_v4pilot`.
+- The next milestone is now implemented in checkpoint form:
+  - `v43_task_frame_z_readiness` was trained on the consolidated
+    `task_frame_readiness_v43_v44.jsonl` dataset and reached held-out
+    precision `0.984` and recall `0.987` at threshold `0.80` on the
+    root-held-out validation split after fixing compact-dataset/runtime feature
+    extraction parity.
+  - `v44_task_frame_yaw_readiness` was trained on the same dataset and reached
+    held-out precision `1.000` and recall `1.000` at threshold `0.05` on the
+    root-held-out validation split.
+  - Both checkpoints are loaded by `evaluate_c2c_v2_rlbench.py` and keep
+    `close_ready` as legacy/diagnostic only.
+- Two short xvfb smoke runs completed on
+  `insert_onto_square_peg` with the strict handoff gate wired in. They reached
+  the runtime trace path and preserved the close block semantics, but the
+  short step budget did not reach a true planner close request in those runs.
+
+Latest smoke confirmation:
+
+- old4 smoke root:
+  `runtime_artifacts/coarse2contact_v2/mp4_smoke_v42_expanded_v4pilot_old4_front_wrist`
+- random5 smoke root:
+  `runtime_artifacts/coarse2contact_v2/mp4_smoke_v42_expanded_v4pilot_random5_front_wrist`
+
+Both smokes preserved the wrist camera view and kept planner close under the
+strict handoff guard. They are visual evidence only; they do not replace the
+offline worst-slice gate.
+
+Hard-bucket smoke for the leading candidate also exists:
+
+- hard-bucket smoke root:
+  `runtime_artifacts/coarse2contact_v2/mp4_smoke_v42_expanded_v4pilot_hardbucket_front_wrist`
+
+This smoke kept the same strict handoff guard and wrist-view layout. It is
+useful for inspection, but it still does not override the offline promotion
+gate.
+
+Additional implementation smoke:
+
+- `runtime_artifacts/coarse2contact_v2/eval_z_yaw_sanity_v43_v44_xvfb`
+- `runtime_artifacts/coarse2contact_v2/eval_z_yaw_sanity_v43_v44_xvfb_ep3`
+
+These runs exercised the new Z/Yaw readiness checkpoints under `xvfb-run`.
+They confirmed the readiness heads load, the runtime trace fields populate, and
+`alignment_ready_for_handoff` remains false when Z/Yaw are not ready. The
+episodes did not request planner close within the short smoke budget, so they
+are semantic sanity checks rather than a final close-block proof.
 
 ## Goal
 

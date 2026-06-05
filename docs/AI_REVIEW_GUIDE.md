@@ -24,9 +24,9 @@ takeover framework, not solved online failure-tail recovery.
 - Branch: `codex/c2c-v2-status-publish`
 - Latest relevant commit: current branch tip on `codex/c2c-v2-status-publish`
   (see `git log -n 1`)
+- Runtime environment: `conda run -n vla-adapter ...`
 - Fixed planner checkpoint:
   `/home/guoning/code/VLA2/pretrained_models/planner_checkpoints/insert_onto_square_peg_30000_chkpt`
-- Fixed runtime environment: `conda run -n vla-adapter ...`
 - Current focus stage: `RING_GRASP_ALIGN`
 - Runtime apply remains disabled; evaluation probes are privileged and offline
 
@@ -187,17 +187,20 @@ Recent hard-bucket validation tightened the current interpretation:
   `scripts/diagnose_c2c_v2_prior_only_abstain.py` before concluding the
   localizer cannot see the object.
 - Latest runtime XY estimator A/B:
-  - v25 affine remains the runtime default. It is small-data and likely
-    over-specialized to early smoke episodes, but it still passes the current
-    MP4/hard-bucket runtime A/B better than wider candidates.
-  - v34 hard/occlusion affine should not be used for runtime apply. It improved
-    amplitude MAE offline but failed direction-sensitive runtime control.
-  - v36 direction-first MLP is implemented and can be loaded by the runtime, but
-    it is not an approved replacement. It improves offline direction and some
-    near-entry rates, while reducing contraction and increasing overshoot
-    relative to v25.
-  - Reviewers should judge estimator candidates by MP4 runtime A/B plus
+  - `v41` is the conservative baseline candidate.
+  - `v42_expanded_v4pilot` is the current active baseline. It improves
+    random10, random holdout, old4, random5, and hard-bucket validation
+    relative to `v41` while keeping strict handoff semantics unchanged.
+  - `v42_generalization` is a useful negative-control branch: it shows why
+    random10 and hard-bucket gates must both be enforced.
+  - Reviewers should judge estimator candidates by random holdout plus
     hard-bucket runtime A/B, not by offline MAE or pooled validation metrics.
+- Next route-level review target:
+  - Review `docs/C2C_V2_Z_YAW_READINESS_PLAN.md`.
+  - The project should now keep v42 fixed as XY baseline and build v43 Z
+    readiness followed by v44 Yaw readiness.
+  - Reviewers should reject any shortcut that opens planner close, Z control,
+    or yaw control before readiness passes held-out validation.
 
 Latest clean focused-validation read:
 

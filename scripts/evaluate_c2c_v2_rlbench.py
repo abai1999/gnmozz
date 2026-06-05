@@ -9,9 +9,10 @@ import os
 import random
 import sys
 import time
+from dataclasses import replace
 from collections import deque
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -88,6 +89,13 @@ from prismatic.robot.coarse2contact_v2.alignment_takeover import (
     AlignmentTakeoverSession,
     TaskFrameResidualEstimate,
     evaluate_alignment_readiness,
+)
+from prismatic.robot.coarse2contact_v2.task_frame_readiness import (
+    TaskFrameReadinessNet,
+    TaskFrameYawReadinessEstimate,
+    TaskFrameZReadinessEstimate,
+    load_task_frame_readiness_checkpoint,
+    task_frame_readiness_feature_vector,
 )
 from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin, recovery_overshoot_flag
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RuntimeXYAffineCalibration, calibrated_runtime_xy_residual_from_trace
@@ -398,6 +406,47 @@ def _task_frame_residual_from_runtime_trace(
     )
 
 
+def _task_frame_readiness_prediction(
+    trace_row: Mapping[str, Any],
+    *,
+    model: TaskFrameReadinessNet | None,
+    head: str,
+) -> TaskFrameZReadinessEstimate | TaskFrameYawReadinessEstimate | None:
+    if model is None:
+        return None
+    if str(getattr(model, "head_type", "")) != str(head):
+        raise ValueError(f"task frame readiness checkpoint head mismatch: expected {head}, got {getattr(model, 'head_type', '')}")
+    features = task_frame_readiness_feature_vector(trace_row)
+    return model.predict_numpy(features)
+
+
+def _apply_task_frame_readiness_to_residual(
+    residual: TaskFrameResidualEstimate,
+    *,
+    z_readiness: TaskFrameZReadinessEstimate | None,
+    yaw_readiness: TaskFrameYawReadinessEstimate | None,
+) -> TaskFrameResidualEstimate:
+    axis_validity = dict(residual.axis_validity)
+    axis_confidence = dict(residual.axis_confidence)
+    abstain_reason = str(residual.abstain_reason)
+    if z_readiness is not None:
+        axis_validity["z"] = bool(z_readiness.z_ready)
+        axis_confidence["z"] = float(z_readiness.z_confidence)
+        if not bool(z_readiness.z_ready):
+            abstain_reason = str(z_readiness.z_abstain_reason or abstain_reason)
+    if yaw_readiness is not None:
+        axis_validity["yaw"] = bool(yaw_readiness.yaw_ready)
+        axis_confidence["yaw"] = float(yaw_readiness.yaw_confidence)
+        if not bool(yaw_readiness.yaw_ready):
+            abstain_reason = str(yaw_readiness.yaw_abstain_reason or abstain_reason)
+    return replace(
+        residual,
+        axis_validity=axis_validity,
+        axis_confidence=axis_confidence,
+        abstain_reason=abstain_reason,
+    )
+
+
 def _load_grasp_probe_candidate_rows(path_text: str | None) -> tuple[set[tuple[int, int]], dict[tuple[int, int], dict[str, object]]]:
     if not path_text:
         return set(), {}
@@ -629,6 +678,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional non-privileged XY affine calibration used by --c2c_grasp_probe_policy runtime_estimator_xy.",
     )
     parser.add_argument(
+        "--task_frame_z_readiness_ckpt",
+        type=str,
+        default="",
+        help="Optional non-privileged Z readiness checkpoint used to gate strict handoff.",
+    )
+    parser.add_argument(
+        "--task_frame_yaw_readiness_ckpt",
+        type=str,
+        default="",
+        help="Optional non-privileged yaw readiness checkpoint used to gate strict handoff.",
+    )
+    parser.add_argument(
         "--c2c_grasp_probe_smoke_type",
         type=str,
         default="diagnostic_privileged_probe",
@@ -840,6 +901,23 @@ def evaluate(args: argparse.Namespace) -> float:
         getattr(args, "c2c_grasp_probe_candidate_jsonl", "")
     )
     runtime_xy_calibration = RuntimeXYAffineCalibration.load(getattr(args, "runtime_xy_calibration_json", "") or None)
+    runtime_xy_calibration_window_size = max(1, int(getattr(runtime_xy_calibration, "window_size", 1) if runtime_xy_calibration is not None else 1))
+    task_frame_z_readiness_model = None
+    task_frame_yaw_readiness_model = None
+    if str(getattr(args, "task_frame_z_readiness_ckpt", "") or ""):
+        task_frame_z_readiness_model, task_frame_z_readiness_meta = load_task_frame_readiness_checkpoint(
+            getattr(args, "task_frame_z_readiness_ckpt"),
+            map_location="cpu",
+        )
+    else:
+        task_frame_z_readiness_meta = {}
+    if str(getattr(args, "task_frame_yaw_readiness_ckpt", "") or ""):
+        task_frame_yaw_readiness_model, task_frame_yaw_readiness_meta = load_task_frame_readiness_checkpoint(
+            getattr(args, "task_frame_yaw_readiness_ckpt"),
+            map_location="cpu",
+        )
+    else:
+        task_frame_yaw_readiness_meta = {}
 
     vla, processor, action_head, proprio_projector, norm_stats = load_checkpoint(
         args.checkpoint_dir,
@@ -943,7 +1021,14 @@ def evaluate(args: argparse.Namespace) -> float:
         "c2c_grasp_probe_candidate_count": int(len(grasp_probe_candidate_keys)),
         "runtime_xy_calibration_json": str(getattr(args, "runtime_xy_calibration_json", "")),
         "runtime_xy_calibration_loaded": bool(runtime_xy_calibration is not None),
+        "runtime_xy_calibration_window_size": int(runtime_xy_calibration_window_size),
         "runtime_xy_pullback_calibration": bool(not args.disable_runtime_xy_pullback_calibration),
+        "task_frame_z_readiness_ckpt": str(getattr(args, "task_frame_z_readiness_ckpt", "")),
+        "task_frame_z_readiness_loaded": bool(task_frame_z_readiness_model is not None),
+        "task_frame_z_readiness_meta": _jsonable_value(task_frame_z_readiness_meta),
+        "task_frame_yaw_readiness_ckpt": str(getattr(args, "task_frame_yaw_readiness_ckpt", "")),
+        "task_frame_yaw_readiness_loaded": bool(task_frame_yaw_readiness_model is not None),
+        "task_frame_yaw_readiness_meta": _jsonable_value(task_frame_yaw_readiness_meta),
         "depth_error_trend": [],
     }
 
@@ -975,6 +1060,7 @@ def evaluate(args: argparse.Namespace) -> float:
         probe_observed_closed_streak = 0
         probe_sticky_steps_remaining = 0
         probe_close_arbiter_guard_steps_remaining = 0
+        runtime_xy_history: deque[dict[str, object]] = deque(maxlen=max(0, int(runtime_xy_calibration_window_size) - 1))
         alignment_session_counter = 0
         alignment_session = AlignmentTakeoverSession()
         alignment_config = AlignmentTakeoverConfig(
@@ -1030,6 +1116,15 @@ def evaluate(args: argparse.Namespace) -> float:
             delta_action = action_queue.pop(0)
             base_delta_action = delta_action.copy()
             planner_chunk_local = world_delta_to_local(np.asarray(base_delta_action[:6], dtype=np.float32), np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
+            runtime_robot_state = {
+                "invalid_action_flag": False,
+                "wrist_valid_depth_ratio": float(wrist_valid_depth_ratio),
+                "wrist_depth_near_fraction": float(wrist_depth_near_fraction),
+                "wrist_is_occluded": bool(wrist_is_occluded),
+                "wrist_is_low_visibility": bool(wrist_is_low_visibility),
+                "proprio": np.asarray(proprio, dtype=np.float32),
+                "planner_delta_7d": np.asarray(base_delta_action[:6], dtype=np.float32),
+            }
             privileged_frame_pack = _episode_privileged_frame_pack(task, obs) if args.dump_runtime_obs and args.capture_failure_target_pose else None
             probe_true_error_before = _grasp_teacher_error_from_pack(privileged_frame_pack, grasp_spec) if args.c2c_grasp_probe_policy != "off" else None
             trace_entry = {
@@ -1079,13 +1174,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 delta_action = c2c.step(
                     delta_action,
                     observation=obs,
-                    robot_state={
-                        "invalid_action_flag": False,
-                        "wrist_valid_depth_ratio": float(wrist_valid_depth_ratio),
-                        "wrist_depth_near_fraction": float(wrist_depth_near_fraction),
-                        "wrist_is_occluded": bool(wrist_is_occluded),
-                        "wrist_is_low_visibility": bool(wrist_is_low_visibility),
-                    },
+                    robot_state=runtime_robot_state,
                     task_spec=task_spec,
                     current_instruction=instruction,
                 )
@@ -1097,9 +1186,28 @@ def evaluate(args: argparse.Namespace) -> float:
                     gate_frame_saved = True
                 probe_visibility_bucket = _runtime_probe_visibility_bucket(trace_entry)
                 trace_entry["visual_observability_class"] = str(probe_visibility_bucket)
-                runtime_xy_estimate = calibrated_runtime_xy_residual_from_trace(trace_entry, runtime_xy_calibration)
+                runtime_xy_estimate = calibrated_runtime_xy_residual_from_trace(
+                    trace_entry,
+                    runtime_xy_calibration,
+                    history_rows=list(reversed(runtime_xy_history)),
+                    observation=obs.as_dict() if hasattr(obs, "as_dict") else {
+                        "wrist_rgb": getattr(obs, "wrist_rgb", None),
+                        "wrist_depth": getattr(obs, "wrist_depth", None),
+                        "front_rgb": getattr(obs, "front_rgb", None),
+                        "front_depth": getattr(obs, "front_depth", None),
+                        "gripper_pose": getattr(obs, "gripper_pose", None),
+                    },
+                    robot_state=runtime_robot_state,
+                )
                 trace_entry["runtime_xy_estimator"] = runtime_xy_estimate.to_dict()
                 trace_entry["runtime_xy_estimator_calibration_loaded"] = bool(runtime_xy_calibration is not None)
+                trace_entry["runtime_xy_estimator_history_window_size"] = int(runtime_xy_calibration_window_size)
+                trace_entry["runtime_xy_estimator_history_rows"] = int(len(runtime_xy_history))
+                trace_entry["xy_direction_confidence"] = float(getattr(runtime_xy_estimate, "xy_direction_confidence", 0.0))
+                trace_entry["xy_sign_stability"] = float(getattr(runtime_xy_estimate, "xy_sign_stability", 0.0))
+                trace_entry["xy_step_scale"] = float(getattr(runtime_xy_estimate, "xy_step_scale", 1.0))
+                trace_entry["xy_risk_reason"] = str(getattr(runtime_xy_estimate, "xy_risk_reason", ""))
+                trace_entry["xy_stall_reason"] = str(getattr(runtime_xy_estimate, "xy_stall_reason", ""))
                 probe_stage = str(trace_entry.get("c2c_v2_stage", ""))
                 probe_shell_fields = grasp_probe_shell_fields(
                     probe_true_error_before,
@@ -1282,6 +1390,37 @@ def evaluate(args: argparse.Namespace) -> float:
                         shell_fields=probe_shell_fields,
                     )
                 task_frame_residual = _task_frame_residual_from_runtime_trace(trace_entry, runtime_xy_estimate)
+                z_readiness = _task_frame_readiness_prediction(
+                    trace_entry,
+                    model=task_frame_z_readiness_model,
+                    head="z",
+                )
+                yaw_readiness = _task_frame_readiness_prediction(
+                    trace_entry,
+                    model=task_frame_yaw_readiness_model,
+                    head="yaw",
+                )
+                if isinstance(z_readiness, TaskFrameZReadinessEstimate):
+                    trace_entry.update(_jsonable_value(z_readiness.to_dict()))
+                    trace_entry["task_frame_z_ready"] = bool(z_readiness.z_ready)
+                    trace_entry["task_frame_z_readiness_loaded"] = True
+                else:
+                    trace_entry.setdefault("z_readiness_source", "heuristic_alignment_trace")
+                    trace_entry.setdefault("z_readiness_loaded", False)
+                    trace_entry["task_frame_z_readiness_loaded"] = False
+                if isinstance(yaw_readiness, TaskFrameYawReadinessEstimate):
+                    trace_entry.update(_jsonable_value(yaw_readiness.to_dict()))
+                    trace_entry["task_frame_yaw_ready"] = bool(yaw_readiness.yaw_ready)
+                    trace_entry["task_frame_yaw_readiness_loaded"] = True
+                else:
+                    trace_entry.setdefault("yaw_readiness_source", "heuristic_alignment_trace")
+                    trace_entry.setdefault("yaw_readiness_loaded", False)
+                    trace_entry["task_frame_yaw_readiness_loaded"] = False
+                task_frame_residual = _apply_task_frame_readiness_to_residual(
+                    task_frame_residual,
+                    z_readiness=z_readiness if isinstance(z_readiness, TaskFrameZReadinessEstimate) else None,
+                    yaw_readiness=yaw_readiness if isinstance(yaw_readiness, TaskFrameYawReadinessEstimate) else None,
+                )
                 alignment_readiness = evaluate_alignment_readiness(task_frame_residual, alignment_config)
                 lifecycle_enabled = bool(args.c2c_grasp_probe_policy != "off" and not args.disable_c2c_grasp_probe_alignment_lifecycle)
                 if lifecycle_enabled and probe_eligible and not alignment_session.active:
@@ -1766,6 +1905,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 trace_entry["basin_axis_source"] = str(last_trace.get("basin_axis_source", "none"))
                 trace_entry["basin_frame_consistency"] = float(last_trace.get("basin_frame_consistency", 0.0))
                 trace_entry["basin_close_ready"] = bool(last_trace.get("basin_close_ready", False))
+                trace_entry["basin_close_ready_diagnostic_legacy"] = bool(last_trace.get("basin_close_ready_diagnostic_legacy", last_trace.get("basin_close_ready", False)))
                 trace_entry["uses_privileged_target"] = False
                 trace_entry["uses_rlbench_mask_runtime"] = False
                 trace_entry["grasp_gripper_override"] = last_trace.get("grasp_gripper_override", None)
@@ -2039,6 +2179,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 success = True
             if terminate:
                 break
+            runtime_xy_history.append(dict(trace_entry))
 
         episode_mp4_path = None
         if args.record_video and args.write_episode_videos and len(frames) > 1:

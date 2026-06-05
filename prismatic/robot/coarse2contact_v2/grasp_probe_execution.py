@@ -109,19 +109,19 @@ def grasp_probe_close_arbiter_decision(
         and (bool(active) or bool(guard_active) or bool(candidate_match))
     )
     ready = bool(close_ready)
-    blocked = bool(enabled and planner_close_requested and protected_window and not ready)
+    blocked = bool(enabled and planner_close_requested and not ready)
     if not bool(enabled):
         reason = "disabled"
     elif not planner_close_requested:
         reason = "planner_open"
+    elif ready:
+        reason = "ready"
     elif str(stage_name) != "RING_GRASP_ALIGN":
         reason = "not_grasp_align"
     elif str(gripper_mode) not in {"planner_after_near", "eval_close_after_near"}:
         reason = "gripper_mode_not_arbited"
     elif not (bool(active) or bool(guard_active) or bool(candidate_match)):
         reason = "outside_guard_window"
-    elif ready:
-        reason = "ready"
     else:
         reason = "not_close_ready"
     return {
