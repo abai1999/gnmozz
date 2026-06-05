@@ -149,6 +149,13 @@ correction.
 Make v43/v44 useful as a high-precision non-privileged handoff predicate on
 actual runtime traces, then decide whether to open guarded Z micro-servo.
 
+This is no longer an open-ended diagnostics phase. The strict close gate has
+been checked enough to keep it frozen; the remaining targeted audit exists only
+to identify which Z/Yaw readiness or residual feature is blocking true handoff
+on replayable positive windows. After that, the main line should move from
+classification-only readiness toward guarded task-frame Z improvement, then
+Yaw readiness/control.
+
 The concrete target is:
 
 **On held-out random and hard-bucket runtime traces with v42 XY fixed, produce
@@ -244,7 +251,10 @@ The review outcome is positive but bounded:
 4. The remaining work is not more close plumbing; it is trace-level proof on
    the actual failure tails, followed by a cautious decision about guarded Z.
 
-That means the best next move is still to audit, not to widen the gate.
+That means the best next move is a narrow replay/audit to locate the active
+Z/Yaw blocker, not more broad diagnostics and not threshold widening. The
+engineering direction after that should be capability: improve task-frame Z
+readiness into guarded Z micro-servo, then repeat the same pattern for Yaw.
 
 ## Non-Goals
 

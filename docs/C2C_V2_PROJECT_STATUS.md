@@ -46,6 +46,11 @@ Current objective:
   targets for current-runtime recall, not as proven current-runtime false
   negatives. The strict-smoke traces did show no planner-close leak: every
   close request was blocked.
+- The project should not keep expanding diagnostics as the main work. With v42
+  fixed as the XY baseline and strict close safety intact, the highest-value
+  work is now Z/Yaw capability: replay the offline-positive windows only to
+  identify the active blocker, then improve task-frame Z readiness/control
+  before returning to Yaw readiness/control.
 
 Success means:
 
