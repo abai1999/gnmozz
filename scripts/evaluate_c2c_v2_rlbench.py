@@ -106,6 +106,16 @@ from prismatic.robot.coarse2contact_v2.task_frame_v45_candidate import (
     task_frame_v45_candidate_feature_vector,
     task_frame_v45_micro_servo_step,
 )
+from prismatic.robot.coarse2contact_v2.task_frame_v46_alignment import (
+    TaskFrameV46AlignmentCalibration,
+    TaskFrameV46AlignmentEstimate,
+    TaskFrameV46ControlDecision,
+    load_task_frame_v46_alignment_checkpoint,
+    load_task_frame_v46_yaw_control_selector_checkpoint,
+    task_frame_v46_effect_aware_xy_correction,
+    task_frame_v46_transition_command_search,
+    task_frame_v46_micro_servo_step,
+)
 from prismatic.robot.coarse2contact_v2.recovery_audit import in_close_ready_basin, in_near_grasp_basin, recovery_overshoot_flag
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import (
     RUNTIME_XY_SOFT_ACTIVATION_RADIUS,
@@ -480,6 +490,39 @@ def _load_grasp_probe_candidate_rows(path_text: str | None) -> tuple[set[tuple[i
     return keys, rows
 
 
+def _load_task_frame_command_sweep_row(path_text: str | None, row_index: int) -> dict[str, object] | None:
+    if not path_text:
+        return None
+    path = Path(path_text)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing --task_frame_v46_command_sweep_spec_jsonl: {path}")
+    rows: list[dict[str, object]] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    if not rows:
+        raise ValueError(f"Empty --task_frame_v46_command_sweep_spec_jsonl: {path}")
+    idx = int(row_index)
+    if idx < 0 or idx >= len(rows):
+        raise IndexError(f"--task_frame_v46_command_sweep_row_index {idx} outside 0..{len(rows) - 1}")
+    row = dict(rows[idx])
+    row["sweep_spec_path"] = str(path)
+    row["sweep_spec_row_index"] = int(idx)
+    return row
+
+
+def _local_6d_from_value(value: object) -> np.ndarray | None:
+    try:
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size < 6 or not np.all(np.isfinite(arr[:6])):
+        return None
+    return arr[:6].astype(np.float32)
+
+
 def _absolute_to_world_delta(abs_action: np.ndarray, current_gripper_pose: np.ndarray) -> np.ndarray:
     action = np.asarray(abs_action, dtype=np.float32).reshape(-1)
     pose = np.asarray(current_gripper_pose, dtype=np.float32).reshape(-1)
@@ -723,6 +766,100 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v45_task_frame_min_step_scale", type=float, default=0.05)
     parser.add_argument("--v45_task_frame_force_safe_threshold", type=float, default=0.18)
     parser.add_argument(
+        "--task_frame_v46_ckpt",
+        type=str,
+        default="",
+        help="Optional non-privileged unified XY/Z/Yaw task-frame alignment checkpoint.",
+    )
+    parser.add_argument(
+        "--task_frame_v46_yaw_selector_ckpt",
+        type=str,
+        default="",
+        help=(
+            "Optional non-privileged v46 yaw-control permission selector. It can only suppress yaw "
+            "micro-servo; it never grants close/handoff authority."
+        ),
+    )
+    parser.add_argument(
+        "--enable_v46_task_frame_micro_servo",
+        action="store_true",
+        default=False,
+        help="Enable the guarded unified XY/Z/Yaw v46 micro-servo for smoke/replay only.",
+    )
+    parser.add_argument("--v46_task_frame_xy_gain", type=float, default=0.35)
+    parser.add_argument("--v46_task_frame_z_gain", type=float, default=0.35)
+    parser.add_argument("--v46_task_frame_yaw_gain", type=float, default=0.25)
+    parser.add_argument("--v46_task_frame_max_xy_step", type=float, default=0.0030)
+    parser.add_argument("--v46_task_frame_max_z_step", type=float, default=0.0030)
+    parser.add_argument("--v46_task_frame_max_yaw_step", type=float, default=0.020)
+    parser.add_argument("--v46_task_frame_confidence_threshold", type=float, default=0.45)
+    parser.add_argument("--v46_task_frame_weak_confidence_threshold", type=float, default=0.20)
+    parser.add_argument("--v46_task_frame_min_step_scale", type=float, default=0.05)
+    parser.add_argument("--v46_task_frame_force_safe_threshold", type=float, default=0.18)
+    parser.add_argument(
+        "--v46_task_frame_xy_mode",
+        type=str,
+        default="hybrid_v42_preferred",
+        choices=["hybrid_v42_preferred", "unified_v46", "effect_aware", "transition_guarded_effect_aware"],
+        help=(
+            "XY control source when v46 is enabled. hybrid_v42_preferred preserves the v42 runtime-XY "
+            "baseline for XY and uses v46 for Z/Yaw unless no v42 step is available and v46 risk is normal. "
+            "effect_aware uses the learned v46/v47 XY control-effect head for bounded XY correction. "
+            "transition_guarded_effect_aware suppresses that XY correction when the command-conditioned "
+            "transition head predicts post-command XY worsen."
+        ),
+    )
+    parser.add_argument(
+        "--v46_task_frame_activation_radius",
+        type=float,
+        default=0.060,
+        help=(
+            "Estimated task-frame XY near-field radius for v46 bounded servo activation. "
+            "This gates only correction, never close/handoff."
+        ),
+    )
+    parser.add_argument(
+        "--v46_task_frame_activation_z_radius",
+        type=float,
+        default=0.040,
+        help="Estimated task-frame Z near-field radius for v46 bounded servo activation; correction-only.",
+    )
+    parser.add_argument(
+        "--v46_task_frame_near_field_threshold",
+        type=float,
+        default=0.50,
+        help=(
+            "Learned near-field confidence threshold for v46 bounded servo activation. "
+            "This gates correction only; it never grants close or handoff."
+        ),
+    )
+    parser.add_argument(
+        "--v46_task_frame_allow_learned_near_field_radius_bypass",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow the learned near-field head to activate v46 correction even when the estimated XYZ radius gate "
+            "is false. Disabled by default so learned near-field cannot create early correction far outside the "
+            "task-frame activation radius; this affects correction only, never close/handoff."
+        ),
+    )
+    parser.add_argument(
+        "--task_frame_v46_command_sweep_spec_jsonl",
+        type=str,
+        default="",
+        help=(
+            "Optional v59 command-sweep spec JSONL. When set with "
+            "--task_frame_v46_command_sweep_row_index, the evaluator executes that single bounded "
+            "candidate command at its matching episode/step for transition data collection only."
+        ),
+    )
+    parser.add_argument(
+        "--task_frame_v46_command_sweep_row_index",
+        type=int,
+        default=-1,
+        help="Row index inside --task_frame_v46_command_sweep_spec_jsonl to execute. Negative disables sweep execution.",
+    )
+    parser.add_argument(
         "--c2c_grasp_probe_smoke_type",
         type=str,
         default="diagnostic_privileged_probe",
@@ -939,11 +1076,16 @@ def evaluate(args: argparse.Namespace) -> float:
     grasp_probe_candidate_keys, grasp_probe_candidate_rows = _load_grasp_probe_candidate_rows(
         getattr(args, "c2c_grasp_probe_candidate_jsonl", "")
     )
+    task_frame_v46_command_sweep_row = _load_task_frame_command_sweep_row(
+        getattr(args, "task_frame_v46_command_sweep_spec_jsonl", ""),
+        int(getattr(args, "task_frame_v46_command_sweep_row_index", -1)),
+    )
     runtime_xy_calibration = RuntimeXYAffineCalibration.load(getattr(args, "runtime_xy_calibration_json", "") or None)
     runtime_xy_calibration_window_size = max(1, int(getattr(runtime_xy_calibration, "window_size", 1) if runtime_xy_calibration is not None else 1))
     task_frame_z_readiness_model = None
     task_frame_yaw_readiness_model = None
     task_frame_v45_model = None
+    task_frame_v46_calibration = None
     if str(getattr(args, "task_frame_z_readiness_ckpt", "") or ""):
         task_frame_z_readiness_model, task_frame_z_readiness_meta = load_task_frame_readiness_checkpoint(
             getattr(args, "task_frame_z_readiness_ckpt"),
@@ -965,6 +1107,21 @@ def evaluate(args: argparse.Namespace) -> float:
         )
     else:
         task_frame_v45_meta = {}
+    if str(getattr(args, "task_frame_v46_ckpt", "") or ""):
+        task_frame_v46_calibration, task_frame_v46_meta = load_task_frame_v46_alignment_checkpoint(
+            getattr(args, "task_frame_v46_ckpt"),
+            map_location="cpu",
+        )
+    else:
+        task_frame_v46_meta = {}
+    if str(getattr(args, "task_frame_v46_yaw_selector_ckpt", "") or ""):
+        task_frame_v46_yaw_selector, task_frame_v46_yaw_selector_meta = load_task_frame_v46_yaw_control_selector_checkpoint(
+            getattr(args, "task_frame_v46_yaw_selector_ckpt"),
+            map_location="cpu",
+        )
+    else:
+        task_frame_v46_yaw_selector = None
+        task_frame_v46_yaw_selector_meta = {}
 
     vla, processor, action_head, proprio_projector, norm_stats = load_checkpoint(
         args.checkpoint_dir,
@@ -1039,6 +1196,12 @@ def evaluate(args: argparse.Namespace) -> float:
         "c2c_grasp_probe_flush_planner_queue": bool(args.c2c_grasp_probe_flush_planner_queue),
         "c2c_grasp_probe_window_mode": str(args.c2c_grasp_probe_window_mode),
         "c2c_grasp_probe_shell_filter": str(args.c2c_grasp_probe_shell_filter),
+        "task_frame_v46_command_sweep_spec_jsonl": str(getattr(args, "task_frame_v46_command_sweep_spec_jsonl", "")),
+        "task_frame_v46_command_sweep_row_index": int(getattr(args, "task_frame_v46_command_sweep_row_index", -1)),
+        "task_frame_v46_command_sweep_loaded": bool(task_frame_v46_command_sweep_row is not None),
+        "task_frame_v46_command_sweep_candidate_name": (
+            str(task_frame_v46_command_sweep_row.get("candidate_name", "")) if task_frame_v46_command_sweep_row else ""
+        ),
         "c2c_grasp_probe_frontier_pullback_xy_threshold": float(args.c2c_grasp_probe_frontier_pullback_xy_threshold),
         "close_ready_z_threshold": float(args.close_ready_z_threshold),
         "c2c_grasp_probe_max_candidate_xy_error": (
@@ -1080,6 +1243,13 @@ def evaluate(args: argparse.Namespace) -> float:
         "task_frame_v45_loaded": bool(task_frame_v45_model is not None),
         "task_frame_v45_meta": _jsonable_value(task_frame_v45_meta),
         "enable_v45_task_frame_micro_servo": bool(args.enable_v45_task_frame_micro_servo),
+        "task_frame_v46_ckpt": str(getattr(args, "task_frame_v46_ckpt", "")),
+        "task_frame_v46_loaded": bool(task_frame_v46_calibration is not None),
+        "task_frame_v46_meta": _jsonable_value(task_frame_v46_meta),
+        "task_frame_v46_yaw_selector_ckpt": str(getattr(args, "task_frame_v46_yaw_selector_ckpt", "")),
+        "task_frame_v46_yaw_selector_loaded": bool(task_frame_v46_yaw_selector is not None),
+        "task_frame_v46_yaw_selector_meta": _jsonable_value(task_frame_v46_yaw_selector_meta),
+        "enable_v46_task_frame_micro_servo": bool(args.enable_v46_task_frame_micro_servo),
         "v45_task_frame_z_gain": float(args.v45_task_frame_z_gain),
         "v45_task_frame_yaw_gain": float(args.v45_task_frame_yaw_gain),
         "v45_task_frame_max_z_step": float(args.v45_task_frame_max_z_step),
@@ -1223,6 +1393,36 @@ def evaluate(args: argparse.Namespace) -> float:
                 ),
                 "runtime_xy_pullback_calibration": bool(not args.disable_runtime_xy_pullback_calibration),
             }
+            task_frame_v46_sweep_active = False
+            task_frame_v46_sweep_command = None
+            task_frame_v46_sweep_step = None
+            if task_frame_v46_command_sweep_row is not None:
+                sweep_ep = int(task_frame_v46_command_sweep_row.get("episode_idx", -1))
+                sweep_step = int(task_frame_v46_command_sweep_row.get("step_idx", task_frame_v46_command_sweep_row.get("step", -1)))
+                task_frame_v46_sweep_active = bool(int(ep_idx) == sweep_ep and int(step_idx) == sweep_step)
+                if task_frame_v46_sweep_active:
+                    task_frame_v46_sweep_command = _local_6d_from_value(task_frame_v46_command_sweep_row.get("candidate_command_local_6d"))
+                    task_frame_v46_sweep_step = _local_6d_from_value(task_frame_v46_command_sweep_row.get("candidate_step_local_6d"))
+                    if task_frame_v46_sweep_command is None:
+                        task_frame_v46_sweep_active = False
+            trace_entry["task_frame_v46_command_sweep_enabled"] = bool(task_frame_v46_command_sweep_row is not None)
+            trace_entry["task_frame_v46_command_sweep_active"] = bool(task_frame_v46_sweep_active)
+            trace_entry["task_frame_v46_command_sweep_spec_path"] = (
+                str(task_frame_v46_command_sweep_row.get("sweep_spec_path", "")) if task_frame_v46_command_sweep_row else ""
+            )
+            trace_entry["task_frame_v46_command_sweep_row_index"] = (
+                int(task_frame_v46_command_sweep_row.get("sweep_spec_row_index", -1)) if task_frame_v46_command_sweep_row else -1
+            )
+            trace_entry["task_frame_v46_command_sweep_candidate_name"] = (
+                str(task_frame_v46_command_sweep_row.get("candidate_name", "")) if task_frame_v46_command_sweep_row else ""
+            )
+            trace_entry["task_frame_v46_command_sweep_candidate_step_local_6d"] = _jsonable_value(
+                task_frame_v46_sweep_step if task_frame_v46_sweep_step is not None else np.zeros(6, dtype=np.float32)
+            )
+            trace_entry["task_frame_v46_command_sweep_candidate_command_local_6d"] = _jsonable_value(
+                task_frame_v46_sweep_command if task_frame_v46_sweep_command is not None else np.zeros(6, dtype=np.float32)
+            )
+            trace_entry["task_frame_v46_command_sweep_executed"] = False
             _attach_offline_eval_only(trace_entry, privileged_frame_pack)
 
             if c2c is not None:
@@ -1498,11 +1698,12 @@ def evaluate(args: argparse.Namespace) -> float:
                     yaw_readiness=yaw_readiness if isinstance(yaw_readiness, TaskFrameYawReadinessEstimate) else None,
                 )
                 alignment_readiness = evaluate_alignment_readiness(task_frame_residual, alignment_config)
+                raw_force_norm = float(np.linalg.norm(np.asarray(raw_force if raw_force is not None else np.zeros(6, dtype=np.float32), dtype=np.float32)))
+                trace_entry["task_frame_force_norm"] = float(raw_force_norm)
                 task_frame_v45_estimate = None
                 task_frame_v45_decision = None
                 task_frame_v45_local_step = np.zeros(6, dtype=np.float32)
                 if bool(args.enable_v45_task_frame_micro_servo) and task_frame_v45_model is not None:
-                    raw_force_norm = float(np.linalg.norm(np.asarray(raw_force if raw_force is not None else np.zeros(6, dtype=np.float32), dtype=np.float32)))
                     trace_entry["task_frame_v45_force_norm"] = float(raw_force_norm)
                     task_frame_v45_estimate, task_frame_v45_decision, task_frame_v45_local_step = task_frame_v45_micro_servo_step(
                         trace_entry,
@@ -1529,8 +1730,186 @@ def evaluate(args: argparse.Namespace) -> float:
                     trace_entry["task_frame_v45_yaw_block_reason"] = "disabled"
                     trace_entry["task_frame_v45_step_scale"] = 0.0
                 trace_entry["task_frame_v45_enabled"] = bool(args.enable_v45_task_frame_micro_servo and task_frame_v45_model is not None)
+                task_frame_v46_estimate = None
+                task_frame_v46_decision = None
+                task_frame_v46_local_step = np.zeros(6, dtype=np.float32)
+                if bool(args.enable_v46_task_frame_micro_servo) and task_frame_v46_calibration is not None:
+                    runtime_observation_map = {
+                        "wrist_rgb": getattr(obs, "wrist_rgb", None),
+                        "wrist_depth": getattr(obs, "wrist_depth", None),
+                        "front_rgb": getattr(obs, "front_rgb", None),
+                        "front_depth": getattr(obs, "front_depth", None),
+                    }
+                    task_frame_v46_estimate = task_frame_v46_calibration.predict_from_trace(
+                        trace_entry,
+                        observation=runtime_observation_map,
+                        robot_state=runtime_robot_state,
+                        history_rows=list(runtime_xy_history),
+                    )
+                    task_frame_v46_yaw_selector_decision = None
+                    if task_frame_v46_yaw_selector is not None:
+                        task_frame_v46_yaw_selector_decision = task_frame_v46_yaw_selector.predict_from_trace(
+                            trace_entry,
+                            task_frame_v46_estimate,
+                            observation=runtime_observation_map,
+                            robot_state=runtime_robot_state,
+                            image_crop_size=int(task_frame_v46_calibration.image_crop_size),
+                            image_resize_size=int(task_frame_v46_calibration.image_resize_size),
+                        )
+                        trace_entry.update(_jsonable_value(task_frame_v46_yaw_selector_decision.to_dict()))
+                    else:
+                        trace_entry["task_frame_v46_yaw_selector_loaded"] = False
+                        trace_entry["task_frame_v46_yaw_selector_allowed"] = True
+                        trace_entry["task_frame_v46_yaw_selector_block_reason"] = "not_configured"
+                        trace_entry["task_frame_v46_yaw_selector_uses_privileged_runtime"] = False
+                        trace_entry["task_frame_v46_yaw_selector_close_control_allowed"] = False
+                    task_frame_v46_decision, task_frame_v46_local_step = task_frame_v46_micro_servo_step(
+                        task_frame_v46_estimate,
+                        history_rows=list(runtime_xy_history),
+                        force_safe=bool(raw_force_norm < float(args.v46_task_frame_force_safe_threshold)),
+                        xy_gain=float(args.v46_task_frame_xy_gain),
+                        z_gain=float(args.v46_task_frame_z_gain),
+                        yaw_gain=float(args.v46_task_frame_yaw_gain),
+                        max_xy_step=float(args.v46_task_frame_max_xy_step),
+                        max_z_step=float(args.v46_task_frame_max_z_step),
+                        max_yaw_step=float(args.v46_task_frame_max_yaw_step),
+                        confidence_threshold=float(args.v46_task_frame_confidence_threshold),
+                        weak_confidence_threshold=float(args.v46_task_frame_weak_confidence_threshold),
+                        min_step_scale=float(args.v46_task_frame_min_step_scale),
+                        low_visibility=bool(wrist_is_low_visibility or wrist_is_occluded),
+                        yaw_selector_decision=task_frame_v46_yaw_selector_decision,
+                    )
+                    trace_entry.update(_jsonable_value(task_frame_v46_estimate.to_dict()))
+                    trace_entry.update(_jsonable_value(task_frame_v46_decision.to_dict()))
+                    trace_entry["task_frame_v46_raw_decision_applied"] = bool(task_frame_v46_decision.applied)
+                    trace_entry["task_frame_v46_applied"] = False
+                else:
+                    trace_entry["task_frame_v46_raw_decision_applied"] = False
+                    trace_entry["task_frame_v46_applied"] = False
+                    trace_entry["task_frame_v46_block_reason"] = "disabled"
+                    trace_entry["task_frame_v46_xy_block_reason"] = "disabled"
+                    trace_entry["task_frame_v46_z_block_reason"] = "disabled"
+                    trace_entry["task_frame_v46_yaw_block_reason"] = "disabled"
+                    trace_entry["task_frame_v46_close_control_allowed"] = False
+                    trace_entry["task_frame_v46_yaw_selector_loaded"] = False
+                    trace_entry["task_frame_v46_yaw_selector_allowed"] = False
+                    trace_entry["task_frame_v46_yaw_selector_block_reason"] = "v46_disabled"
+                    trace_entry["task_frame_v46_yaw_selector_uses_privileged_runtime"] = False
+                    trace_entry["task_frame_v46_yaw_selector_close_control_allowed"] = False
+                trace_entry["task_frame_v46_enabled"] = bool(args.enable_v46_task_frame_micro_servo and task_frame_v46_calibration is not None)
+                task_frame_v46_estimated_near_norm = float("nan")
+                task_frame_v46_estimated_xy_norm = float("nan")
+                task_frame_v46_estimated_z_abs = float("nan")
+                task_frame_v46_activation_ready = False
+                task_frame_v46_activation_reason = "disabled"
+                task_frame_v46_radius_ready = False
+                task_frame_v46_learned_near_ready = False
+                task_frame_v46_near_field_activation_ready = False
+                task_frame_v46_near_field_confidence = float("nan")
+                task_frame_v46_near_field_available = False
+                if task_frame_v46_estimate is not None and task_frame_v46_decision is not None:
+                    task_frame_v46_estimated_xy_norm = float(
+                        np.linalg.norm(
+                            np.asarray(
+                                [float(task_frame_v46_estimate.dx), float(task_frame_v46_estimate.dy)],
+                                dtype=np.float32,
+                            )
+                        )
+                    )
+                    task_frame_v46_estimated_z_abs = float(abs(float(task_frame_v46_estimate.dz)))
+                    task_frame_v46_estimated_near_norm = float(
+                        np.linalg.norm(
+                            np.asarray(
+                                [
+                                    float(task_frame_v46_estimate.dx),
+                                    float(task_frame_v46_estimate.dy),
+                                    float(task_frame_v46_estimate.dz),
+                                ],
+                                dtype=np.float32,
+                            )
+                        )
+                    )
+                    task_frame_v46_near_field_confidence = float(
+                        getattr(task_frame_v46_estimate, "near_field_confidence", 0.0)
+                    )
+                    task_frame_v46_near_field_available = bool(
+                        getattr(task_frame_v46_estimate, "near_field_head_available", False)
+                    )
+                    task_frame_v46_radius_ready = bool(
+                        np.isfinite(task_frame_v46_estimated_xy_norm)
+                        and np.isfinite(task_frame_v46_estimated_z_abs)
+                        and task_frame_v46_estimated_xy_norm <= float(args.v46_task_frame_activation_radius) + 1.0e-9
+                        and task_frame_v46_estimated_z_abs <= float(args.v46_task_frame_activation_z_radius) + 1.0e-9
+                    )
+                    task_frame_v46_learned_near_ready = bool(
+                        task_frame_v46_near_field_available
+                        and np.isfinite(task_frame_v46_near_field_confidence)
+                        and task_frame_v46_near_field_confidence >= float(args.v46_task_frame_near_field_threshold)
+                    )
+                    task_frame_v46_near_field_activation_ready = bool(
+                        task_frame_v46_radius_ready
+                        and (
+                            task_frame_v46_learned_near_ready
+                            or not task_frame_v46_near_field_available
+                        )
+                    )
+                    if bool(args.v46_task_frame_allow_learned_near_field_radius_bypass):
+                        task_frame_v46_near_field_activation_ready = bool(
+                            task_frame_v46_near_field_activation_ready or task_frame_v46_learned_near_ready
+                        )
+                    task_frame_v46_activation_ready = bool(
+                        probe_stage_ok
+                        and probe_visibility_bucket != "prior_only"
+                        and task_frame_v46_near_field_activation_ready
+                        and bool(task_frame_v46_decision.applied)
+                    )
+                    if task_frame_v46_activation_ready:
+                        task_frame_v46_activation_reason = (
+                            "v46_learned_near_field_ready"
+                            if task_frame_v46_learned_near_ready
+                            else "v46_axis_evidence_ready"
+                        )
+                    elif not probe_stage_ok:
+                        task_frame_v46_activation_reason = "not_grasp_align_stage"
+                    elif probe_visibility_bucket == "prior_only":
+                        task_frame_v46_activation_reason = "prior_only_visibility"
+                    elif not np.isfinite(task_frame_v46_estimated_xy_norm) or not np.isfinite(task_frame_v46_estimated_z_abs):
+                        task_frame_v46_activation_reason = "invalid_estimated_residual"
+                    elif (
+                        task_frame_v46_estimated_xy_norm > float(args.v46_task_frame_activation_radius) + 1.0e-9
+                        and not task_frame_v46_learned_near_ready
+                    ):
+                        task_frame_v46_activation_reason = "outside_v46_xy_activation_radius"
+                    elif (
+                        task_frame_v46_estimated_z_abs > float(args.v46_task_frame_activation_z_radius) + 1.0e-9
+                        and not task_frame_v46_learned_near_ready
+                    ):
+                        task_frame_v46_activation_reason = "outside_v46_z_activation_radius"
+                    else:
+                        task_frame_v46_activation_reason = str(getattr(task_frame_v46_decision, "block_reason", "axis_not_ready"))
+                if bool(task_frame_v46_sweep_active):
+                    task_frame_v46_activation_ready = True
+                    task_frame_v46_activation_reason = "v46_command_sweep_spec"
+                trace_entry["task_frame_v46_activation_radius"] = float(args.v46_task_frame_activation_radius)
+                trace_entry["task_frame_v46_activation_z_radius"] = float(args.v46_task_frame_activation_z_radius)
+                trace_entry["task_frame_v46_near_field_threshold"] = float(args.v46_task_frame_near_field_threshold)
+                trace_entry["task_frame_v46_radius_ready"] = bool(task_frame_v46_radius_ready)
+                trace_entry["task_frame_v46_learned_near_field_ready"] = bool(task_frame_v46_learned_near_ready)
+                trace_entry["task_frame_v46_learned_near_field_radius_bypass_allowed"] = bool(
+                    args.v46_task_frame_allow_learned_near_field_radius_bypass
+                )
+                trace_entry["task_frame_v46_near_field_activation_ready"] = bool(
+                    task_frame_v46_near_field_activation_ready
+                )
+                trace_entry["task_frame_v46_near_field_confidence"] = float(task_frame_v46_near_field_confidence)
+                trace_entry["task_frame_v46_near_field_head_available"] = bool(task_frame_v46_near_field_available)
+                trace_entry["task_frame_v46_estimated_near_norm"] = float(task_frame_v46_estimated_near_norm)
+                trace_entry["task_frame_v46_estimated_xy_norm"] = float(task_frame_v46_estimated_xy_norm)
+                trace_entry["task_frame_v46_estimated_z_abs"] = float(task_frame_v46_estimated_z_abs)
+                trace_entry["task_frame_v46_activation_ready"] = bool(task_frame_v46_activation_ready)
+                trace_entry["task_frame_v46_activation_reason"] = str(task_frame_v46_activation_reason)
                 lifecycle_enabled = bool(args.c2c_grasp_probe_policy != "off" and not args.disable_c2c_grasp_probe_alignment_lifecycle)
-                if lifecycle_enabled and probe_eligible and not alignment_session.active:
+                if lifecycle_enabled and (probe_eligible or task_frame_v46_activation_ready) and not alignment_session.active:
                     alignment_session_counter += 1
                     alignment_session = alignment_session.begin(alignment_session_counter)
                 alignment_visual_ready = bool(
@@ -1543,7 +1922,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 )
                 if lifecycle_enabled:
                     alignment_session = alignment_session.update(
-                        eligible_now=bool(probe_eligible),
+                        eligible_now=bool(probe_eligible or task_frame_v46_activation_ready),
                         visual_ready=bool(alignment_visual_ready),
                         readiness=alignment_readiness,
                         config=alignment_config,
@@ -1567,10 +1946,12 @@ def evaluate(args: argparse.Namespace) -> float:
                 probe_takeover_active = bool(
                     lifecycle_takeover_active
                     or probe_eligible
+                    or task_frame_v46_activation_ready
                     or (sticky_takeover_active and not lifecycle_enabled)
                 )
                 probe_control_step_ready = bool(
                     probe_eligible
+                    or task_frame_v46_activation_ready
                     or (
                         lifecycle_takeover_active
                         and probe_stage_ok
@@ -1585,6 +1966,7 @@ def evaluate(args: argparse.Namespace) -> float:
                 )
                 trace_entry["grasp_probe_active"] = bool(probe_takeover_active)
                 trace_entry["grasp_probe_control_step_ready"] = bool(probe_control_step_ready)
+                trace_entry["grasp_probe_v46_activation_active"] = bool(task_frame_v46_activation_ready)
                 trace_entry["task_frame_residual_estimate"] = _jsonable_value(task_frame_residual.to_dict())
                 trace_entry.update(_jsonable_value(alignment_readiness.to_dict()))
                 trace_entry.update(_jsonable_value(alignment_session.to_trace()))
@@ -1640,7 +2022,10 @@ def evaluate(args: argparse.Namespace) -> float:
                     and float(probe_runtime_estimator_residual_norm_xy if str(args.c2c_grasp_probe_policy) == "runtime_estimator_xy" else probe_residual_norm_xy) < float(args.c2c_grasp_probe_micro_deadband)
                 )
                 probe_micro_hysteresis_alpha_used = float(args.c2c_grasp_probe_correction_ema_alpha)
-                if probe_control_step_ready:
+                legacy_xy_probe_suppressed_by_v46 = bool(
+                    task_frame_v46_activation_ready and str(args.v46_task_frame_xy_mode) in {"unified_v46", "effect_aware", "transition_guarded_effect_aware"}
+                )
+                if probe_control_step_ready and not legacy_xy_probe_suppressed_by_v46:
                     if str(args.c2c_grasp_probe_policy) == "runtime_estimator_xy":
                         if bool(runtime_xy_estimate.entry_ready):
                             probe_raw_correction_local = _bounded_xy_estimator_probe_step(
@@ -1701,14 +2086,123 @@ def evaluate(args: argparse.Namespace) -> float:
                     probe_local_command = current_local_command.copy()
                     probe_local_command[0] += float(probe_applied_correction_local[0])
                     probe_local_command[1] += float(probe_applied_correction_local[1])
-                    if bool(task_frame_v45_decision is not None and task_frame_v45_decision.applied):
+                    if bool(
+                        task_frame_v46_decision is not None
+                        and (task_frame_v46_decision.applied or task_frame_v46_sweep_active)
+                        and task_frame_v46_activation_ready
+                    ):
+                        legacy_xy_available = bool(
+                            np.linalg.norm(np.asarray(probe_applied_correction_local[:2], dtype=np.float32)) > 0.0
+                        )
+                        xy_mode = str(args.v46_task_frame_xy_mode)
+                        use_transition_guarded_xy = bool(xy_mode == "transition_guarded_effect_aware")
+                        use_effect_aware_xy = bool(xy_mode in {"effect_aware", "transition_guarded_effect_aware"})
+                        use_v46_xy = bool(
+                            xy_mode == "unified_v46"
+                            or (
+                                xy_mode == "hybrid_v42_preferred"
+                                and not legacy_xy_available
+                                and str(getattr(task_frame_v46_estimate, "risk_reason", "")) == "normal"
+                            )
+                        )
+                        if use_effect_aware_xy:
+                            effect_xy = task_frame_v46_effect_aware_xy_correction(
+                                task_frame_v46_estimate,
+                                current_local_xy=np.asarray(current_local_command[:2], dtype=np.float32),
+                                max_xy_step=float(args.v46_task_frame_max_xy_step),
+                            )
+                            if use_transition_guarded_xy:
+                                proposed_step = task_frame_v46_local_step.copy()
+                                proposed_step[0] = float(effect_xy[0])
+                                proposed_step[1] = float(effect_xy[1])
+
+                                def _predict_transition(command_6d: np.ndarray) -> dict:
+                                    if task_frame_v46_calibration is None:
+                                        return {"valid": False, "reason": "missing_calibration"}
+                                    return task_frame_v46_calibration.predict_command_transition_from_trace(
+                                        trace_entry,
+                                        observation=runtime_observation_map,
+                                        robot_state=runtime_robot_state,
+                                        history_rows=list(runtime_xy_history),
+                                        command_6d=command_6d,
+                                    )
+
+                                command_search = task_frame_v46_transition_command_search(
+                                    task_frame_v46_estimate,
+                                    base_command_local_6d=probe_local_command,
+                                    proposed_step_local_6d=proposed_step,
+                                    transition_predictor=_predict_transition,
+                                    max_xy_step=float(args.v46_task_frame_max_xy_step),
+                                    max_z_step=float(args.v46_task_frame_max_z_step),
+                                    max_yaw_step=float(args.v46_task_frame_max_yaw_step),
+                                )
+                                trace_entry.update(_jsonable_value(command_search.to_dict()))
+                                selected_step = np.asarray(command_search.selected_step_local_6d, dtype=np.float32)
+                                effect_xy = selected_step[:2].astype(np.float32)
+                                task_frame_v46_local_step = task_frame_v46_local_step.copy()
+                                task_frame_v46_local_step[2] = float(selected_step[2])
+                                task_frame_v46_local_step[5] = float(selected_step[5])
+                                trace_entry["task_frame_v46_command_transition_valid"] = bool(command_search.valid)
+                                trace_entry["task_frame_v46_command_transition_reason"] = str(command_search.reason)
+                                residual_xy = np.asarray([float(task_frame_v46_estimate.dx), float(task_frame_v46_estimate.dy)], dtype=np.float32)
+                                selected_delta = np.asarray(command_search.selected_delta, dtype=np.float32)
+                                predicted_post_xy = residual_xy + selected_delta[:2]
+                                trace_entry["task_frame_v46_command_transition_pre_xy_norm"] = float(np.linalg.norm(residual_xy))
+                                trace_entry["task_frame_v46_command_transition_post_xy_norm"] = float(np.linalg.norm(predicted_post_xy))
+                                trace_entry["task_frame_v46_command_transition_pre_z_abs"] = float(abs(float(task_frame_v46_estimate.dz)))
+                                trace_entry["task_frame_v46_command_transition_post_z_abs"] = float(abs(float(task_frame_v46_estimate.dz) + float(selected_delta[2])))
+                            probe_local_command[0] += float(effect_xy[0])
+                            probe_local_command[1] += float(effect_xy[1])
+                        elif use_v46_xy:
+                            probe_local_command[0] += float(task_frame_v46_local_step[0])
+                            probe_local_command[1] += float(task_frame_v46_local_step[1])
+                        probe_local_command[2] += float(task_frame_v46_local_step[2])
+                        probe_local_command[5] += float(task_frame_v46_local_step[5])
+                        applied_v46_local_step = task_frame_v46_local_step.copy()
+                        if use_effect_aware_xy:
+                            applied_v46_local_step[0] = float(effect_xy[0])
+                            applied_v46_local_step[1] = float(effect_xy[1])
+                        elif not use_v46_xy:
+                            applied_v46_local_step[0] = 0.0
+                            applied_v46_local_step[1] = 0.0
+                        if bool(task_frame_v46_sweep_active and task_frame_v46_sweep_command is not None):
+                            sweep_command = np.asarray(task_frame_v46_sweep_command, dtype=np.float32).reshape(6)
+                            applied_v46_local_step = (sweep_command - current_local_command).astype(np.float32)
+                            probe_local_command = sweep_command.astype(np.float32)
+                            trace_entry["task_frame_v46_command_sweep_executed"] = True
+                        else:
+                            trace_entry["task_frame_v46_command_sweep_executed"] = False
+                        trace_entry["task_frame_v46_applied_local_6d"] = _jsonable_value(applied_v46_local_step)
+                        task_frame_v46_actual_step_norm = float(np.linalg.norm(np.asarray(applied_v46_local_step, dtype=np.float32)))
+                        trace_entry["task_frame_v46_actual_step_norm"] = float(task_frame_v46_actual_step_norm)
+                        trace_entry["task_frame_v46_applied"] = bool(task_frame_v46_actual_step_norm > 1.0e-9)
+                        trace_entry["task_frame_v46_xy_control_source"] = (
+                            "command_sweep_spec" if task_frame_v46_sweep_active else
+                            "transition_guarded_effect_aware" if (use_transition_guarded_xy and task_frame_v46_actual_step_norm > 1.0e-9) else
+                            "transition_guarded_suppressed" if use_transition_guarded_xy else
+                            "effect_aware" if use_effect_aware_xy else
+                            "v46" if use_v46_xy else
+                            "v42_runtime_xy" if legacy_xy_available else
+                            "none"
+                        )
+                        trace_entry["task_frame_v46_xy_control_suppressed"] = bool(
+                            (use_transition_guarded_xy and task_frame_v46_actual_step_norm <= 1.0e-9)
+                            or not (use_v46_xy or use_effect_aware_xy)
+                        )
+                        trace_entry.setdefault("task_frame_v45_applied_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32)))
+                        trace_entry["task_frame_v45_applied"] = False
+                    elif bool(task_frame_v45_decision is not None and task_frame_v45_decision.applied):
                         probe_local_command[2] += float(task_frame_v45_local_step[2])
                         probe_local_command[5] += float(task_frame_v45_local_step[5])
                         trace_entry["task_frame_v45_applied_local_6d"] = _jsonable_value(task_frame_v45_local_step)
                         trace_entry["task_frame_v45_applied"] = True
+                        trace_entry.setdefault("task_frame_v46_applied_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32)))
+                        trace_entry["task_frame_v46_applied"] = False
                     else:
                         trace_entry.setdefault("task_frame_v45_applied_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32)))
                         trace_entry["task_frame_v45_applied"] = False
+                        trace_entry.setdefault("task_frame_v46_applied_local_6d", _jsonable_value(np.zeros(6, dtype=np.float32)))
+                        trace_entry["task_frame_v46_applied"] = False
                     probe_world_delta = local_delta_to_world(probe_local_command, np.asarray(obs.gripper_pose[3:7], dtype=np.float32)).astype(np.float32)
                     delta_action = delta_action.copy()
                     delta_action[:6] = probe_world_delta[:6]
@@ -1726,6 +2220,7 @@ def evaluate(args: argparse.Namespace) -> float:
                     trace_entry["grasp_probe_smoothed_xy_step_local_6d"] = _jsonable_value(probe_applied_correction_local)
                     trace_entry["grasp_probe_applied_xy_step_local_6d"] = _jsonable_value(probe_applied_correction_local)
                     trace_entry["grasp_probe_micro_deadband_active"] = bool(probe_micro_deadband_active)
+                    trace_entry["grasp_probe_legacy_xy_suppressed_by_v46"] = bool(legacy_xy_probe_suppressed_by_v46)
                     trace_entry["grasp_probe_pre_near_or_micro_for_diagnostic"] = bool(probe_pre_near_or_micro)
                     trace_entry["grasp_probe_pre_close_ready_for_handoff"] = bool(probe_pre_close_ready)
                     trace_entry["alignment_ready_for_handoff"] = bool(probe_pre_close_ready)

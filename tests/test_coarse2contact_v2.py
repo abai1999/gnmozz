@@ -18,9 +18,15 @@ from prismatic.robot.coarse2contact_v2 import (
     PrecisionSkillSupervisor,
     TaskFrameResidualEstimate,
     TASK_FRAME_V45_RISK_CLASSES,
+    TASK_FRAME_V46_RISK_CLASSES,
     TaskFrameV45CandidateEstimate,
     TaskFrameV45CandidateNet,
     TaskFrameV45MicroServoDecision,
+    TaskFrameV46AlignmentEstimate,
+    TaskFrameV46AlignmentNet,
+    TaskFrameV46ControlDecision,
+    TaskFrameV46YawControlSelectorDecision,
+    TaskFrameV46YawControlSelectorNet,
     DepthGeometryLocalizerNet,
     LocalGeometryError,
     RECOVERY_MAINLINE_CHECKPOINT,
@@ -46,7 +52,15 @@ from prismatic.robot.coarse2contact_v2 import (
     load_precision_task_spec,
     load_task_frame_v45_candidate_checkpoint,
     save_task_frame_v45_candidate_checkpoint,
+    save_task_frame_v46_alignment_checkpoint,
     task_frame_v45_micro_servo_step,
+    load_task_frame_v46_alignment_checkpoint,
+    load_task_frame_v46_yaw_control_selector_checkpoint,
+    task_frame_v46_labels_from_row,
+    task_frame_v46_effect_aware_xy_correction,
+    task_frame_v46_micro_servo_step,
+    task_frame_v46_transition_command_search,
+    task_frame_v46_yaw_selector_feature_names,
 )
 from prismatic.robot.coarse2contact_v2.recovery_audit import planner_bias_xyyaw, recovery_phase_label, trace_episode_index
 from prismatic.robot.coarse2contact_v2.recovery_audit import (
@@ -70,6 +84,24 @@ from scripts.audit_c2c_v2_frame_contract_relabel import audit as audit_frame_con
 from scripts.audit_c2c_v2_frame_contract_relabel import _apply_calibrated_yaw_observability
 from scripts.audit_c2c_v2_grasp_failure_tail_intervention import audit as audit_grasp_failure_tail_intervention
 from scripts.audit_c2c_v2_grasp_intervention import audit as audit_grasp_intervention
+from scripts.audit_c2c_v2_task_frame_zero_adjusted_effect import audit as audit_v46_zero_adjusted_effect
+from scripts.audit_c2c_v2_task_frame_yaw_transition_effect import audit as audit_v46_yaw_transition_effect
+from scripts.build_c2c_v2_task_frame_v46_manifest import build_manifest as build_v46_task_frame_manifest
+from scripts.build_c2c_v2_task_frame_applied_transition_manifest import build_manifest as build_v46_applied_transition_manifest
+from scripts.build_c2c_v2_task_frame_command_sweep_spec import build_manifest as build_v46_command_sweep_spec
+from scripts.build_c2c_v2_task_frame_nearfield_manifest import build_manifest as build_v46_nearfield_manifest
+from scripts.run_c2c_v2_task_frame_command_sweep_batch import (
+    DEFAULT_PLANNER_CHECKPOINT as V59_DEFAULT_PLANNER_CHECKPOINT,
+    build_eval_command as build_v59_sweep_eval_command,
+    output_root_for_row as v59_sweep_output_root_for_row,
+    run_batch as run_v59_sweep_batch,
+    select_sweep_rows as select_v59_sweep_rows,
+)
+from scripts.summarize_c2c_v2_task_frame_v46_gate import summarize as summarize_v46_gate
+from scripts.audit_c2c_v2_task_frame_yaw_holdout_coverage import audit_coverage as audit_v46_yaw_holdout_coverage
+from scripts.audit_c2c_v2_task_frame_yaw_model_observability import audit_model_observability as audit_v46_yaw_model_observability
+from scripts.audit_c2c_v2_task_frame_yaw_observability_shift import audit_shift as audit_v46_yaw_observability_shift
+from scripts.train_c2c_v2_task_frame_v46_yaw_control_selector import train as train_v46_yaw_control_selector
 from scripts.audit_c2c_v2_small_xy_micro_stability import audit as audit_small_xy_micro_stability
 from scripts.audit_c2c_v2_yaw_threshold_sweep import sweep as audit_yaw_threshold_sweep
 from scripts.compare_c2c_v2_queue_flush_ablation import compare as compare_queue_flush_ablation
@@ -96,6 +128,24 @@ from scripts.train_c2c_v2_xy_spatial_temporal import _load_generalization_gate_r
 from scripts.train_c2c_v2_xy_spatial_temporal import _selection_score
 from scripts.train_c2c_v2_xy_spatial_temporal import _worst_case_selection_score
 from scripts.train_c2c_v2_xy_spatial_temporal import _step_scale_target_from_xy_error
+from scripts.train_c2c_v2_task_frame_v46_alignment import _command_xy_from_row
+from scripts.train_c2c_v2_task_frame_v46_candidate_ranker import (
+    _adjust_rank_score_with_support as v46_candidate_adjust_rank_score_with_support,
+    _candidate_command_feature_vector as v46_candidate_command_feature_vector,
+    _command_outcome_targets as v46_candidate_command_outcome_targets,
+    _group_key as v46_candidate_rank_group_key,
+    _pairwise_oracle_margin_loss as v46_candidate_pairwise_oracle_margin_loss,
+    _predicted_outcome_utility as v46_candidate_predicted_outcome_utility,
+    _score_command_np as v46_candidate_rank_score_command,
+    _score_residual_np as v46_candidate_rank_score_residual,
+    _split_ranker_rows as split_v46_candidate_rank_rows,
+    _split_groups as split_v46_candidate_rank_groups,
+    _support_target_from_zero_or_pre as v46_candidate_support_target_from_zero_or_pre,
+    _zero_guard_margin_loss as v46_candidate_zero_guard_margin_loss,
+)
+from scripts.eval_c2c_v2_task_frame_v46_candidate_ranker_loo import (
+    _aggregate_reports as aggregate_v46_candidate_ranker_loo_reports,
+)
 from scripts.eval_c2c_v2_frame_yaw_estimator import evaluate as evaluate_frame_yaw_estimator
 from scripts.diagnose_c2c_v2_yaw_frame_alignment import diagnose as diagnose_yaw_frame_alignment
 from scripts.mine_c2c_v2_yaw_positive_windows import mine as mine_yaw_positive_windows
@@ -117,6 +167,7 @@ from prismatic.robot.coarse2contact_v2.runtime_xy_residual import calibrated_run
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import estimate_runtime_xy_residual
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RuntimeXYAffineCalibration, RuntimeXYMLPCalibration
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RuntimeXYSpatialTemporalCalibration
+from prismatic.robot.coarse2contact_v2.runtime_xy_residual import RUNTIME_XY_SPATIAL_TEMPORAL_IMAGE_SIZE
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import XYSpatialTemporalHeadNet
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import runtime_xy_context_feature_names, runtime_xy_context_feature_vector_from_trace
 from prismatic.robot.coarse2contact_v2.runtime_xy_residual import runtime_xy_spatial_temporal_feature_names
@@ -1787,6 +1838,2340 @@ class Coarse2ContactV2Tests(unittest.TestCase):
             self.assertGreater(float(step_low_vis[5]), 0.0)
             decision_payload = decision_ready.to_dict()
             self.assertTrue(all("close" not in key for key in decision_payload))
+
+    def test_task_frame_v46_checkpoint_predicts_parallel_axes_without_close_authority(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            model = TaskFrameV46AlignmentNet(
+                image_hidden_dim=32,
+                scalar_feature_dim=len(TASK_FRAME_READINESS_FEATURE_NAMES),
+                history_window_size=2,
+                history_feature_dim=max(1, len(runtime_xy_spatial_temporal_feature_names(tuple(DEFAULT_RUNTIME_XY_FEATURE_NAMES), 2)) // 2),
+                proprio_dim=15,
+                planner_prior_dim=6,
+                fusion_hidden_dim=32,
+                risk_classes=TASK_FRAME_V46_RISK_CLASSES,
+            )
+            for param in model.parameters():
+                torch.nn.init.zeros_(param)
+            with torch.no_grad():
+                model.residual_head.bias[:] = torch.tensor([1.0, -1.0, 1.0, 1.0])
+                model.confidence_head.bias[:] = torch.tensor([-1.0, -1.0, 1.0])
+                model.observability_head.bias[:] = torch.tensor([1.0, 1.0, 1.0])
+                model.step_scale_head.bias[:] = torch.tensor([0.0, 0.0, 0.0])
+                model.yaw_ambiguous_head.bias.fill_(1.0)
+                model.yaw_hypothesis_head.bias[:] = torch.tensor([2.0, 1.0, 0.0, -1.0])
+            checkpoint = tmpdir / "v46.pt"
+            save_task_frame_v46_alignment_checkpoint(checkpoint, model, metadata={"schema_version": "unit_test_v46"})
+            calibration, meta = load_task_frame_v46_alignment_checkpoint(checkpoint)
+            self.assertEqual(meta["schema_version"], "unit_test_v46")
+            row = {
+                "local_geometry_error": {
+                    "grasp": {
+                        "valid": True,
+                        "dx": 0.01,
+                        "dy": -0.01,
+                        "confidence": 0.7,
+                        "observability": 0.02,
+                        "fit_residual": 0.001,
+                        "inlier_ratio": 0.9,
+                    }
+                },
+                "estimated_basin_error": {
+                    "estimated_basin_error_valid": True,
+                    "estimated_basin_error_x_valid": True,
+                    "estimated_basin_error_y_valid": True,
+                    "estimated_basin_error_z_valid": True,
+                    "estimated_basin_error_yaw_valid": False,
+                    "estimated_basin_error_frame_consistency": 0.8,
+                    "estimated_basin_error_proxy_dx": 0.01,
+                    "estimated_basin_error_proxy_dy": -0.01,
+                },
+                "offline_labels": {
+                    "dx": 0.01,
+                    "dy": -0.01,
+                    "dz": 0.004,
+                    "dyaw": 0.03,
+                    "xy_observable": True,
+                    "z_observable": True,
+                    "yaw_observable": True,
+                    "yaw_ambiguous": True,
+                },
+            }
+            estimate = calibration.predict_from_trace(
+                row,
+                observation=_make_observation(),
+                robot_state={"proprio": np.zeros((15,), dtype=np.float32), "planner_delta_7d": np.zeros((7,), dtype=np.float32)},
+                history_rows=[row],
+            )
+            self.assertIsInstance(estimate, TaskFrameV46AlignmentEstimate)
+            self.assertFalse(estimate.uses_privileged_runtime)
+            self.assertFalse(estimate.close_control_allowed)
+            self.assertTrue(estimate.xy_observable)
+            self.assertTrue(estimate.z_observable)
+            self.assertTrue(estimate.yaw_observable)
+            self.assertTrue(estimate.yaw_ambiguous)
+            decision, step = task_frame_v46_micro_servo_step(
+                estimate,
+                history_rows=[{"task_frame_v46_dyaw": 0.05}, {"task_frame_v46_dyaw": 0.04}],
+                force_safe=True,
+                confidence_threshold=0.45,
+                weak_confidence_threshold=0.20,
+            )
+            self.assertIsInstance(decision, TaskFrameV46ControlDecision)
+            self.assertTrue(decision.applied)
+            self.assertTrue(decision.xy_allowed)
+            self.assertTrue(decision.z_allowed)
+            self.assertFalse(decision.yaw_allowed)
+            self.assertTrue(decision.xy_weak)
+            self.assertTrue(decision.z_weak)
+            self.assertEqual(decision.yaw_block_reason, "yaw_ambiguous")
+            self.assertGreater(float(step[0]), 0.0)
+            self.assertLess(float(step[1]), 0.0)
+            self.assertGreater(float(step[2]), 0.0)
+            self.assertEqual(float(step[5]), 0.0)
+            self.assertFalse(decision.uses_privileged_runtime)
+            self.assertFalse(decision.close_control_allowed)
+            labels = task_frame_v46_labels_from_row(row)
+            self.assertIsNotNone(labels)
+            assert labels is not None
+            self.assertTrue(labels["privileged_label_offline_only"])
+            self.assertFalse(labels["uses_privileged_runtime"])
+            unobservable_row = {
+                "privileged_dx": 0.01,
+                "privileged_dy": 0.0,
+                "privileged_dz": 0.002,
+                "privileged_dyaw": 0.10,
+                "yaw_observability_class": "unobservable",
+                "yaw_control_observable": False,
+            }
+            unobservable_labels = task_frame_v46_labels_from_row(unobservable_row)
+            self.assertIsNotNone(unobservable_labels)
+            assert unobservable_labels is not None
+            self.assertFalse(unobservable_labels["yaw_observable"])
+            self.assertTrue(unobservable_labels["yaw_ambiguous"])
+            ambiguous_row = {**unobservable_row, "yaw_observability_class": "ambiguous"}
+            ambiguous_labels = task_frame_v46_labels_from_row(ambiguous_row)
+            self.assertIsNotNone(ambiguous_labels)
+            assert ambiguous_labels is not None
+            self.assertTrue(ambiguous_labels["yaw_ambiguous"])
+            string_bool_row = {
+                "offline_labels": {
+                    "dx": "0.01",
+                    "dy": "0.0",
+                    "dz": "0.002",
+                    "dyaw": "0.10",
+                    "xy_observable": "true",
+                    "z_observable": "true",
+                    "yaw_observable": "False",
+                    "yaw_ambiguous": "False",
+                }
+            }
+            string_bool_labels = task_frame_v46_labels_from_row(string_bool_row)
+            self.assertIsNotNone(string_bool_labels)
+            assert string_bool_labels is not None
+            self.assertFalse(string_bool_labels["yaw_observable"])
+            self.assertFalse(string_bool_labels["yaw_ambiguous"])
+
+    def test_v46_yaw_selector_checkpoint_predicts_permission_without_close_authority(self) -> None:
+        names = task_frame_v46_yaw_selector_feature_names(
+            include_scalar_features=True,
+            include_spatial_moment_features=True,
+        )
+        selector = TaskFrameV46YawControlSelectorNet(feature_dim=len(names), hidden_dim=8)
+        for param in selector.parameters():
+            torch.nn.init.zeros_(param)
+        with torch.no_grad():
+            selector.net[-1].bias.fill_(8.0)
+        with TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "yaw_selector.pt"
+            torch.save(
+                {
+                    "schema_version": "c2c_v2_task_frame_v46_yaw_control_selector_checkpoint_v1",
+                    "model_type": "v46_yaw_control_permission_selector",
+                    "feature_names": list(names),
+                    "feature_mean": np.zeros((len(names),), dtype=np.float32),
+                    "feature_std": np.ones((len(names),), dtype=np.float32),
+                    "selected_threshold": 0.5,
+                    "hidden_dim": 8,
+                    "model_state_dict": selector.state_dict(),
+                    "metadata": {
+                        "feature_names": list(names),
+                        "include_scalar_features": True,
+                        "include_spatial_moment_features": True,
+                        "uses_privileged_runtime": False,
+                        "close_control_allowed": False,
+                    },
+                },
+                ckpt,
+            )
+            calibration, metadata = load_task_frame_v46_yaw_control_selector_checkpoint(ckpt)
+            self.assertFalse(metadata["uses_privileged_runtime"])
+            self.assertFalse(metadata["close_control_allowed"])
+            estimate = TaskFrameV46AlignmentEstimate(
+                dx=0.0,
+                dy=0.0,
+                dz=0.0,
+                dyaw=0.04,
+                xy_confidence=0.8,
+                z_confidence=0.8,
+                yaw_confidence=0.9,
+                xy_observable=True,
+                z_observable=True,
+                yaw_observable=True,
+                yaw_ambiguous=False,
+                yaw_unobservable=False,
+                xy_step_scale=0.6,
+                z_step_scale=0.6,
+                yaw_step_scale=0.7,
+                yaw_hypothesis_index=0,
+                yaw_hypothesis_gap=0.5,
+                xy_control_effect=(0.0, 0.0, 0.0, 0.0),
+                risk_reason="normal",
+                near_field_confidence=0.9,
+                xy_observable_score=0.9,
+                z_observable_score=0.8,
+                yaw_observable_score=0.85,
+                yaw_ambiguous_score=0.05,
+            )
+            decision = calibration.predict_from_trace(
+                {},
+                estimate,
+                observation=_make_observation(),
+                robot_state={"proprio": np.zeros((15,), dtype=np.float32), "planner_delta_7d": np.zeros((7,), dtype=np.float32)},
+            )
+            self.assertIsInstance(decision, TaskFrameV46YawControlSelectorDecision)
+            self.assertTrue(decision.allowed)
+            self.assertEqual(decision.block_reason, "ready")
+            self.assertFalse(decision.uses_privileged_runtime)
+            self.assertFalse(decision.close_control_allowed)
+
+    def test_v46_yaw_selector_suppresses_yaw_only_without_close_authority(self) -> None:
+        estimate = TaskFrameV46AlignmentEstimate(
+            dx=0.01,
+            dy=-0.01,
+            dz=0.004,
+            dyaw=0.08,
+            xy_confidence=0.8,
+            z_confidence=0.8,
+            yaw_confidence=0.9,
+            xy_observable=True,
+            z_observable=True,
+            yaw_observable=True,
+            yaw_ambiguous=False,
+            yaw_unobservable=False,
+            xy_step_scale=0.7,
+            z_step_scale=0.7,
+            yaw_step_scale=0.8,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.5,
+            xy_control_effect=(0.0, 0.0, 0.0, 0.0),
+            risk_reason="normal",
+            yaw_observable_score=0.9,
+            yaw_ambiguous_score=0.05,
+        )
+        denied = TaskFrameV46YawControlSelectorDecision(
+            allowed=False,
+            score=0.1,
+            threshold=0.5,
+            block_reason="selector_below_threshold",
+        )
+        decision, step = task_frame_v46_micro_servo_step(
+            estimate,
+            history_rows=[{"task_frame_v46_dyaw": 0.07}, {"task_frame_v46_dyaw": 0.06}],
+            force_safe=True,
+            yaw_selector_decision=denied,
+        )
+        self.assertTrue(decision.applied)
+        self.assertTrue(decision.xy_allowed)
+        self.assertTrue(decision.z_allowed)
+        self.assertFalse(decision.yaw_allowed)
+        self.assertEqual(decision.yaw_block_reason, "selector_below_threshold")
+        self.assertNotEqual(float(step[0]), 0.0)
+        self.assertNotEqual(float(step[2]), 0.0)
+        self.assertEqual(float(step[5]), 0.0)
+        self.assertFalse(decision.close_control_allowed)
+
+    def test_v46_yaw_selector_true_still_requires_history_stability(self) -> None:
+        estimate = TaskFrameV46AlignmentEstimate(
+            dx=0.0,
+            dy=0.0,
+            dz=0.0,
+            dyaw=0.08,
+            xy_confidence=0.8,
+            z_confidence=0.8,
+            yaw_confidence=0.9,
+            xy_observable=True,
+            z_observable=True,
+            yaw_observable=True,
+            yaw_ambiguous=False,
+            yaw_unobservable=False,
+            xy_step_scale=0.0,
+            z_step_scale=0.0,
+            yaw_step_scale=0.8,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.5,
+            xy_control_effect=(0.0, 0.0, 0.0, 0.0),
+            risk_reason="normal",
+        )
+        allowed = TaskFrameV46YawControlSelectorDecision(allowed=True, score=0.9, threshold=0.5, block_reason="ready")
+        decision, step = task_frame_v46_micro_servo_step(
+            estimate,
+            history_rows=[{"task_frame_v46_dyaw": -0.07}, {"task_frame_v46_dyaw": 0.06}],
+            force_safe=True,
+            yaw_selector_decision=allowed,
+        )
+        self.assertFalse(decision.yaw_allowed)
+        self.assertEqual(decision.yaw_block_reason, "yaw_history_not_stable")
+        self.assertEqual(float(step[5]), 0.0)
+
+    def test_v46_direction_conflict_keeps_xy_servo_conservative(self) -> None:
+        normal = TaskFrameV46AlignmentEstimate(
+            dx=0.02,
+            dy=-0.02,
+            dz=0.004,
+            dyaw=0.0,
+            xy_confidence=0.9,
+            z_confidence=0.9,
+            yaw_confidence=0.0,
+            xy_observable=True,
+            z_observable=True,
+            yaw_observable=False,
+            yaw_ambiguous=False,
+            yaw_unobservable=True,
+            xy_step_scale=1.0,
+            z_step_scale=1.0,
+            yaw_step_scale=0.0,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.0,
+            xy_control_effect=(-1.0, 0.0, 0.0, -1.0),
+            risk_reason="normal",
+        )
+        conflict = TaskFrameV46AlignmentEstimate(
+            dx=normal.dx,
+            dy=normal.dy,
+            dz=normal.dz,
+            dyaw=normal.dyaw,
+            xy_confidence=normal.xy_confidence,
+            z_confidence=normal.z_confidence,
+            yaw_confidence=normal.yaw_confidence,
+            xy_observable=normal.xy_observable,
+            z_observable=normal.z_observable,
+            yaw_observable=normal.yaw_observable,
+            yaw_ambiguous=normal.yaw_ambiguous,
+            yaw_unobservable=normal.yaw_unobservable,
+            xy_step_scale=normal.xy_step_scale,
+            z_step_scale=normal.z_step_scale,
+            yaw_step_scale=normal.yaw_step_scale,
+            yaw_hypothesis_index=normal.yaw_hypothesis_index,
+            yaw_hypothesis_gap=normal.yaw_hypothesis_gap,
+            xy_control_effect=normal.xy_control_effect,
+            risk_reason="direction_conflict",
+        )
+        normal_decision, normal_step = task_frame_v46_micro_servo_step(normal, force_safe=True)
+        conflict_decision, conflict_step = task_frame_v46_micro_servo_step(conflict, force_safe=True)
+        self.assertTrue(conflict_decision.xy_allowed)
+        self.assertLess(conflict_decision.xy_risk_step_scale, normal_decision.xy_risk_step_scale)
+        self.assertLess(float(np.linalg.norm(conflict_step[:2])), float(np.linalg.norm(normal_step[:2])))
+
+    def test_v46_effect_aware_xy_correction_uses_control_effect_without_close_authority(self) -> None:
+        estimate = TaskFrameV46AlignmentEstimate(
+            dx=0.010,
+            dy=-0.006,
+            dz=0.0,
+            dyaw=0.0,
+            xy_confidence=0.9,
+            z_confidence=0.0,
+            yaw_confidence=0.0,
+            xy_observable=True,
+            z_observable=False,
+            yaw_observable=False,
+            yaw_ambiguous=False,
+            yaw_unobservable=True,
+            xy_step_scale=1.0,
+            z_step_scale=0.0,
+            yaw_step_scale=0.0,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.0,
+            xy_control_effect=(-1.0, 0.0, 0.0, -1.0),
+            risk_reason="normal",
+        )
+        correction = task_frame_v46_effect_aware_xy_correction(
+            estimate,
+            current_local_xy=np.zeros((2,), dtype=np.float32),
+            max_xy_step=0.003,
+        )
+        self.assertEqual(correction.shape, (2,))
+        self.assertAlmostEqual(float(correction[0]), 0.003, places=6)
+        self.assertAlmostEqual(float(correction[1]), -0.003, places=6)
+        self.assertFalse(estimate.close_control_allowed)
+
+    def test_v46_command_transition_predicts_delta_without_close_authority(self) -> None:
+        model = TaskFrameV46AlignmentNet(
+            image_hidden_dim=32,
+            scalar_feature_dim=len(TASK_FRAME_READINESS_FEATURE_NAMES),
+            history_window_size=2,
+            history_feature_dim=max(1, len(runtime_xy_spatial_temporal_feature_names(tuple(DEFAULT_RUNTIME_XY_FEATURE_NAMES), 2)) // 2),
+            proprio_dim=15,
+            planner_prior_dim=6,
+            fusion_hidden_dim=32,
+            risk_classes=TASK_FRAME_V46_RISK_CLASSES,
+        )
+        for param in model.parameters():
+            torch.nn.init.zeros_(param)
+        with TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "v46_transition.pt"
+            save_task_frame_v46_alignment_checkpoint(ckpt, model, metadata={"unit_test": True})
+            calibration, _ = load_task_frame_v46_alignment_checkpoint(ckpt)
+        row = {
+            "offline_labels": {
+                "dx": 0.01,
+                "dy": 0.01,
+                "dz": 0.004,
+                "dyaw": 0.03,
+                "xy_observable": True,
+                "z_observable": True,
+                "yaw_observable": False,
+                "yaw_ambiguous": True,
+            }
+        }
+        transition = calibration.predict_command_transition_from_trace(
+            row,
+            observation=_make_observation(),
+            robot_state={"proprio": np.zeros((15,), dtype=np.float32), "planner_delta_7d": np.zeros((7,), dtype=np.float32)},
+            history_rows=[row],
+            command_6d=np.array([0.001, -0.001, 0.002, 0.0, 0.0, 0.0], dtype=np.float32),
+        )
+        self.assertTrue(transition["valid"])
+        self.assertEqual(len(transition["delta"]), 4)
+        self.assertEqual(len(transition["logvar"]), 4)
+        self.assertFalse(transition["uses_privileged_runtime"])
+        self.assertFalse(transition["close_control_allowed"])
+
+    def test_v46_extended_command_feature_checkpoint_loads_and_pads_runtime_command(self) -> None:
+        model = TaskFrameV46AlignmentNet(
+            image_hidden_dim=32,
+            scalar_feature_dim=len(TASK_FRAME_READINESS_FEATURE_NAMES),
+            history_window_size=2,
+            history_feature_dim=max(1, len(runtime_xy_spatial_temporal_feature_names(tuple(DEFAULT_RUNTIME_XY_FEATURE_NAMES), 2)) // 2),
+            proprio_dim=15,
+            planner_prior_dim=6,
+            command_feature_dim=16,
+            fusion_hidden_dim=32,
+            risk_classes=TASK_FRAME_V46_RISK_CLASSES,
+        )
+        with TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "v46_typed_command.pt"
+            save_task_frame_v46_alignment_checkpoint(ckpt, model, metadata={"unit_test": True})
+            calibration, _ = load_task_frame_v46_alignment_checkpoint(ckpt)
+        self.assertEqual(int(calibration.command_feature_dim), 16)
+        history_dim = len(runtime_xy_spatial_temporal_feature_names(tuple(DEFAULT_RUNTIME_XY_FEATURE_NAMES), 2))
+        out = calibration.model.forward(
+            torch.zeros((1, 7, RUNTIME_XY_SPATIAL_TEMPORAL_IMAGE_SIZE, RUNTIME_XY_SPATIAL_TEMPORAL_IMAGE_SIZE), dtype=torch.float32),
+            torch.zeros((1, len(TASK_FRAME_READINESS_FEATURE_NAMES)), dtype=torch.float32),
+            torch.zeros((1, history_dim), dtype=torch.float32),
+            torch.zeros((1, 15), dtype=torch.float32),
+            torch.zeros((1, 6), dtype=torch.float32),
+            torch.zeros((1, 6), dtype=torch.float32),
+        )
+        self.assertEqual(tuple(out["command_delta"].shape), (1, 4))
+        self.assertEqual(tuple(out["command_outcome_logits"].shape), (1, 9))
+
+    def test_v46_transition_command_search_selects_bounded_supported_axis_step(self) -> None:
+        estimate = TaskFrameV46AlignmentEstimate(
+            dx=0.0,
+            dy=0.0,
+            dz=0.004,
+            dyaw=0.0,
+            xy_confidence=0.0,
+            z_confidence=0.9,
+            yaw_confidence=0.0,
+            xy_observable=False,
+            z_observable=True,
+            yaw_observable=False,
+            yaw_ambiguous=False,
+            yaw_unobservable=True,
+            xy_step_scale=0.0,
+            z_step_scale=1.0,
+            yaw_step_scale=0.0,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.0,
+            xy_control_effect=(0.0, 0.0, 0.0, 0.0),
+            risk_reason="normal",
+        )
+
+        def predictor(command_6d: np.ndarray) -> dict:
+            z_cmd = float(np.asarray(command_6d, dtype=np.float32).reshape(-1)[2])
+            dz_delta = -0.003 if z_cmd > 0.0 else (0.002 if z_cmd < 0.0 else 0.0)
+            return {
+                "valid": True,
+                "delta": [0.0, 0.0, dz_delta, 0.0],
+                "logvar": [-10.0, -10.0, -10.0, -10.0],
+                "support": 0.95,
+                "uses_privileged_runtime": False,
+                "close_control_allowed": False,
+            }
+
+        result = task_frame_v46_transition_command_search(
+            estimate,
+            base_command_local_6d=np.zeros((6,), dtype=np.float32),
+            proposed_step_local_6d=np.array([0.0, 0.0, 0.002, 0.0, 0.0, 0.0], dtype=np.float32),
+            transition_predictor=predictor,
+            max_z_step=0.003,
+        )
+        self.assertTrue(result.valid)
+        self.assertTrue(result.applied)
+        self.assertGreater(float(result.selected_step_local_6d[2]), 0.0)
+        self.assertTrue(result.z_contracts)
+        self.assertFalse(result.uses_privileged_runtime)
+        self.assertFalse(result.close_control_allowed)
+
+    def test_v46_transition_command_search_rejects_moved_axis_worsen(self) -> None:
+        estimate = TaskFrameV46AlignmentEstimate(
+            dx=0.04,
+            dy=0.0,
+            dz=0.004,
+            dyaw=0.0,
+            xy_confidence=0.9,
+            z_confidence=0.9,
+            yaw_confidence=0.0,
+            xy_observable=True,
+            z_observable=True,
+            yaw_observable=False,
+            yaw_ambiguous=False,
+            yaw_unobservable=True,
+            xy_step_scale=1.0,
+            z_step_scale=1.0,
+            yaw_step_scale=0.0,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.0,
+            xy_control_effect=(0.0, 0.0, 0.0, 0.0),
+            risk_reason="normal",
+        )
+
+        def predictor(command_6d: np.ndarray) -> dict:
+            z_cmd = float(np.asarray(command_6d, dtype=np.float32).reshape(-1)[2])
+            # Combined score would improve because XY shrinks a lot, but the
+            # moved Z axis worsens. The selector must reject this candidate.
+            if abs(z_cmd) > 1.0e-9:
+                delta = [-0.035, 0.0, 0.004, 0.0]
+            else:
+                delta = [0.0, 0.0, 0.0, 0.0]
+            return {
+                "valid": True,
+                "delta": delta,
+                "logvar": [-10.0, -10.0, -10.0, -10.0],
+                "support": 0.95,
+                "uses_privileged_runtime": False,
+                "close_control_allowed": False,
+            }
+
+        result = task_frame_v46_transition_command_search(
+            estimate,
+            base_command_local_6d=np.zeros((6,), dtype=np.float32),
+            proposed_step_local_6d=np.array([0.0, 0.0, 0.002, 0.0, 0.0, 0.0], dtype=np.float32),
+            transition_predictor=predictor,
+            max_z_step=0.003,
+        )
+        self.assertTrue(result.valid)
+        self.assertFalse(result.applied)
+        self.assertEqual(result.reason, "no_candidate_improves_no_correction")
+        self.assertEqual(float(result.selected_step_local_6d[2]), 0.0)
+        self.assertFalse(result.close_control_allowed)
+
+    def test_v46_effect_aware_xy_correction_obeys_risk_softgate(self) -> None:
+        normal = TaskFrameV46AlignmentEstimate(
+            dx=0.010,
+            dy=-0.006,
+            dz=0.0,
+            dyaw=0.0,
+            xy_confidence=0.9,
+            z_confidence=0.0,
+            yaw_confidence=0.0,
+            xy_observable=True,
+            z_observable=False,
+            yaw_observable=False,
+            yaw_ambiguous=False,
+            yaw_unobservable=True,
+            xy_step_scale=1.0,
+            z_step_scale=0.0,
+            yaw_step_scale=0.0,
+            yaw_hypothesis_index=0,
+            yaw_hypothesis_gap=0.0,
+            xy_control_effect=(-1.0, 0.0, 0.0, -1.0),
+            risk_reason="normal",
+        )
+        conflict = TaskFrameV46AlignmentEstimate(
+            dx=normal.dx,
+            dy=normal.dy,
+            dz=normal.dz,
+            dyaw=normal.dyaw,
+            xy_confidence=normal.xy_confidence,
+            z_confidence=normal.z_confidence,
+            yaw_confidence=normal.yaw_confidence,
+            xy_observable=normal.xy_observable,
+            z_observable=normal.z_observable,
+            yaw_observable=normal.yaw_observable,
+            yaw_ambiguous=normal.yaw_ambiguous,
+            yaw_unobservable=normal.yaw_unobservable,
+            xy_step_scale=0.5,
+            z_step_scale=normal.z_step_scale,
+            yaw_step_scale=normal.yaw_step_scale,
+            yaw_hypothesis_index=normal.yaw_hypothesis_index,
+            yaw_hypothesis_gap=normal.yaw_hypothesis_gap,
+            xy_control_effect=normal.xy_control_effect,
+            risk_reason="direction_conflict",
+        )
+        normal_correction = task_frame_v46_effect_aware_xy_correction(
+            normal,
+            current_local_xy=np.zeros((2,), dtype=np.float32),
+            max_xy_step=0.003,
+        )
+        conflict_correction = task_frame_v46_effect_aware_xy_correction(
+            conflict,
+            current_local_xy=np.zeros((2,), dtype=np.float32),
+            max_xy_step=0.003,
+        )
+        self.assertLess(float(np.linalg.norm(conflict_correction)), float(np.linalg.norm(normal_correction)))
+        self.assertLessEqual(float(np.max(np.abs(conflict_correction))), 0.003 * 0.5 * 0.35 + 1e-7)
+        self.assertFalse(conflict.close_control_allowed)
+
+    def test_v46_checkpoint_preserves_residual_output_support(self) -> None:
+        model = TaskFrameV46AlignmentNet(max_abs_xy=0.08, max_abs_z=0.07, max_abs_yaw=0.35, use_spatial_moments=True)
+        with TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "v46.pt"
+            save_task_frame_v46_alignment_checkpoint(ckpt, model, metadata={"unit_test": True})
+            calibration, metadata = load_task_frame_v46_alignment_checkpoint(ckpt)
+        self.assertTrue(metadata["unit_test"])
+        self.assertAlmostEqual(calibration.model.max_abs_xy, 0.08)
+        self.assertAlmostEqual(calibration.model.max_abs_z, 0.07)
+        self.assertAlmostEqual(calibration.model.max_abs_yaw, 0.35)
+        self.assertTrue(calibration.model.use_spatial_moments)
+
+    def test_task_frame_v46_manifest_keeps_nonprivileged_multisource_local_labels(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            rows: list[dict[str, object]] = []
+            for root_name, ep in (("root_a", 0), ("root_b", 1)):
+                eval_root = tmpdir / root_name / "eval"
+                obs_dir = eval_root / "runtime_observations"
+                trace_dir = eval_root / "gripper_traces"
+                obs_dir.mkdir(parents=True)
+                trace_dir.mkdir(parents=True)
+                obs_path = obs_dir / f"ep{ep:03d}_runtime_obs.npz"
+                trace_path = trace_dir / f"ep{ep:03d}_gripper_trace.jsonl"
+                obs_path.write_bytes(b"placeholder")
+                trace_path.write_text("", encoding="utf-8")
+                rows.append(
+                    {
+                        "schema_version": "frame_residual_v2",
+                        "episode_idx": ep,
+                        "step_idx": 5,
+                        "source_runtime_obs_path": str(obs_path),
+                        "source_trace_path": str(trace_path),
+                        "privileged_dx": 0.010,
+                        "privileged_dy": -0.012,
+                        "privileged_dz": 0.006,
+                        "privileged_dyaw": 0.050,
+                        "yaw_control_observable": True,
+                        "uses_privileged_label": True,
+                        "uses_privileged_runtime": False,
+                        "failure_bucket": "small_xy_large_yaw",
+                        "visual_observability_class": "partial_observable",
+                    }
+                )
+            rows.append({**rows[0], "step_idx": 6, "privileged_dx": 0.50})
+            rows.append({**rows[1], "step_idx": 7, "uses_privileged_runtime": True})
+            source_jsonl = tmpdir / "frame_residual_v2.jsonl"
+            with open(source_jsonl, "w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+            output_jsonl = tmpdir / "v46_manifest.jsonl"
+            summary_json = tmpdir / "v46_manifest.summary.json"
+            summary = build_v46_task_frame_manifest(
+                [source_jsonl],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                max_abs_xy_label=0.08,
+                max_abs_z_label=0.08,
+                max_abs_yaw_label=0.35,
+            )
+            self.assertEqual(summary["retained_rows"], 2)
+            self.assertEqual(summary["source_eval_roots"], 2)
+            self.assertEqual(summary["counters"]["dropped_outside_local_support"], 1)
+            self.assertEqual(summary["counters"]["dropped_privileged_runtime"], 1)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(retained), 2)
+            self.assertTrue(all(row["uses_privileged_runtime"] is False for row in retained))
+            self.assertTrue(all(row["trace_path"] for row in retained))
+            self.assertTrue(all(row["v46_offline_label_keys"] == ["dx", "dy", "dz", "dyaw"] for row in retained))
+
+    def test_task_frame_v46_applied_transition_manifest_keeps_labels_offline_only(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "v52_smoke"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep024_runtime_obs.npz").write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep024_gripper_trace.jsonl"
+            trace_row = {
+                "episode_idx": 24,
+                "step": 100,
+                "task_frame_v46_applied": True,
+                "task_frame_v46_applied_local_6d": [-0.001, 0.001, 0.003, 0.0, 0.0, 0.0],
+                "grasp_probe_local_command_local_6d": [-0.002, 0.004, 0.003, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [-0.011, 0.035, 0.003, 0.16],
+                "grasp_probe_post_true_error_t": [-0.010, 0.036, 0.002, 0.15],
+                "task_frame_v46_xy_observable": True,
+                "task_frame_v46_z_observable": True,
+                "task_frame_v46_yaw_observable": False,
+                "task_frame_v46_yaw_ambiguous": True,
+                "planner_gripper_close_requested": True,
+                "planner_gripper_handoff_allowed": False,
+            }
+            trace_path.write_text(json.dumps(trace_row) + "\n", encoding="utf-8")
+            output_jsonl = tmpdir / "applied_manifest.jsonl"
+            summary_json = tmpdir / "applied_manifest.summary.json"
+            summary = build_v46_applied_transition_manifest(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+            )
+            self.assertEqual(summary["retained_rows"], 1)
+            self.assertEqual(summary["close_leak_rows"], 0)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(retained), 1)
+            row = retained[0]
+            self.assertFalse(row["uses_privileged_runtime"])
+            self.assertNotIn("grasp_probe_pre_true_error_t", row)
+            self.assertNotIn("grasp_probe_post_true_error_t", row)
+            self.assertAlmostEqual(row["offline_labels"]["dx"], -0.011, places=6)
+            self.assertAlmostEqual(row["next_privileged_dy"], 0.036, places=6)
+            self.assertAlmostEqual(row["applied_control_command_xy"][0], -0.002, places=6)
+            self.assertAlmostEqual(row["applied_control_command_xy"][1], 0.004, places=6)
+            self.assertEqual(row["privileged_label_boundary"], "offline_pre_post_transition_labels_only")
+
+    def test_task_frame_v46_applied_transition_manifest_can_require_command_sweep_executed(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "v59_sweep"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep026_runtime_obs.npz").write_bytes(b"placeholder")
+            base_row = {
+                "episode_idx": 26,
+                "task_frame_v46_applied": True,
+                "task_frame_v46_applied_local_6d": [0.0, 0.0, 0.003, 0.0, 0.0, 0.0],
+                "grasp_probe_local_command_local_6d": [0.0, 0.0, 0.003, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [0.01, 0.02, 0.04, 0.10],
+                "grasp_probe_post_true_error_t": [0.009, 0.019, 0.03, 0.09],
+            }
+            executed_row = {
+                **base_row,
+                "step": 41,
+                "task_frame_v46_command_sweep_executed": True,
+                "task_frame_v46_command_sweep_row_index": 49,
+                "task_frame_v46_command_sweep_candidate_name": "z_neg",
+            }
+            later_natural_row = {
+                **base_row,
+                "step": 94,
+                "task_frame_v46_command_sweep_executed": False,
+                "task_frame_v46_command_sweep_row_index": 49,
+                "task_frame_v46_command_sweep_candidate_name": "z_neg",
+            }
+            trace_path = trace_dir / "ep026_gripper_trace.jsonl"
+            trace_path.write_text(json.dumps(executed_row) + "\n" + json.dumps(later_natural_row) + "\n", encoding="utf-8")
+            output_jsonl = tmpdir / "applied_manifest.jsonl"
+            summary_json = tmpdir / "applied_manifest.summary.json"
+            summary = build_v46_applied_transition_manifest(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                require_command_sweep_executed=True,
+            )
+            self.assertEqual(summary["retained_rows"], 1)
+            self.assertTrue(summary["require_command_sweep_executed"])
+            self.assertEqual(summary["counters"]["dropped_not_command_sweep_executed"], 1)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0]["step_idx"], 41)
+            self.assertTrue(retained[0]["task_frame_v46_command_sweep_executed"])
+            self.assertEqual(retained[0]["task_frame_v46_command_sweep_row_index"], 49)
+            self.assertEqual(retained[0]["task_frame_v46_command_sweep_candidate_name"], "z_neg")
+
+    def test_task_frame_v46_applied_transition_manifest_recovers_original_source_root_from_command_sweep_spec(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            original_root = tmpdir / "original_source_root"
+            eval_root = tmpdir / "command_sweep_output_root"
+            original_obs_dir = original_root / "runtime_observations"
+            original_obs_dir.mkdir(parents=True)
+            eval_trace_dir = eval_root / "gripper_traces"
+            eval_trace_dir.mkdir(parents=True)
+            (original_obs_dir / "ep026_runtime_obs.npz").write_bytes(b"placeholder")
+            spec_path = tmpdir / "command_sweep_spec.jsonl"
+            spec_row = {
+                "source_eval_root": str(original_root),
+                "source_eval_root_kind": "runtime_command_sweep_spec",
+                "session_id": "original_source_root",
+                "sequence_id": f"{original_root}::ep026",
+                "episode_idx": 26,
+                "step_idx": 41,
+                "trace_path": str(original_root / "gripper_traces" / "ep026_gripper_trace.jsonl"),
+                "runtime_obs_path": str(original_obs_dir / "ep026_runtime_obs.npz"),
+                "candidate_name": "z_neg",
+                "candidate_step_local_6d": [0.0, 0.0, -0.003, 0.0, 0.0, 0.0],
+                "candidate_command_local_6d": [0.0, 0.0, -0.003, 0.0, 0.0, 0.0],
+            }
+            spec_path.write_text(json.dumps(spec_row) + "\n", encoding="utf-8")
+            trace_row = {
+                "episode_idx": 26,
+                "step": 41,
+                "task_frame_v46_applied": True,
+                "task_frame_v46_applied_local_6d": [0.0, 0.0, -0.003, 0.0, 0.0, 0.0],
+                "grasp_probe_local_command_local_6d": [0.0, 0.0, -0.003, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [0.01, 0.02, 0.04, 0.10],
+                "grasp_probe_post_true_error_t": [0.009, 0.019, 0.03, 0.09],
+                "task_frame_v46_command_sweep_executed": True,
+                "task_frame_v46_command_sweep_row_index": 0,
+                "task_frame_v46_command_sweep_candidate_name": "z_neg",
+                "task_frame_v46_command_sweep_spec_path": str(spec_path),
+            }
+            trace_path = eval_trace_dir / "ep026_gripper_trace.jsonl"
+            trace_path.write_text(json.dumps(trace_row) + "\n", encoding="utf-8")
+            output_jsonl = tmpdir / "applied_manifest.jsonl"
+            summary_json = tmpdir / "applied_manifest.summary.json"
+            summary = build_v46_applied_transition_manifest(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                require_command_sweep_executed=True,
+            )
+            self.assertEqual(summary["retained_rows"], 1)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(retained), 1)
+            row = retained[0]
+            self.assertEqual(row["source_eval_root"], str(original_root))
+            self.assertEqual(row["runtime_obs_path"], str(original_obs_dir / "ep026_runtime_obs.npz"))
+            self.assertEqual(row["sequence_id"], f"{original_root}::ep026")
+            self.assertEqual(row["obs_pointer"]["trace_path"], str(original_root / "gripper_traces" / "ep026_gripper_trace.jsonl"))
+            self.assertEqual(row["task_frame_v46_command_sweep_row_index"], 0)
+            self.assertEqual(row["task_frame_v46_command_sweep_candidate_name"], "z_neg")
+
+    def test_task_frame_v46_command_sweep_spec_has_no_fake_transition_labels(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "v58_smoke"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep024_runtime_obs.npz").write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep024_gripper_trace.jsonl"
+            trace_row = {
+                "episode_idx": 24,
+                "step": 100,
+                "c2c_v2_stage": "RING_GRASP_ALIGN",
+                "task_frame_v46_near_field_activation_ready": True,
+                "task_frame_v46_radius_ready": True,
+                "task_frame_v46_near_field_confidence": 0.91,
+                "task_frame_v46_dx": 0.02,
+                "task_frame_v46_dy": -0.01,
+                "task_frame_v46_dz": 0.004,
+                "task_frame_v46_dyaw": 0.05,
+                "grasp_probe_local_command_local_6d": [0.001, -0.002, 0.0, 0.0, 0.0, 0.0],
+                "grasp_probe_pre_true_error_t": [0.1, 0.2, 0.3, 0.4],
+                "grasp_probe_post_true_error_t": [0.2, 0.3, 0.4, 0.5],
+                "planner_gripper_close_requested": True,
+                "planner_gripper_handoff_allowed": False,
+            }
+            trace_path.write_text(json.dumps(trace_row) + "\n", encoding="utf-8")
+            output_jsonl = tmpdir / "command_sweep.jsonl"
+            summary_json = tmpdir / "command_sweep.summary.json"
+            summary = build_v46_command_sweep_spec(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                xy_step=0.003,
+                z_step=0.002,
+                yaw_step=0.01,
+            )
+            self.assertEqual(summary["selected_runtime_rows"], 1)
+            self.assertEqual(summary["retained_rows"], summary["candidate_commands_per_runtime_row"])
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertGreaterEqual(len(retained), 9)
+            row = retained[0]
+            self.assertFalse(row["uses_privileged_runtime"])
+            self.assertFalse(row["uses_privileged_label_for_training"])
+            self.assertFalse(row["has_next_residual"])
+            self.assertTrue(row["has_command_6d"])
+            self.assertFalse(row["close_control_allowed"])
+            self.assertNotIn("offline_labels", row)
+            self.assertNotIn("next_privileged_dx", row)
+            self.assertNotIn("grasp_probe_pre_true_error_t", json.dumps(row))
+            self.assertEqual(row["privileged_label_boundary"], "no_transition_label_until_candidate_command_executed")
+            command = np.asarray(row["candidate_command_local_6d"], dtype=np.float32)
+            base = np.asarray(row["base_command_local_6d"], dtype=np.float32)
+            step = np.asarray(row["candidate_step_local_6d"], dtype=np.float32)
+            self.assertTrue(np.allclose(command, base + step))
+
+    def test_task_frame_v46_command_sweep_spec_probe_or_offline_selection_keeps_labels_out(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "random5_trace"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep023_runtime_obs.npz").write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep023_gripper_trace.jsonl"
+            rows = [
+                {
+                    "episode_idx": 23,
+                    "step": 10,
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "grasp_probe_candidate_actionable": True,
+                    "grasp_probe_frontier_pullback_candidate": True,
+                    "grasp_probe_local_command_local_6d": [0.001, 0.0, 0.004, 0.0, 0.0, 0.0],
+                    "grasp_probe_pre_true_error_t": [0.10, 0.01, 0.30, 0.20],
+                },
+                {
+                    "episode_idx": 23,
+                    "step": 40,
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "grasp_probe_candidate_actionable": True,
+                    "grasp_probe_frontier_pullback_candidate": True,
+                    "grasp_probe_local_command_local_6d": [0.001, 0.0, 0.004, 0.0, 0.0, 0.0],
+                    "grasp_probe_pre_true_error_t": [0.06, 0.01, 0.30, 0.20],
+                    "grasp_probe_post_true_error_t": [0.04, 0.01, 0.29, 0.19],
+                },
+            ]
+            trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            output_jsonl = tmpdir / "command_sweep.jsonl"
+            summary_json = tmpdir / "command_sweep.summary.json"
+            summary = build_v46_command_sweep_spec(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                selection_mode="probe_or_offline_residual_band",
+                min_step=40,
+                max_step=80,
+                min_xy_error=0.035,
+                max_xy_error=0.18,
+            )
+            self.assertEqual(summary["selected_runtime_rows"], 1)
+            self.assertEqual(summary["counters"]["dropped_before_min_step"], 1)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertGreater(len(retained), 0)
+            self.assertTrue(all(row["step_idx"] == 40 for row in retained))
+            self.assertTrue(all(row["uses_privileged_runtime"] is False for row in retained))
+            self.assertTrue(all(row["uses_privileged_label_for_training"] is False for row in retained))
+            self.assertNotIn("grasp_probe_pre_true_error_t", json.dumps(retained))
+            self.assertNotIn("grasp_probe_post_true_error_t", json.dumps(retained))
+
+    def test_task_frame_v46_command_sweep_spec_supports_z_yaw_diagnostic_grid(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "zyaw_trace"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep000_runtime_obs.npz").write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep000_gripper_trace.jsonl"
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "episode_idx": 0,
+                        "step": 60,
+                        "c2c_v2_stage": "RING_GRASP_ALIGN",
+                        "grasp_probe_local_command_local_6d": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        "grasp_probe_pre_true_error_t": [0.02, 0.01, 0.04, 0.20],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output_jsonl = tmpdir / "zyaw_spec.jsonl"
+            summary_json = tmpdir / "zyaw_spec.summary.json"
+            summary = build_v46_command_sweep_spec(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                selection_mode="offline_residual_band",
+                min_step=60,
+                max_step=60,
+                xy_step=0.0,
+                z_step=0.0,
+                yaw_step=0.0,
+                candidate_profile="z_yaw_diagnostic",
+                z_steps=(0.0015, 0.003),
+                yaw_steps=(0.006, 0.012),
+                include_combined_xy=False,
+            )
+            self.assertEqual(summary["candidate_profile"], "z_yaw_diagnostic")
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            names = {row["candidate_name"] for row in retained}
+            self.assertIn("zero", names)
+            self.assertIn("z_pos_0030", names)
+            self.assertIn("yaw_neg_0120", names)
+            self.assertIn("zyaw_pn_z0030_y0120", names)
+            self.assertTrue(all(row["candidate_policy"] == "z_yaw_diagnostic" for row in retained))
+            self.assertTrue(all(row["uses_privileged_runtime"] is False for row in retained))
+            self.assertTrue(all(row["uses_privileged_label_for_training"] is False for row in retained))
+            self.assertNotIn("grasp_probe_pre_true_error_t", json.dumps(retained))
+
+    def test_task_frame_v46_command_sweep_spec_supports_yaw_observable_symmetry_collection(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "yaw_observable_trace"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep009_runtime_obs.npz").write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep009_gripper_trace.jsonl"
+            rows = [
+                {
+                    "episode_idx": 9,
+                    "step": 156,
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "task_frame_v46_yaw_observable": True,
+                    "task_frame_v46_yaw_ambiguous": False,
+                    "task_frame_v46_yaw_unobservable": False,
+                    "task_frame_v46_yaw_confidence": 0.82,
+                    "task_frame_v46_yaw_hypothesis_gap": 0.44,
+                    "alias_drift_decision": "stable_alias_control",
+                    "visual_observability_class": "partial_but_yaw_supported",
+                    "grasp_probe_local_command_local_6d": [0.0, 0.0, 0.001, 0.0, 0.0, 0.0],
+                    "grasp_probe_pre_true_error_t": [0.02, -0.01, 0.03, 0.18],
+                    "grasp_probe_post_true_error_t": [0.03, -0.02, 0.04, 0.21],
+                },
+                {
+                    "episode_idx": 9,
+                    "step": 157,
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "task_frame_v46_yaw_observable": True,
+                    "task_frame_v46_yaw_ambiguous": True,
+                    "task_frame_v46_yaw_unobservable": False,
+                    "task_frame_v46_yaw_confidence": 0.95,
+                    "task_frame_v46_yaw_hypothesis_gap": 0.60,
+                    "alias_drift_decision": "stable_alias_control",
+                    "grasp_probe_local_command_local_6d": [0.0, 0.0, 0.001, 0.0, 0.0, 0.0],
+                },
+                {
+                    "episode_idx": 9,
+                    "step": 158,
+                    "c2c_v2_stage": "RING_GRASP_ALIGN",
+                    "task_frame_v46_yaw_observable": True,
+                    "task_frame_v46_yaw_ambiguous": False,
+                    "task_frame_v46_yaw_unobservable": False,
+                    "task_frame_v46_yaw_confidence": 0.90,
+                    "task_frame_v46_yaw_hypothesis_gap": 0.50,
+                    "alias_drift_decision": "frame_drift_abstain",
+                    "grasp_probe_local_command_local_6d": [0.0, 0.0, 0.001, 0.0, 0.0, 0.0],
+                },
+            ]
+            trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            output_jsonl = tmpdir / "yaw_sym_spec.jsonl"
+            summary_json = tmpdir / "yaw_sym_spec.summary.json"
+            summary = build_v46_command_sweep_spec(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                selection_mode="yaw_observable_symmetry",
+                candidate_profile="yaw_observable_symmetry",
+                xy_step=0.0,
+                z_step=0.0,
+                yaw_step=0.0,
+                z_steps=(0.0015,),
+                yaw_steps=(0.006, 0.012),
+                min_yaw_confidence=0.40,
+                min_yaw_hypothesis_gap=0.20,
+                require_yaw_alias_stable=True,
+                include_combined_xy=False,
+            )
+            self.assertEqual(summary["selection_mode"], "yaw_observable_symmetry")
+            self.assertEqual(summary["candidate_profile"], "yaw_observable_symmetry")
+            self.assertEqual(summary["selected_runtime_rows"], 1)
+            self.assertEqual(summary["counters"]["dropped_not_selected_yaw_observable_symmetry"], 2)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            names = {row["candidate_name"] for row in retained}
+            self.assertIn("zero", names)
+            self.assertIn("yaw_hyp_pos_0060", names)
+            self.assertIn("yaw_hyp_neg_0120", names)
+            self.assertIn("zyaw_sym_p_hyp_pos_z0015_y0060", names)
+            self.assertTrue(all(row["step_idx"] == 156 for row in retained))
+            self.assertTrue(all(row["candidate_policy"] == "yaw_observable_symmetry" for row in retained))
+            self.assertTrue(all(row["uses_privileged_runtime"] is False for row in retained))
+            self.assertTrue(all(row["uses_privileged_label_for_training"] is False for row in retained))
+            self.assertTrue(all(row["close_control_allowed"] is False for row in retained))
+            self.assertEqual(retained[0]["runtime_trace_fields"]["alias_drift_decision"], "stable_alias_control")
+            self.assertNotIn("grasp_probe_pre_true_error_t", json.dumps(retained))
+            self.assertNotIn("grasp_probe_post_true_error_t", json.dumps(retained))
+
+    def test_task_frame_v46_command_sweep_spec_bootstraps_yaw_observable_manifest_without_label_leak(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "manifest_source"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            runtime_obs = obs_dir / "ep006_runtime_obs.npz"
+            runtime_obs.write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep006_gripper_trace.jsonl"
+            trace_path.write_text(json.dumps({"episode_idx": 6, "step": 121}) + "\n", encoding="utf-8")
+            manifest = tmpdir / "yaw_positive_manifest.jsonl"
+            rows = [
+                {
+                    "schema_version": "unit_manifest",
+                    "source_eval_root": str(eval_root),
+                    "sequence_id": f"{eval_root}::ep006",
+                    "episode_idx": 6,
+                    "step_idx": 121,
+                    "stage": "RING_GRASP_ALIGN",
+                    "runtime_obs_path": str(runtime_obs),
+                    "trace_path": str(trace_path),
+                    "yaw_observability_class": "observable",
+                    "yaw_control_observable": True,
+                    "visual_observability_class": "visual_observable",
+                    "offline_labels": {
+                        "dx": 0.010,
+                        "dy": -0.005,
+                        "dz": 0.002,
+                        "dyaw": 0.08,
+                        "xy_observable": True,
+                        "z_observable": True,
+                        "yaw_observable": True,
+                        "yaw_ambiguous": False,
+                    },
+                },
+                {
+                    "schema_version": "unit_manifest",
+                    "source_eval_root": str(eval_root),
+                    "sequence_id": f"{eval_root}::ep006",
+                    "episode_idx": 6,
+                    "step_idx": 122,
+                    "stage": "RING_GRASP_ALIGN",
+                    "runtime_obs_path": str(runtime_obs),
+                    "trace_path": str(trace_path),
+                    "yaw_observability_class": "ambiguous",
+                    "yaw_control_observable": False,
+                    "offline_labels": {
+                        "dx": 0.010,
+                        "dy": -0.005,
+                        "dz": 0.002,
+                        "dyaw": 0.08,
+                        "yaw_observable": False,
+                        "yaw_ambiguous": True,
+                    },
+                },
+            ]
+            manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            output_jsonl = tmpdir / "yaw_manifest_spec.jsonl"
+            summary_json = tmpdir / "yaw_manifest_spec.summary.json"
+            summary = build_v46_command_sweep_spec(
+                [manifest],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                selection_mode="yaw_observable_symmetry_or_offline_label",
+                candidate_profile="yaw_observable_symmetry",
+                xy_step=0.0,
+                z_step=0.0,
+                yaw_step=0.0,
+                z_steps=(0.0015,),
+                yaw_steps=(0.006,),
+                include_combined_xy=False,
+                require_yaw_alias_stable=False,
+            )
+            self.assertEqual(summary["selected_runtime_rows"], 1)
+            self.assertEqual(summary["counters"]["dropped_not_selected_yaw_observable_symmetry_or_offline_label"], 1)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertGreater(len(retained), 0)
+            self.assertTrue(all(row["runtime_obs_path"] == str(runtime_obs) for row in retained))
+            self.assertTrue(all(row["trace_path"] == str(trace_path) for row in retained))
+            self.assertTrue(all(row["uses_privileged_runtime"] is False for row in retained))
+            self.assertTrue(all(row["uses_privileged_label_for_training"] is False for row in retained))
+            self.assertTrue(all(row["close_control_allowed"] is False for row in retained))
+            self.assertIn("yaw_hyp_pos_0060", {row["candidate_name"] for row in retained})
+            self.assertNotIn("offline_labels", json.dumps(retained))
+            self.assertNotIn("dyaw", json.dumps(retained))
+
+    def test_task_frame_v46_command_sweep_spec_selects_yaw_selector_permitted_rows(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "selector_source"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            runtime_obs = obs_dir / "ep006_runtime_obs.npz"
+            runtime_obs.write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep006_gripper_trace.jsonl"
+            rows = [
+                {
+                    "episode_idx": 6,
+                    "step_idx": 121,
+                    "stage_name": "RING_GRASP_ALIGN",
+                    "trace_path": str(trace_path),
+                    "runtime_obs_path": str(runtime_obs),
+                    "source_eval_root": str(eval_root),
+                    "sequence_id": f"{eval_root}::ep006",
+                    "task_frame_v46_yaw_selector_allowed": True,
+                    "task_frame_v46_yaw_selector_score": 0.9,
+                    "grasp_probe_local_command_local_6d": [0, 0, 0, 0, 0, 0],
+                    "target": [0.01, 0.0, 0.02, 0.04],
+                },
+                {
+                    "episode_idx": 6,
+                    "step_idx": 122,
+                    "stage_name": "RING_GRASP_ALIGN",
+                    "trace_path": str(trace_path),
+                    "runtime_obs_path": str(runtime_obs),
+                    "source_eval_root": str(eval_root),
+                    "sequence_id": f"{eval_root}::ep006",
+                    "task_frame_v46_yaw_selector_allowed": False,
+                    "task_frame_v46_yaw_selector_score": 0.1,
+                    "grasp_probe_local_command_local_6d": [0, 0, 0, 0, 0, 0],
+                    "target": [0.01, 0.0, 0.02, 0.04],
+                },
+            ]
+            prediction_dump = tmpdir / "selector_predictions.jsonl"
+            prediction_dump.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            output_jsonl = tmpdir / "selector_spec.jsonl"
+            summary_json = tmpdir / "selector_spec.summary.json"
+            summary = build_v46_command_sweep_spec(
+                [prediction_dump],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+                selection_mode="yaw_selector_permitted",
+                candidate_profile="yaw_observable_symmetry",
+                xy_step=0.0,
+                z_step=0.0,
+                yaw_step=0.0,
+                z_steps=(0.0015,),
+                yaw_steps=(0.006, 0.012),
+                include_combined_xy=False,
+                require_yaw_alias_stable=False,
+            )
+            self.assertEqual(summary["selected_runtime_rows"], 1)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertTrue(retained)
+            self.assertTrue(all(row["step_idx"] == 121 for row in retained))
+            self.assertIn("yaw_hyp_neg_0060", {row["candidate_name"] for row in retained})
+            self.assertTrue(all(row["uses_privileged_runtime"] is False for row in retained))
+            self.assertTrue(all(row["uses_privileged_label_for_training"] is False for row in retained))
+            self.assertNotIn("target", json.dumps(retained))
+            self.assertNotIn("dyaw", json.dumps(retained))
+
+    def test_task_frame_v46_zero_adjusted_effect_audit_subtracts_noop_drift(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            rows = [
+                {
+                    "episode_idx": 0,
+                    "step_idx": 10,
+                    "task_frame_v46_command_sweep_row_index": 0,
+                    "task_frame_v46_command_sweep_candidate_name": "zero",
+                    "offline_labels": {"dx": 0.02, "dy": 0.0, "dz": 0.04, "dyaw": 0.20},
+                    "next_privileged_dx": 0.019,
+                    "next_privileged_dy": 0.0,
+                    "next_privileged_dz": 0.039,
+                    "next_privileged_dyaw": 0.19,
+                    "uses_privileged_runtime": False,
+                    "close_leak": False,
+                },
+                {
+                    "episode_idx": 0,
+                    "step_idx": 10,
+                    "task_frame_v46_command_sweep_row_index": 1,
+                    "task_frame_v46_command_sweep_candidate_name": "yaw_neg",
+                    "offline_labels": {"dx": 0.02, "dy": 0.0, "dz": 0.04, "dyaw": 0.20},
+                    "next_privileged_dx": 0.019,
+                    "next_privileged_dy": 0.0,
+                    "next_privileged_dz": 0.039,
+                    "next_privileged_dyaw": 0.16,
+                    "uses_privileged_runtime": False,
+                    "close_leak": False,
+                },
+                {
+                    "episode_idx": 0,
+                    "step_idx": 10,
+                    "task_frame_v46_command_sweep_row_index": 2,
+                    "task_frame_v46_command_sweep_candidate_name": "z_neg",
+                    "offline_labels": {"dx": 0.02, "dy": 0.0, "dz": 0.04, "dyaw": 0.20},
+                    "next_privileged_dx": 0.019,
+                    "next_privileged_dy": 0.0,
+                    "next_privileged_dz": 0.050,
+                    "next_privileged_dyaw": 0.19,
+                    "uses_privileged_runtime": False,
+                    "close_leak": False,
+                },
+            ]
+            manifest = tmpdir / "manifest.jsonl"
+            manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            out = tmpdir / "audit.json"
+            summary = audit_v46_zero_adjusted_effect(manifest, output_json=out, candidates_per_group=3)
+            self.assertEqual(summary["audited_groups"], 1)
+            self.assertEqual(summary["close_leak_rows"], 0)
+            self.assertFalse(summary["uses_privileged_runtime_any"])
+            self.assertEqual(summary["candidate_metrics"]["zero"]["beats_zero_yaw"], 0.0)
+            self.assertEqual(summary["candidate_metrics"]["yaw_neg"]["beats_zero_yaw"], 1.0)
+            self.assertEqual(summary["candidate_metrics"]["z_neg"]["beats_zero_z"], 0.0)
+
+    def test_v46_yaw_transition_effect_audit_reports_sign_and_collateral(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            base = {
+                "episode_idx": 0,
+                "step_idx": 10,
+                "source_eval_root": "root_a",
+                "sequence_id": "root_a::ep000",
+                "offline_labels": {"dx": 0.02, "dy": 0.0, "dz": 0.04, "dyaw": -0.10, "yaw_observable": True, "yaw_ambiguous": False},
+                "next_privileged_dx": 0.02,
+                "next_privileged_dy": 0.0,
+                "next_privileged_dz": 0.04,
+                "next_privileged_dyaw": -0.10,
+                "uses_privileged_runtime": False,
+                "close_leak": False,
+            }
+            rows = [
+                {
+                    **base,
+                    "task_frame_v46_command_sweep_row_index": 0,
+                    "task_frame_v46_command_sweep_candidate_name": "zero",
+                    "applied_control_command_local_6d": [0, 0, 0, 0, 0, 0],
+                    "next_privileged_dyaw": -0.095,
+                },
+                {
+                    **base,
+                    "task_frame_v46_command_sweep_row_index": 1,
+                    "task_frame_v46_command_sweep_candidate_name": "yaw_neg",
+                    "applied_control_command_local_6d": [0, 0, 0, 0, 0, -0.01],
+                    "next_privileged_dyaw": -0.070,
+                    "next_privileged_dx": 0.021,
+                },
+                {
+                    **base,
+                    "task_frame_v46_command_sweep_row_index": 2,
+                    "task_frame_v46_command_sweep_candidate_name": "yaw_pos",
+                    "applied_control_command_local_6d": [0, 0, 0, 0, 0, 0.01],
+                    "next_privileged_dyaw": -0.120,
+                },
+            ]
+            manifest = tmpdir / "yaw_transition.jsonl"
+            manifest.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            summary = audit_v46_yaw_transition_effect(
+                [manifest],
+                output_json=tmpdir / "yaw_transition.json",
+                candidates_per_group=3,
+            )
+            self.assertEqual(summary["rows"], 2)
+            self.assertEqual(summary["counters"]["audited_groups"], 1)
+            self.assertEqual(summary["close_leak_rows"], 0)
+            self.assertFalse(summary["uses_privileged_runtime_any"])
+            self.assertEqual(summary["by_command_residual_sign_relation"]["same_sign"]["rows"], 1)
+            self.assertEqual(summary["by_command_residual_sign_relation"]["opposes_residual"]["rows"], 1)
+            self.assertEqual(summary["by_command_yaw_bucket"]["neg_0100"]["beats_zero_yaw_rate"], 1.0)
+            self.assertEqual(summary["by_command_yaw_bucket"]["pos_0100"]["yaw_worsen_rate"], 1.0)
+            self.assertEqual(summary["by_command_yaw_bucket"]["neg_0100"]["xy_collateral_worsen_rate"], 1.0)
+            self.assertEqual(summary["best_per_group"]["beats_zero_yaw_rate"], 1.0)
+
+    def test_v59_command_sweep_batch_selects_rows_and_builds_strict_eval_command(self) -> None:
+        rows = [
+            {"episode_idx": 24, "step_idx": 100, "candidate_name": "x_neg"},
+            {"episode_idx": 24, "step_idx": 100, "candidate_name": "x_pos"},
+            {"episode_idx": 25, "step_idx": 120, "candidate_name": "z_pos"},
+        ]
+        selected = select_v59_sweep_rows(rows, row_indices="", start_index=0, max_rows=2, episode_indices="24", candidate_names="")
+        self.assertEqual([idx for idx, _ in selected], [0, 1])
+        selected_z = select_v59_sweep_rows(rows, row_indices="", start_index=0, max_rows=0, episode_indices="", candidate_names="z_pos")
+        self.assertEqual([idx for idx, _ in selected_z], [2])
+        root = v59_sweep_output_root_for_row(Path("out"), 2, rows[2])
+        self.assertEqual(root.name, "row00002_z_pos_ep025_step120")
+        args = SimpleNamespace(
+            conda_env="vla-adapter",
+            checkpoint_dir=V59_DEFAULT_PLANNER_CHECKPOINT,
+            runtime_xy_calibration_json="runtime_artifacts/coarse2contact_v2/checkpoints/runtime_xy_spatial_temporal_v42_expanded_v4pilot_candidate.pt",
+            task_frame_v46_ckpt="runtime_artifacts/coarse2contact_v2/checkpoints/runtime_task_frame_alignment_v58_nearfield_onpolicy_candidate.pt",
+            eval_seed=3407,
+            post_steps=15,
+            min_max_steps=115,
+        )
+        cmd = build_v59_sweep_eval_command(
+            spec_jsonl=Path("spec.jsonl"),
+            row_index=2,
+            row=rows[2],
+            output_root=root,
+            args=args,
+        )
+        self.assertIn("/home/guoning/code/VLA2/pretrained_models/planner_checkpoints/insert_onto_square_peg_30000_chkpt", cmd)
+        self.assertIn("--task_frame_v46_command_sweep_spec_jsonl", cmd)
+        self.assertIn("--task_frame_v46_command_sweep_row_index", cmd)
+        self.assertIn("2", cmd)
+        self.assertIn("--c2c_grasp_probe_smoke_type", cmd)
+        self.assertIn("runtime_style_c2c", cmd)
+        self.assertIn("--video_layout", cmd)
+        self.assertIn("front_wrist", cmd)
+        self.assertIn("--capture_failure_target_pose", cmd)
+        self.assertEqual(cmd[cmd.index("--episode_indices") + 1], "25")
+        self.assertEqual(cmd[cmd.index("--max_steps") + 1], "135")
+
+    def test_v59_command_sweep_batch_skip_existing_reuses_completed_root(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            spec = tmpdir / "spec.jsonl"
+            row = {"episode_idx": 24, "step_idx": 100, "candidate_name": "x_neg"}
+            spec.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            output_root = tmpdir / "batch"
+            completed_root = v59_sweep_output_root_for_row(output_root, 0, row)
+            trace_dir = completed_root / "gripper_traces"
+            trace_dir.mkdir(parents=True)
+            (completed_root / "eval_results.json").write_text("{}", encoding="utf-8")
+            (trace_dir / "ep024_gripper_trace.jsonl").write_text("{}\n", encoding="utf-8")
+            args = SimpleNamespace(
+                spec_jsonl=spec,
+                output_root=output_root,
+                summary_json="",
+                row_indices="0",
+                start_index=0,
+                max_rows=0,
+                episode_indices="",
+                candidate_names="",
+                max_parallel=1,
+                gpus="0",
+                dry_run=False,
+                skip_existing=True,
+                build_manifest=False,
+                manifest_jsonl="",
+                manifest_summary_json="",
+                conda_env="vla-adapter",
+                checkpoint_dir=V59_DEFAULT_PLANNER_CHECKPOINT,
+                runtime_xy_calibration_json="runtime_artifacts/coarse2contact_v2/checkpoints/runtime_xy_spatial_temporal_v42_expanded_v4pilot_candidate.pt",
+                task_frame_v46_ckpt="runtime_artifacts/coarse2contact_v2/checkpoints/runtime_task_frame_alignment_v58_nearfield_onpolicy_candidate.pt",
+                eval_seed=3407,
+                post_steps=15,
+                min_max_steps=115,
+            )
+            summary = run_v59_sweep_batch(args)
+            self.assertEqual(summary["success_count"], 1)
+            self.assertEqual(summary["failure_count"], 0)
+            self.assertEqual(summary["skipped_existing_count"], 1)
+            self.assertTrue(summary["results"][0]["skipped_existing"])
+
+    def test_v59_command_sweep_batch_dry_run_uses_canonical_conda_env_launcher(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            spec = tmpdir / "spec.jsonl"
+            row = {"episode_idx": 24, "step_idx": 100, "candidate_name": "x_neg"}
+            spec.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            args = SimpleNamespace(
+                spec_jsonl=spec,
+                output_root=tmpdir / "batch",
+                summary_json="",
+                row_indices="0",
+                start_index=0,
+                max_rows=0,
+                episode_indices="",
+                candidate_names="",
+                max_parallel=1,
+                gpus="0",
+                dry_run=True,
+                skip_existing=False,
+                build_manifest=False,
+                manifest_jsonl="",
+                manifest_summary_json="",
+                conda_env="vla-adapter",
+                conda_prefix="",
+                checkpoint_dir=V59_DEFAULT_PLANNER_CHECKPOINT,
+                runtime_xy_calibration_json="runtime_artifacts/coarse2contact_v2/checkpoints/runtime_xy_spatial_temporal_v42_expanded_v4pilot_candidate.pt",
+                task_frame_v46_ckpt="runtime_artifacts/coarse2contact_v2/checkpoints/runtime_task_frame_alignment_v58_nearfield_onpolicy_candidate.pt",
+                eval_seed=3407,
+                post_steps=15,
+                min_max_steps=115,
+            )
+            summary = run_v59_sweep_batch(args)
+            command = summary["results"][0]["command"]
+            self.assertEqual(command[:7], ["conda", "run", "-n", "vla-adapter", "xvfb-run", "-a", "python"])
+            self.assertIn("scripts/evaluate_c2c_v2_rlbench.py", command)
+            self.assertNotIn("-p", command[:7])
+            self.assertNotIn("--prefix", command[:7])
+
+    def test_v46_gate_summary_requires_yaw_evidence_and_flags_bad_observability(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            no_yaw = tmpdir / "no_yaw.json"
+            good = tmpdir / "good.json"
+            selector_good = tmpdir / "selector_good.json"
+            bad = tmpdir / "bad.json"
+            loo_bad = tmpdir / "loo_bad.json"
+            loo_good = tmpdir / "loo_good.json"
+            no_yaw.write_text(
+                json.dumps(
+                    {
+                        "eval_rows": 10,
+                        "overall": {
+                            "bounded_step_contraction": 0.9,
+                            "bounded_step_worsen": 0.0,
+                            "xy_bounded_step_contraction": 0.8,
+                            "z_bounded_step_contraction": 0.7,
+                            "yaw_bounded_step_contraction": 0.0,
+                            "xy_observable_target_rate": 1.0,
+                            "xy_observable_predicted_rate": 1.0,
+                            "yaw_control_target_rate": 0.0,
+                            "yaw_control_predicted_rate": 0.0,
+                            "yaw_ambiguous_target_rate": 1.0,
+                            "yaw_ambiguous_predicted_rate": 1.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            good.write_text(
+                json.dumps(
+                    {
+                        "eval_rows": 10,
+                        "overall": {
+                            "bounded_step_contraction": 0.9,
+                            "bounded_step_worsen": 0.0,
+                            "xy_bounded_step_contraction": 0.8,
+                            "z_bounded_step_contraction": 0.7,
+                            "yaw_bounded_step_contraction": 0.8,
+                            "xy_observable_target_rate": 1.0,
+                            "xy_observable_predicted_rate": 1.0,
+                            "yaw_control_target_rate": 0.2,
+                            "yaw_control_predicted_rate": 0.2,
+                            "yaw_ambiguous_target_rate": 0.2,
+                            "yaw_ambiguous_predicted_rate": 0.2,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            selector_good.write_text(
+                json.dumps(
+                    {
+                        "eval_rows": 10,
+                        "overall": {
+                            "bounded_step_contraction": 0.9,
+                            "bounded_step_worsen": 0.0,
+                            "xy_bounded_step_contraction": 0.8,
+                            "z_bounded_step_contraction": 0.7,
+                            "yaw_bounded_step_contraction": 0.8,
+                            "xy_observable_target_rate": 1.0,
+                            "xy_observable_predicted_rate": 1.0,
+                            "yaw_control_target_rate": 0.2,
+                            "yaw_control_predicted_rate": 0.9,
+                            "yaw_selector_control_predicted_rate": 0.2,
+                            "yaw_selector_precision": 0.9,
+                            "yaw_selector_false_positive_rate": 0.0,
+                            "yaw_ambiguous_target_rate": 0.2,
+                            "yaw_ambiguous_predicted_rate": 0.2,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bad.write_text(
+                json.dumps(
+                    {
+                        "eval_rows": 10,
+                        "overall": {
+                            "bounded_step_contraction": 0.1,
+                            "bounded_step_worsen": 0.8,
+                            "xy_bounded_step_contraction": 0.0,
+                            "z_bounded_step_contraction": 0.7,
+                            "yaw_bounded_step_contraction": 0.0,
+                            "xy_observable_target_rate": 1.0,
+                            "xy_observable_predicted_rate": 0.0,
+                            "yaw_control_target_rate": 0.0,
+                            "yaw_control_predicted_rate": 1.0,
+                            "yaw_ambiguous_target_rate": 1.0,
+                            "yaw_ambiguous_predicted_rate": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loo_bad.write_text(
+                json.dumps(
+                    {
+                        "folds": 4,
+                        "worst_folds": {
+                            "top1_best_score_match": {"top1_best_score_match": 1.0},
+                            "top1_combined_contraction": {"top1_combined_contraction": 1.0},
+                            "top1_minus_zero_combined_contraction": {"top1_minus_zero_combined_contraction": 0.0},
+                            "top1_minus_zero_yaw_contraction": {"top1_minus_zero_yaw_contraction": 0.0},
+                        },
+                        "fold_summaries": [
+                            {
+                                "top1_worse_than_zero_xy_rate": 0.0,
+                                "top1_worse_than_zero_z_rate": 0.0,
+                                "top1_worse_than_zero_yaw_rate": 0.0,
+                                "top1_worse_than_zero_combined_rate": 0.0,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loo_good.write_text(
+                json.dumps(
+                    {
+                        "folds": 12,
+                        "worst_folds": {
+                            "top1_best_score_match": {"top1_best_score_match": 1.0},
+                            "top1_combined_contraction": {"top1_combined_contraction": 0.9},
+                            "top1_minus_zero_combined_contraction": {"top1_minus_zero_combined_contraction": 0.2},
+                            "top1_minus_zero_yaw_contraction": {"top1_minus_zero_yaw_contraction": 0.2},
+                        },
+                        "fold_summaries": [
+                            {
+                                "top1_worse_than_zero_xy_rate": 0.0,
+                                "top1_worse_than_zero_z_rate": 0.0,
+                                "top1_worse_than_zero_yaw_rate": 0.0,
+                                "top1_worse_than_zero_combined_rate": 0.0,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary = summarize_v46_gate(
+                [f"no_yaw={no_yaw}", f"good={good}", f"selector_good={selector_good}", f"bad={bad}"],
+                output_json=tmpdir / "gate.json",
+            )
+            self.assertEqual(summary["offline_gate_status"], "fail")
+            self.assertEqual(summary["reports"][0]["status"], "fail")
+            self.assertIn("insufficient_yaw_control_evidence", summary["reports"][0]["violations"])
+            self.assertEqual(summary["reports"][1]["status"], "offline_pass")
+            self.assertEqual(summary["reports"][2]["status"], "offline_pass")
+            self.assertNotIn("yaw_control_false_positive", summary["reports"][2]["violations"])
+            self.assertEqual(summary["reports"][2]["metrics"]["yaw_runtime_control_predicted_rate"], 0.2)
+            self.assertEqual(summary["reports"][3]["status"], "fail")
+            self.assertIn("combined_contraction_below_gate", summary["reports"][3]["violations"])
+            self.assertIn("xy_observable_false_negative", summary["reports"][3]["violations"])
+            self.assertIn("yaw_control_false_positive", summary["reports"][3]["violations"])
+            self.assertIn("yaw_ambiguity_false_negative", summary["reports"][3]["violations"])
+            ranker_bad_summary = summarize_v46_gate(
+                [f"good={good}"],
+                output_json=tmpdir / "gate_ranker_bad.json",
+                ranker_loo_json=[f"loo_bad={loo_bad}"],
+            )
+            self.assertEqual(ranker_bad_summary["offline_gate_status"], "fail")
+            self.assertEqual(ranker_bad_summary["ranker_loo_reports"][0]["status"], "fail")
+            self.assertIn("insufficient_ranker_loo_folds", ranker_bad_summary["ranker_loo_reports"][0]["violations"])
+            self.assertIn(
+                "ranker_worst_root_combined_not_beating_zero",
+                ranker_bad_summary["ranker_loo_reports"][0]["violations"],
+            )
+            self.assertIn(
+                "ranker_worst_root_yaw_not_beating_zero",
+                ranker_bad_summary["ranker_loo_reports"][0]["violations"],
+            )
+            ranker_good_summary = summarize_v46_gate(
+                [f"good={good}"],
+                output_json=tmpdir / "gate_ranker_good.json",
+                ranker_loo_json=[f"loo_good={loo_good}"],
+            )
+            self.assertEqual(ranker_good_summary["offline_gate_status"], "pass")
+            self.assertEqual(ranker_good_summary["ranker_loo_reports"][0]["status"], "offline_pass")
+
+    def test_v46_yaw_holdout_coverage_selects_observable_near_contact_rows(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            manifest = tmpdir / "manifest.jsonl"
+            rows = [
+                {
+                    "source_eval_root": "root_a",
+                    "episode_idx": 23,
+                    "step_idx": 100,
+                    "privileged_dx": 0.010,
+                    "privileged_dy": -0.020,
+                    "privileged_dz": 0.015,
+                    "privileged_dyaw": 0.050,
+                    "yaw_observability_class": "observable",
+                    "yaw_observable": True,
+                },
+                {
+                    "source_eval_root": "root_b",
+                    "episode_idx": 24,
+                    "step_idx": 101,
+                    "privileged_dx": 0.010,
+                    "privileged_dy": 0.010,
+                    "privileged_dz": 0.015,
+                    "privileged_dyaw": 0.050,
+                    "yaw_observability_class": "ambiguous",
+                    "yaw_observable": False,
+                },
+                {
+                    "source_eval_root": "root_c",
+                    "episode_idx": 25,
+                    "step_idx": 102,
+                    "privileged_dx": 0.120,
+                    "privileged_dy": 0.010,
+                    "privileged_dz": 0.015,
+                    "privileged_dyaw": 0.050,
+                    "yaw_observability_class": "observable",
+                    "yaw_observable": True,
+                },
+            ]
+            manifest.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            summary = audit_v46_yaw_holdout_coverage(
+                [manifest],
+                output_json=tmpdir / "summary.json",
+                output_jsonl=tmpdir / "selected.jsonl",
+                min_yaw_control_rows=2,
+                min_yaw_control_roots=2,
+            )
+            self.assertEqual(summary["selected_rows"], 1)
+            self.assertEqual(summary["selected_source_eval_roots"], 1)
+            self.assertEqual(summary["status"], "insufficient_coverage")
+            self.assertIn("insufficient_yaw_control_rows", summary["violations"])
+            selected = [json.loads(line) for line in (tmpdir / "selected.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(selected[0]["episode_idx"], 23)
+            self.assertTrue(selected[0]["task_frame_v46_label_yaw_observable"])
+            self.assertFalse(selected[0]["task_frame_v46_label_yaw_ambiguous"])
+
+    def test_v46_yaw_observability_shift_audit_flags_seed_control_loss(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            spec = tmpdir / "spec.jsonl"
+            manifest = tmpdir / "manifest.jsonl"
+            spec.write_text(
+                json.dumps(
+                    {
+                        "candidate_name": "yaw_neg",
+                        "runtime_trace_fields": {
+                            "task_frame_v46_label_yaw_observable": True,
+                            "task_frame_v46_label_yaw_ambiguous": False,
+                            "task_frame_v46_yaw_observability_class": "observable",
+                            "yaw_observability_frame_observability": 0.12,
+                            "yaw_control_block_reason": "ready",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "episode_idx": 6,
+                        "step_idx": 121,
+                        "task_frame_v46_command_sweep_row_index": 0,
+                        "task_frame_v46_command_sweep_candidate_name": "yaw_neg",
+                        "offline_labels": {
+                            "dx": 0.0,
+                            "dy": 0.0,
+                            "dz": 0.01,
+                            "dyaw": -0.03,
+                            "yaw_observable": False,
+                            "yaw_ambiguous": True,
+                        },
+                        "next_privileged_dz": 0.008,
+                        "next_privileged_dyaw": -0.02,
+                        "yaw_contracted_observed": True,
+                        "z_contracted_observed": True,
+                        "xy_contracted_observed": True,
+                        "close_leak": False,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            summary = audit_v46_yaw_observability_shift(
+                manifest,
+                spec_jsonl=spec,
+                output_json=tmpdir / "summary.json",
+                output_jsonl=tmpdir / "rows.jsonl",
+            )
+            self.assertEqual(summary["rows"], 1)
+            self.assertEqual(summary["counters"]["seed_yaw_control_rows"], 1)
+            self.assertEqual(summary["counters"]["exec_yaw_control_rows"], 0)
+            self.assertEqual(summary["counters"]["seed_control_to_exec_noncontrol"], 1)
+            self.assertAlmostEqual(summary["rates"]["yaw_contraction"], 1.0)
+            row = json.loads((tmpdir / "rows.jsonl").read_text(encoding="utf-8").strip())
+            self.assertTrue(row["seed_yaw_control"])
+            self.assertFalse(row["exec_yaw_control"])
+            self.assertTrue(row["yaw_observability_shift"])
+
+    def test_v46_yaw_model_observability_audit_flags_model_control_loss(self) -> None:
+        class FakeV46Model(torch.nn.Module):
+            def forward(self, image, scalar, history, proprio, planner, command_6d):
+                batch = image.shape[0]
+                return {
+                    "dx": torch.zeros(batch, dtype=torch.float32),
+                    "dy": torch.zeros(batch, dtype=torch.float32),
+                    "dz": torch.full((batch,), 0.01, dtype=torch.float32),
+                    "dyaw": torch.full((batch,), -0.02, dtype=torch.float32),
+                    "axis_observability": torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32).repeat(batch, 1),
+                    "axis_confidence": torch.tensor([[0.8, 0.8, 0.9]], dtype=torch.float32).repeat(batch, 1),
+                    "axis_step_scale": torch.tensor([[0.4, 0.4, 0.4]], dtype=torch.float32).repeat(batch, 1),
+                    "yaw_ambiguous": torch.ones(batch, dtype=torch.float32),
+                }
+
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            manifest = tmpdir / "seed.jsonl"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "source_eval_root": "root_a",
+                        "episode_idx": 6,
+                        "step_idx": 121,
+                        "runtime_trace_fields": {
+                            "task_frame_v46_label_dx": 0.01,
+                            "task_frame_v46_label_dy": -0.01,
+                            "task_frame_v46_label_dz": 0.02,
+                            "task_frame_v46_label_dyaw": -0.03,
+                            "task_frame_v46_label_yaw_observable": True,
+                            "task_frame_v46_label_yaw_ambiguous": False,
+                            "task_frame_v46_yaw_observability_class": "observable",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            arrays = {
+                "image": np.zeros((1, 5, 16, 16), dtype=np.float32),
+                "scalar": np.zeros((1, 32), dtype=np.float32),
+                "history": np.zeros((1, 8), dtype=np.float32),
+                "proprio": np.zeros((1, 16), dtype=np.float32),
+                "planner": np.zeros((1, 7), dtype=np.float32),
+                "residual": np.asarray([[0.01, -0.01, 0.02, -0.03]], dtype=np.float32),
+                "command_6d": np.zeros((1, 6), dtype=np.float32),
+            }
+            kept = [
+                {
+                    "source_eval_root": "root_a",
+                    "episode_idx": 6,
+                    "step_idx": 121,
+                    "yaw_observability_class": "observable",
+                    "yaw_observable": True,
+                    "yaw_ambiguous": False,
+                }
+            ]
+            with patch("scripts.audit_c2c_v2_task_frame_yaw_model_observability.load_task_frame_v46_alignment_checkpoint") as load_mock:
+                load_mock.return_value = (
+                    SimpleNamespace(
+                        model=FakeV46Model(),
+                        proprio_dim=16,
+                        planner_prior_dim=7,
+                    ),
+                    {"name": "fake"},
+                )
+                with patch("scripts.audit_c2c_v2_task_frame_yaw_model_observability._build_arrays", return_value=(arrays, kept)):
+                    summary = audit_v46_yaw_model_observability(
+                        [manifest],
+                        checkpoint=tmpdir / "fake.pt",
+                        output_json=tmpdir / "summary.json",
+                        output_jsonl=tmpdir / "rows.jsonl",
+                        device="cpu",
+                    )
+            self.assertEqual(summary["rows"], 1)
+            self.assertEqual(summary["counters"]["seed_yaw_control_rows"], 1)
+            self.assertEqual(summary["counters"]["model_yaw_control_rows"], 0)
+            self.assertEqual(summary["counters"]["seed_control_to_model_noncontrol"], 1)
+            self.assertEqual(summary["counters"]["block_model_yaw_ambiguous"], 1)
+            row = json.loads((tmpdir / "rows.jsonl").read_text(encoding="utf-8").strip())
+            self.assertTrue(row["seed_yaw_control"])
+            self.assertFalse(row["model_yaw_control"])
+            self.assertEqual(row["model_yaw_block_reason"], "model_yaw_ambiguous")
+
+    def test_v46_yaw_model_observability_audit_threshold_sweep(self) -> None:
+        class FakeV46Model(torch.nn.Module):
+            def forward(self, image, scalar, history, proprio, planner, command_6d):
+                return {
+                    "dx": torch.zeros(2, dtype=torch.float32),
+                    "dy": torch.zeros(2, dtype=torch.float32),
+                    "dz": torch.zeros(2, dtype=torch.float32),
+                    "dyaw": torch.zeros(2, dtype=torch.float32),
+                    "axis_observability": torch.tensor([[1.0, 1.0, 0.9], [1.0, 1.0, 0.4]], dtype=torch.float32),
+                    "axis_confidence": torch.tensor([[0.8, 0.8, 0.9], [0.8, 0.8, 0.9]], dtype=torch.float32),
+                    "axis_step_scale": torch.tensor([[0.4, 0.4, 0.4], [0.4, 0.4, 0.4]], dtype=torch.float32),
+                    "yaw_ambiguous": torch.tensor([0.1, 0.1], dtype=torch.float32),
+                }
+
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            manifest = tmpdir / "seed.jsonl"
+            manifest.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {"source_eval_root": "root_a", "episode_idx": 1, "step_idx": 10},
+                        {"source_eval_root": "root_b", "episode_idx": 2, "step_idx": 11},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            arrays = {
+                "image": np.zeros((2, 5, 16, 16), dtype=np.float32),
+                "scalar": np.zeros((2, 32), dtype=np.float32),
+                "history": np.zeros((2, 8), dtype=np.float32),
+                "proprio": np.zeros((2, 16), dtype=np.float32),
+                "planner": np.zeros((2, 7), dtype=np.float32),
+                "residual": np.asarray([[0.0, 0.0, 0.01, 0.03], [0.0, 0.0, 0.01, 0.03]], dtype=np.float32),
+                "command_6d": np.zeros((2, 6), dtype=np.float32),
+            }
+            kept = [
+                {
+                    "source_eval_root": "root_a",
+                    "episode_idx": 1,
+                    "step_idx": 10,
+                    "yaw_observability_class": "observable",
+                    "yaw_observable": True,
+                    "yaw_ambiguous": False,
+                },
+                {
+                    "source_eval_root": "root_b",
+                    "episode_idx": 2,
+                    "step_idx": 11,
+                    "yaw_observability_class": "ambiguous",
+                    "yaw_observable": False,
+                    "yaw_ambiguous": True,
+                },
+            ]
+            with patch("scripts.audit_c2c_v2_task_frame_yaw_model_observability.load_task_frame_v46_alignment_checkpoint") as load_mock:
+                load_mock.return_value = (
+                    SimpleNamespace(model=FakeV46Model(), proprio_dim=16, planner_prior_dim=7),
+                    {"name": "fake"},
+                )
+                with patch("scripts.audit_c2c_v2_task_frame_yaw_model_observability._build_arrays", return_value=(arrays, kept)):
+                    summary = audit_v46_yaw_model_observability(
+                        [manifest],
+                        checkpoint=tmpdir / "fake.pt",
+                        output_json=tmpdir / "summary.json",
+                        device="cpu",
+                        sweep_yaw_observable_thresholds=(0.3, 0.8),
+                    )
+            sweep = {
+                float(row["yaw_observable_threshold"]): row
+                for row in summary["threshold_sweep"]
+                if float(row["yaw_confidence_threshold"]) == 0.45
+            }
+            self.assertEqual(sweep[0.3]["tp"], 1)
+            self.assertEqual(sweep[0.3]["fp"], 1)
+            self.assertAlmostEqual(sweep[0.3]["precision"], 0.5)
+            self.assertEqual(sweep[0.8]["tp"], 1)
+            self.assertEqual(sweep[0.8]["fp"], 0)
+            self.assertAlmostEqual(sweep[0.8]["precision"], 1.0)
+
+    def test_v46_yaw_control_selector_trains_precision_gate(self) -> None:
+        def arrays(labels: list[float]) -> dict[str, np.ndarray]:
+            n = len(labels)
+            obs = np.ones((n, 3), dtype=np.float32)
+            yaw_amb = np.asarray([0.0 if label > 0.5 else 1.0 for label in labels], dtype=np.float32)
+            obs[:, 2] = np.asarray(labels, dtype=np.float32)
+            return {
+                "image": np.zeros((n, 5, 8, 8), dtype=np.float32),
+                "scalar": np.zeros((n, 4), dtype=np.float32),
+                "history": np.zeros((n, 4), dtype=np.float32),
+                "proprio": np.zeros((n, 2), dtype=np.float32),
+                "planner": np.zeros((n, 2), dtype=np.float32),
+                "command_6d": np.zeros((n, 6), dtype=np.float32),
+                "residual": np.zeros((n, 4), dtype=np.float32),
+                "observability": obs,
+                "yaw_ambiguous": yaw_amb,
+            }
+
+        train_arrays = arrays([1, 1, 0, 0, 0, 0])
+        val_arrays = arrays([1, 0, 0, 0])
+        train_features = np.asarray(
+            [
+                [0.95, 0.9, 0.05, 0.8, 0.10, 0.10, 0.7, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.90, 0.8, 0.10, 0.8, 0.08, 0.08, 0.6, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.20, 0.8, 0.90, 0.8, 0.01, 0.01, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.30, 0.8, 0.80, 0.8, 0.02, 0.02, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.25, 0.8, 0.70, 0.8, 0.01, 0.01, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.10, 0.8, 0.95, 0.8, 0.01, 0.01, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+            ],
+            dtype=np.float32,
+        )
+        val_features = np.asarray(
+            [
+                [0.92, 0.9, 0.05, 0.8, 0.09, 0.09, 0.7, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.22, 0.8, 0.90, 0.8, 0.01, 0.01, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.18, 0.8, 0.85, 0.8, 0.01, 0.01, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+                [0.28, 0.8, 0.80, 0.8, 0.01, 0.01, 0.1, 0.6, 1, 1, 1, 1, 1, 1],
+            ],
+            dtype=np.float32,
+        )
+        train_rows = [{"source_eval_root": "train", "episode_idx": 0, "step_idx": i} for i in range(6)]
+        val_rows = [{"source_eval_root": "val", "episode_idx": 1, "step_idx": i} for i in range(4)]
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            with patch("scripts.train_c2c_v2_task_frame_v46_yaw_control_selector._load_rows", return_value=train_rows + val_rows):
+                with patch("scripts.train_c2c_v2_task_frame_v46_yaw_control_selector.split_records_by_source_root") as split_mock:
+                    split_mock.return_value = SimpleNamespace(
+                        split_mode="root",
+                        train_records=train_rows,
+                        val_records=val_rows,
+                        train_source_eval_roots=["train"],
+                        val_source_eval_roots=["val"],
+                    )
+                    with patch("scripts.train_c2c_v2_task_frame_v46_yaw_control_selector.load_task_frame_v46_alignment_checkpoint") as load_mock:
+                        load_mock.return_value = (SimpleNamespace(model=torch.nn.Identity(), proprio_dim=2, planner_prior_dim=2), {"model": "fake"})
+                        with patch(
+                            "scripts.train_c2c_v2_task_frame_v46_yaw_control_selector._build_arrays",
+                            side_effect=[(train_arrays, train_rows), (val_arrays, val_rows)],
+                        ):
+                            with patch(
+                                "scripts.train_c2c_v2_task_frame_v46_yaw_control_selector._extract_features",
+                                side_effect=[train_features, val_features],
+                            ):
+                                report = train_v46_yaw_control_selector(
+                                    [tmpdir / "dummy.jsonl"],
+                                    v46_checkpoint=tmpdir / "v46.pt",
+                                    output_checkpoint=tmpdir / "selector.pt",
+                                    output_json=tmpdir / "selector.json",
+                                    epochs=80,
+                                    lr=5.0e-3,
+                                    hidden_dim=8,
+                                    min_precision=0.99,
+                                    max_false_positive_rate=0.001,
+                                    include_scalar_features=False,
+                                    include_spatial_moment_features=False,
+                                    device="cpu",
+                                )
+            self.assertFalse(report["close_control_allowed"])
+            self.assertEqual(report["selected_val_metrics"]["fp"], 0)
+            self.assertGreaterEqual(report["selected_val_metrics"]["tp"], 1)
+            self.assertGreaterEqual(report["selected_val_metrics"]["precision"], 0.99)
+            ckpt = torch.load(tmpdir / "selector.pt", map_location="cpu")
+            self.assertEqual(ckpt["model_type"], "v46_yaw_control_permission_selector")
+            self.assertFalse(ckpt["metadata"]["close_control_allowed"])
+
+    def test_v46_training_prefers_manifest_applied_command_xy(self) -> None:
+        row = {
+            "applied_control_command_xy": [0.010, -0.020],
+            "grasp_probe_local_command_local_6d": [0.001, 0.002, 0.0, 0.0, 0.0, 0.0],
+        }
+        trace_row = {"grasp_probe_local_command_local_6d": [0.003, 0.004, 0.0, 0.0, 0.0, 0.0]}
+        command, has_command = _command_xy_from_row(row, trace_row)
+        self.assertAlmostEqual(command[0], 0.010, places=6)
+        self.assertAlmostEqual(command[1], -0.020, places=6)
+        self.assertEqual(has_command, 1.0)
+
+    def test_v46_candidate_ranker_splits_whole_episode_step_groups(self) -> None:
+        rows = [
+            {"episode_idx": 23, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "x_neg"},
+            {"episode_idx": 23, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "x_pos"},
+            {"episode_idx": 24, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "zero"},
+            {"episode_idx": 24, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "xy_pp"},
+            {"episode_idx": 25, "step_idx": 98, "task_frame_v46_command_sweep_candidate_name": "z_pos"},
+        ]
+        group_keys = [v46_candidate_rank_group_key(row) for row in rows]
+        train, val = split_v46_candidate_rank_groups(group_keys, val_fraction=0.34, seed=3)
+        self.assertTrue(train)
+        self.assertTrue(val)
+        self.assertFalse(train & val)
+        for row in rows:
+            key = v46_candidate_rank_group_key(row)
+            self.assertIn(key, train | val)
+        self.assertTrue(all(key.endswith("ep023:step0095") or key.endswith("ep024:step0095") or key.endswith("ep025:step0098") for key in group_keys))
+
+    def test_v46_candidate_ranker_splits_by_source_root_when_available(self) -> None:
+        rows = [
+            {"source_eval_root": "root_a", "episode_idx": 23, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "x_neg"},
+            {"source_eval_root": "root_a", "episode_idx": 23, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "x_pos"},
+            {"source_eval_root": "root_b", "episode_idx": 24, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "zero"},
+            {"source_eval_root": "root_b", "episode_idx": 24, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "xy_pp"},
+            {"source_eval_root": "root_c", "episode_idx": 25, "step_idx": 98, "task_frame_v46_command_sweep_candidate_name": "z_pos"},
+        ]
+        train_rows, val_rows, meta = split_v46_candidate_rank_rows(rows, split_mode="root", val_fraction=0.34, seed=3)
+        self.assertTrue(train_rows)
+        self.assertTrue(val_rows)
+        self.assertFalse({row["source_eval_root"] for row in train_rows} & {row["source_eval_root"] for row in val_rows})
+        self.assertEqual(meta["split_mode"], "root")
+        self.assertTrue(meta["train_source_eval_roots"])
+        self.assertTrue(meta["val_source_eval_roots"])
+        for row in rows:
+            self.assertIn(row["source_eval_root"], set(meta["train_source_eval_roots"]) | set(meta["val_source_eval_roots"]))
+        self.assertNotEqual(
+            v46_candidate_rank_group_key(rows[0]),
+            v46_candidate_rank_group_key({**rows[0], "source_eval_root": "root_z"}),
+        )
+
+    def test_v46_candidate_ranker_honors_explicit_val_source_root(self) -> None:
+        rows = [
+            {"source_eval_root": "root_train_a", "episode_idx": 23, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "x_neg"},
+            {"source_eval_root": "root_train_a", "episode_idx": 23, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "x_pos"},
+            {"source_eval_root": "root_train_b", "episode_idx": 24, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "zero"},
+            {"source_eval_root": "root_hard_negative", "episode_idx": 25, "step_idx": 98, "task_frame_v46_command_sweep_candidate_name": "yaw_neg"},
+            {"source_eval_root": "root_hard_negative", "episode_idx": 25, "step_idx": 98, "task_frame_v46_command_sweep_candidate_name": "yaw_pos"},
+        ]
+        train_rows, val_rows, meta = split_v46_candidate_rank_rows(
+            rows,
+            split_mode="root",
+            val_fraction=0.2,
+            seed=1,
+            val_source_eval_roots={"root_hard_negative"},
+        )
+        self.assertTrue(train_rows)
+        self.assertTrue(val_rows)
+        self.assertEqual({row["source_eval_root"] for row in val_rows}, {"root_hard_negative"})
+        self.assertNotIn("root_hard_negative", {row["source_eval_root"] for row in train_rows})
+        self.assertIn("root_hard_negative", meta["val_source_eval_roots"])
+        self.assertEqual(meta["requested_val_source_eval_roots"], ["root_hard_negative"])
+        self.assertNotIn("root_hard_negative", meta["train_source_eval_roots"])
+        self.assertNotIn("root_hard_negative", meta["test_source_eval_roots"])
+
+    def test_v46_candidate_ranker_default_split_does_not_drop_random_test_root(self) -> None:
+        rows = [
+            {"source_eval_root": f"root_{idx}", "episode_idx": idx, "step_idx": 95, "task_frame_v46_command_sweep_candidate_name": "zero"}
+            for idx in range(6)
+        ]
+        train_rows, val_rows, meta = split_v46_candidate_rank_rows(rows, split_mode="root", val_fraction=0.34, seed=3)
+        self.assertTrue(train_rows)
+        self.assertTrue(val_rows)
+        self.assertEqual(meta["test_source_eval_roots"], [])
+        self.assertEqual(meta["test_fraction"], 0.0)
+        covered = {row["source_eval_root"] for row in train_rows + val_rows}
+        self.assertEqual(covered, {f"root_{idx}" for idx in range(6)})
+
+    def test_v46_candidate_ranker_loo_summary_tracks_worst_root(self) -> None:
+        summary = aggregate_v46_candidate_ranker_loo_reports(
+            [
+                {
+                    "val_source_eval_roots": ["root_easy"],
+                    "val_metrics": {
+                        "groups": 1,
+                        "rows": 11,
+                        "top1_best_score_match": 1.0,
+                        "top1_xy_contraction": 1.0,
+                        "top1_z_contraction": 1.0,
+                        "top1_yaw_contraction": 1.0,
+                        "top1_combined_contraction": 1.0,
+                        "zero_xy_contraction": 0.0,
+                        "zero_z_contraction": 1.0,
+                        "zero_yaw_contraction": 0.0,
+                        "zero_combined_contraction": 0.0,
+                        "group_details": {
+                            "root_easy::ep001:step0010": {
+                                "selected_flags": [True, True, True, True],
+                                "zero_flags": [False, True, False, False],
+                            }
+                        },
+                        "selected_candidate_counts": {"z_guard_pos_0100": 1},
+                        "oracle_candidate_counts": {"z_guard_pos_0100": 1},
+                    },
+                },
+                {
+                    "val_source_eval_roots": ["root_hard"],
+                    "val_metrics": {
+                        "groups": 1,
+                        "rows": 11,
+                        "top1_best_score_match": 0.0,
+                        "top1_xy_contraction": 0.0,
+                        "top1_z_contraction": 1.0,
+                        "top1_yaw_contraction": 0.0,
+                        "top1_combined_contraction": 0.0,
+                        "zero_xy_contraction": 1.0,
+                        "zero_z_contraction": 1.0,
+                        "zero_yaw_contraction": 1.0,
+                        "zero_combined_contraction": 1.0,
+                        "group_details": {
+                            "root_hard::ep001:step0010": {
+                                "selected_flags": [False, True, False, False],
+                                "zero_flags": [True, True, True, True],
+                            }
+                        },
+                        "selected_candidate_counts": {"yaw_hyp_neg_0100": 1},
+                        "oracle_candidate_counts": {"z_guard_pos_0100": 1},
+                    },
+                },
+            ]
+        )
+        self.assertEqual(summary["folds"], 2)
+        self.assertEqual(summary["metric_stats"]["top1_best_score_match"]["mean"], 0.5)
+        self.assertEqual(summary["metric_stats"]["top1_yaw_contraction"]["min"], 0.0)
+        self.assertEqual(summary["fold_summaries"][1]["val_source_eval_roots"], ["root_hard"])
+        self.assertEqual(summary["fold_summaries"][0]["top1_minus_zero_combined_contraction"], 1.0)
+        self.assertEqual(summary["fold_summaries"][1]["top1_minus_zero_yaw_contraction"], -1.0)
+        self.assertEqual(summary["fold_summaries"][0]["top1_beats_zero_yaw_rate"], 1.0)
+        self.assertEqual(summary["fold_summaries"][1]["top1_worse_than_zero_combined_rate"], 1.0)
+        self.assertEqual(summary["worst_folds"]["top1_yaw_contraction"]["val_source_eval_roots"], ["root_hard"])
+        self.assertEqual(summary["worst_folds"]["top1_minus_zero_combined_contraction"]["val_source_eval_roots"], ["root_hard"])
+        self.assertFalse(summary["uses_privileged_runtime"])
+
+    def test_v46_candidate_ranker_score_prefers_smaller_task_frame_residual(self) -> None:
+        worse = v46_candidate_rank_score_residual(np.asarray([0.030, 0.040, 0.020, 0.100], dtype=np.float32))
+        better = v46_candidate_rank_score_residual(np.asarray([0.010, 0.010, 0.005, 0.020], dtype=np.float32))
+        invalid = v46_candidate_rank_score_residual(np.asarray([np.nan, 0.0, 0.0, 0.0], dtype=np.float32))
+        self.assertLess(better, worse)
+        self.assertTrue(np.isinf(invalid))
+
+    def test_v46_candidate_ranker_axis_balanced_penalizes_axis_worsen(self) -> None:
+        pre = np.asarray([0.020, 0.020, 0.010, 0.050], dtype=np.float32)
+        balanced = np.asarray([0.018, 0.018, 0.009, 0.045], dtype=np.float32)
+        xy_only_with_yaw_worsen = np.asarray([0.004, 0.004, 0.009, 0.070], dtype=np.float32)
+        self.assertLess(
+            v46_candidate_rank_score_command(pre, balanced, mode="axis_balanced"),
+            v46_candidate_rank_score_command(pre, xy_only_with_yaw_worsen, mode="axis_balanced"),
+        )
+
+    def test_v46_candidate_ranker_yaw_collateral_score_prefers_yaw_without_axis_worsen(self) -> None:
+        pre = np.asarray([0.020, 0.020, 0.020, 0.100], dtype=np.float32)
+        yaw_better_with_collateral = np.asarray([0.040, 0.040, 0.040, 0.050], dtype=np.float32)
+        yaw_slightly_better_safe = np.asarray([0.018, 0.018, 0.018, 0.060], dtype=np.float32)
+        self.assertLess(
+            v46_candidate_rank_score_command(pre, yaw_slightly_better_safe, mode="yaw_collateral"),
+            v46_candidate_rank_score_command(pre, yaw_better_with_collateral, mode="yaw_collateral"),
+        )
+
+    def test_v46_candidate_ranker_zero_guard_penalizes_worse_than_noop_selection(self) -> None:
+        # Scores are minimized.  Candidate 1 is observed worse than zero, but
+        # the model currently ranks it ahead of zero, so the guard must fire.
+        pred_bad = torch.tensor([0.20, 0.05, 0.30], dtype=torch.float32)
+        observed = torch.tensor([0.10, 0.40, 0.02], dtype=torch.float32)
+        loss_bad = v46_candidate_zero_guard_margin_loss(pred_bad, observed, zero_index=0, margin=0.05)
+        self.assertGreater(float(loss_bad.item()), 0.0)
+
+        # Candidate 2 is observed better than zero and is predicted ahead of
+        # zero by a margin; candidate 1 is observed worse and predicted behind
+        # zero.  This should satisfy the zero guard.
+        pred_good = torch.tensor([0.20, 0.30, 0.02], dtype=torch.float32)
+        loss_good = v46_candidate_zero_guard_margin_loss(pred_good, observed, zero_index=0, margin=0.05)
+        self.assertAlmostEqual(float(loss_good.item()), 0.0, places=6)
+
+    def test_v46_candidate_ranker_pairwise_margin_ranks_oracle_and_zero(self) -> None:
+        # Scores are minimized. Candidate 2 is the observed oracle. Candidate 1
+        # is worse than zero, so both oracle-vs-candidate and zero-vs-worse
+        # margins should fire when the model ranks candidate 1 too high.
+        observed = torch.tensor([0.20, 0.40, 0.05], dtype=torch.float32)
+        pred_bad = torch.tensor([0.20, 0.02, 0.10], dtype=torch.float32)
+        loss_bad = v46_candidate_pairwise_oracle_margin_loss(
+            pred_bad,
+            observed,
+            zero_index=0,
+            margin=0.05,
+        )
+        self.assertGreater(float(loss_bad.item()), 0.0)
+
+        pred_good = torch.tensor([0.20, 0.32, 0.02], dtype=torch.float32)
+        loss_good = v46_candidate_pairwise_oracle_margin_loss(
+            pred_good,
+            observed,
+            zero_index=0,
+            margin=0.05,
+        )
+        self.assertAlmostEqual(float(loss_good.item()), 0.0, places=6)
+
+    def test_v46_candidate_ranker_typed_command_features_encode_candidate_axis(self) -> None:
+        z_feat = v46_candidate_command_feature_vector(
+            {"task_frame_v46_command_sweep_candidate_name": "z_guard_pos_0100"},
+            np.asarray([0.0, 0.0, 0.010, 0.0, 0.0, 0.0], dtype=np.float32),
+            mode="typed16",
+        )
+        yaw_feat = v46_candidate_command_feature_vector(
+            {"task_frame_v46_command_sweep_candidate_name": "yaw_hyp_neg_0100"},
+            np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -0.010], dtype=np.float32),
+            mode="typed16",
+        )
+        self.assertEqual(int(z_feat.shape[0]), 16)
+        self.assertEqual(int(yaw_feat.shape[0]), 16)
+        # Type bits are [zero, xy, z, yaw].
+        self.assertEqual([float(v) for v in z_feat[6:10].tolist()], [0.0, 0.0, 1.0, 0.0])
+        self.assertEqual([float(v) for v in yaw_feat[6:10].tolist()], [0.0, 0.0, 0.0, 1.0])
+        self.assertGreater(float(z_feat[13]), 0.0)
+        self.assertLess(float(yaw_feat[14]), 0.0)
+
+    def test_v46_candidate_ranker_support_target_uses_zero_baseline(self) -> None:
+        observed = torch.tensor([0.20, 0.10, 0.30], dtype=torch.float32)
+        residual = torch.zeros((3, 4), dtype=torch.float32)
+        target = v46_candidate_support_target_from_zero_or_pre(observed, residual, zero_index=0)
+        self.assertEqual([float(v) for v in target.tolist()], [0.0, 1.0, 0.0])
+
+    def test_v46_candidate_ranker_support_penalty_suppresses_low_confidence_candidate(self) -> None:
+        raw_score = torch.tensor([0.20, 0.10], dtype=torch.float32)
+        support = torch.tensor([1.00, 0.00], dtype=torch.float32)
+        adjusted = v46_candidate_adjust_rank_score_with_support(raw_score, support, support_score_penalty=0.25)
+        self.assertLess(float(adjusted[0].item()), float(adjusted[1].item()))
+
+    def test_v46_candidate_ranker_outcome_targets_track_beat_zero_and_collateral(self) -> None:
+        residual = torch.tensor(
+            [
+                [0.020, 0.000, 0.020, 0.100],  # zero baseline row
+                [0.020, 0.000, 0.020, 0.100],
+                [0.020, 0.000, 0.020, 0.100],
+            ],
+            dtype=torch.float32,
+        )
+        next_residual = torch.tensor(
+            [
+                [0.020, 0.000, 0.020, 0.100],
+                [0.010, 0.000, 0.018, 0.050],
+                [0.040, 0.000, 0.030, 0.150],
+            ],
+            dtype=torch.float32,
+        )
+        observed = torch.tensor([0.0, -1.0, 1.0], dtype=torch.float32)
+        targets = v46_candidate_command_outcome_targets(residual, next_residual, observed, zero_index=0)
+        self.assertEqual(float(targets[1, 0].item()), 1.0)
+        self.assertEqual([float(v) for v in targets[1, 1:5].tolist()], [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(float(targets[2, 0].item()), 0.0)
+        self.assertEqual([float(v) for v in targets[2, 5:9].tolist()], [1.0, 1.0, 1.0, 1.0])
+
+    def test_v46_candidate_ranker_predicted_outcome_utility_prefers_safe_beat_zero(self) -> None:
+        logits = torch.full((2, 9), -6.0, dtype=torch.float32)
+        logits[0, 0:5] = 6.0  # beat zero and contract axes
+        logits[1, 0] = 6.0
+        logits[1, 5:9] = 6.0  # beat-zero claim but high collateral risk
+        utility = v46_candidate_predicted_outcome_utility(logits)
+        self.assertLess(float(utility[0].item()), float(utility[1].item()))
+
+    def test_task_frame_v46_nearfield_manifest_keeps_pre_residual_labels_offline_only(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            eval_root = tmpdir / "v57_smoke"
+            obs_dir = eval_root / "runtime_observations"
+            trace_dir = eval_root / "gripper_traces"
+            obs_dir.mkdir(parents=True)
+            trace_dir.mkdir(parents=True)
+            (obs_dir / "ep024_runtime_obs.npz").write_bytes(b"placeholder")
+            trace_path = trace_dir / "ep024_gripper_trace.jsonl"
+            rows = [
+                {
+                    "episode_idx": 24,
+                    "step": 10,
+                    "grasp_probe_pre_true_error_t": [0.010, 0.010, 0.030, 0.10],
+                    "task_frame_v46_activation_ready": False,
+                    "task_frame_v46_near_field_confidence": 0.10,
+                },
+                {
+                    "episode_idx": 24,
+                    "step": 11,
+                    "grasp_probe_pre_true_error_t": [0.010, 0.010, 0.300, 0.10],
+                    "task_frame_v46_activation_ready": True,
+                    "task_frame_v46_near_field_confidence": 0.90,
+                },
+            ]
+            trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            output_jsonl = tmpdir / "nearfield_manifest.jsonl"
+            summary_json = tmpdir / "nearfield_manifest.summary.json"
+            summary = build_v46_nearfield_manifest(
+                [eval_root],
+                output_jsonl=output_jsonl,
+                summary_json=summary_json,
+            )
+            self.assertEqual(summary["retained_rows"], 2)
+            retained = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(retained[0]["failure_bucket"], "nearfield_positive")
+            self.assertEqual(retained[1]["failure_bucket"], "nearfield_far_z_negative")
+            self.assertFalse(retained[0]["uses_privileged_runtime"])
+            self.assertNotIn("grasp_probe_pre_true_error_t", retained[0])
+            self.assertEqual(retained[0]["privileged_label_boundary"], "offline_pre_residual_nearfield_label_only")
 
     def test_xy_spatial_temporal_generalization_manifest_builds_gate_and_holdout(self) -> None:
         records: list[dict[str, object]] = []

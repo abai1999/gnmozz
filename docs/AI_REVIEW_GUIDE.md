@@ -141,6 +141,12 @@ at runtime?
 If the answer is no, the next fix should be semantic and structural, not just a
 gain tweak.
 
+For the current method-level route, reviewers should also read
+[`docs/C2C_V2_TASK_FRAME_ALIGNMENT_BREAKTHROUGH_PLAN.md`](C2C_V2_TASK_FRAME_ALIGNMENT_BREAKTHROUGH_PLAN.md).
+The next intended breakthrough is not another proxy/gain sweep; it is a
+non-privileged spatial-temporal task-frame estimator that improves XY, Z, and
+Yaw alignment in parallel while preserving strict close handoff.
+
 ## Latest Validation Snapshot
 
 Recent hard-bucket validation tightened the current interpretation:
@@ -191,10 +197,22 @@ Recent hard-bucket validation tightened the current interpretation:
   - `v42_expanded_v4pilot` is the current active baseline. It improves
     random10, random holdout, old4, random5, and hard-bucket validation
     relative to `v41` while keeping strict handoff semantics unchanged.
-  - `v42_generalization` is a useful negative-control branch: it shows why
-    random10 and hard-bucket gates must both be enforced.
-  - Reviewers should judge estimator candidates by random holdout plus
-    hard-bucket runtime A/B, not by offline MAE or pooled validation metrics.
+- `v42_generalization` is a useful negative-control branch: it shows why
+  random10 and hard-bucket gates must both be enforced.
+- Reviewers should judge estimator candidates by random holdout plus
+  hard-bucket runtime A/B, not by offline MAE or pooled validation metrics.
+- The current method-level push beyond proxy correction is `v46`.
+  Reviewers should now inspect the non-privileged spatial-temporal
+  task-frame line, especially the episode-diverse executed-candidate sweeps
+  and the `axis_balanced` held-out ranker smoke. The latest five-group held-out
+  summary is useful evidence, but it is still smoke-only and not a baseline
+  promotion:
+  - dataset:
+    `runtime_artifacts/coarse2contact_v2/datasets/task_frame_alignment_v63_yaw_observable_bootstrap_groups000_003_030_032_070_manifest.jsonl`
+  - held-out summary:
+    `runtime_artifacts/coarse2contact_v2/reports/runtime_task_frame_alignment_v63_groups000_003_030_032_070_candidate_ranker_axis_v2_loo_summary.json`
+  - current read: the ranker is better than the original residual-only score,
+    but XY remains flat against zero and the result is not yet promotable.
 - Next route-level review target:
   - Review `docs/C2C_V2_Z_YAW_READINESS_PLAN.md`.
   - The project should now keep v42 fixed as XY baseline and build v43 Z
