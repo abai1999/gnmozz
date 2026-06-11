@@ -3852,6 +3852,9 @@ Core takeaways:
 
 - The main blocker is not a missing scalar/ranker loss.  It is the gap between
   task-frame belief semantics and true closed-loop command consequences.
+- Diagnostic/evaluation gates may be split by axis, but runtime safety gates
+  may not.  XY-only/Z-only/yaw-observable/ambiguous-yaw-abstain milestones are
+  training signals and promotion diagnostics only; they do not relax close.
 - Yaw is conditionally controllable but often ambiguous or unobservable because
   of square symmetry, occlusion, and partial wrist views.
 - The scarce supervision is same-window, zero-baselined executed transition
@@ -3866,8 +3869,10 @@ Next target:
   `reacquire`, or `probe`, rather than forcing a confident residual on every
   axis
 - train an uncertainty-aware command-conditioned forward model that predicts
-  post-command residual mean/logvar and selects commands only when they beat
-  same-window zero after collateral penalties
+  post-command residual mean/logvar and selects commands only when conservative
+  lower-confidence beat-zero margins pass hard collateral constraints
+- treat `hold`, `reacquire`, and `probe` as open-only candidate action types,
+  not close/handoff actions
 - collect more retain/flush large-XY/large-Yaw, partial-view, yaw-observable,
   and yaw-ambiguous transition groups with zero/no-op baselines
 - keep strict handoff and planner-owned close frozen
@@ -3877,4 +3882,6 @@ Gate before MP4/promotion:
 - worst-root combined and yaw minus zero must be positive, not tied
 - XY contraction must not regress relative to v42/v46 evidence
 - yaw false positives on ambiguous/unobservable windows must stay controlled
+- dyaw must be blocked when yaw is ambiguous/unobservable unless the action is
+  an explicitly bounded open-only probe/reacquire candidate
 - close leak count remains zero

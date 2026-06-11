@@ -63,6 +63,14 @@ runtime MP4 or insert-success claim.
 - C2C close authority remains disabled.  C2C may request open-only safety.
 - Axis correction does not imply handoff.  A useful correction may happen while
   handoff stays false.
+- Diagnostic/evaluation gates may be split by axis.  Runtime safety gates may
+  not.  XY-only, Z-only, yaw-observable, or ambiguous-yaw-abstain success is
+  useful for training and promotion diagnosis, but it must never propagate into
+  close authority.
+- Runtime close remains:
+  planner close intent plus strict `alignment_ready_for_handoff=true` plus the
+  existing all-axis readiness contract.  No intermediate milestone can relax
+  this rule.
 
 ## Phase 1: Belief State, Not Only Residual Regression
 
@@ -119,11 +127,20 @@ Outputs:
 Selection rule:
 
 - enumerate a small bounded candidate set, including zero/no-op
-- choose a non-zero command only when expected utility beats zero after
-  uncertainty and collateral penalties
+- choose a non-zero command only when a conservative lower-confidence bound
+  beats zero/no-op after uncertainty and collateral penalties
 - require positive worst-root evidence in LOO/source-held-out validation
 - allow abstain/reacquire/probe when all candidates are unsupported or tied
   with zero
+- use hard constraints before weighted utility:
+  - predicted XY worsen probability below threshold
+  - predicted Z worsen probability below threshold
+  - predicted Yaw worsen probability below threshold when yaw is observable
+  - no dyaw command when yaw is ambiguous or unobservable
+  - command stays inside the bounded safe set
+  - predicted beat-zero margin exceeds the uncertainty margin
+- rank only the candidates that pass these constraints.  Do not allow a large
+  yaw/Z predicted gain to compensate for XY collateral damage.
 
 Loss terms:
 
@@ -183,6 +200,17 @@ Add a conservative information-gathering action class:
 
 These actions do not set handoff ready and do not authorize close.
 
+Probe/reacquire constraints:
+
+- must keep the gripper open
+- must not set `alignment_ready_for_handoff`
+- must not enter contact-risk or close-risk regions
+- must have max step, max repeat count, and max cumulative displacement
+- must trigger a fresh belief estimate after execution
+- must fall back to hold/open or planner if uncertainty does not decrease
+- should be modeled as candidate action types in the forward model, not only as
+  hand-written heuristics
+
 Gate:
 
 - ambiguous yaw windows should prefer abstain/reacquire/probe over wrong yaw
@@ -223,6 +251,14 @@ Metrics:
 - handoff precision
 - closed-loop insert success only after offline gate passes
 
+Milestone metrics are separate from runtime close:
+
+- XY-only beat-zero success is a diagnostic milestone, not a close predicate.
+- Z near-contact contraction is a diagnostic milestone, not a close predicate.
+- Yaw permission precision is a diagnostic milestone, not a close predicate.
+- Ambiguous-yaw abstain/reacquire success is a diagnostic milestone, not a
+  close predicate.
+
 Promotion gate:
 
 - worst-root top1 minus zero combined and yaw must be positive, not merely tied
@@ -240,15 +276,21 @@ Promotion gate:
    random-heldout, hard-bucket, and applied-transition manifests.
 3. Add belief labels for axis observability, controllability, uncertainty, and
    recommended policy: correct / hold / reacquire / probe.
-4. Refactor the command-transition training objective to predict continuous
+4. Jointly train a minimal belief head with the forward labels.  Do not wait
+   for a "finished" belief model before using transition consequences, because
+   controllability and observability are partly defined by command outcomes.
+5. Refactor the command-transition training objective to predict continuous
    post-residual mean/logvar as the primary target.
-5. Keep `typed16` candidate context, but add uncertainty and XY-collateral
+6. Keep `typed16` candidate context, but add uncertainty and XY-collateral
    utility terms.
-6. Re-run the 10-root LOO gate and require:
+7. Treat `hold`, `reacquire`, and `probe` as candidate action types for the
+   forward model, with explicit observability-after / uncertainty-after labels
+   where available.
+8. Re-run the 10-root LOO gate and require:
    - worse-than-zero folds: `0`
    - worst-root combined/yaw minus zero: `> 0`
    - no XY contraction regression
-7. Only then run canonical 150/180-step MP4 with front+wrist views.
+9. Only then run canonical 150/180-step MP4 with front+wrist views.
 
 ## Current Status
 
