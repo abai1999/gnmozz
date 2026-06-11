@@ -18,6 +18,8 @@ For the current review of v43/v44 and the next handoff audit plan, see
 [`docs/C2C_V2_V43_V44_REVIEW_AND_NEXT_PLAN.md`](C2C_V2_V43_V44_REVIEW_AND_NEXT_PLAN.md).
 For the next method-level push beyond proxy correction, see
 [`docs/C2C_V2_TASK_FRAME_ALIGNMENT_BREAKTHROUGH_PLAN.md`](C2C_V2_TASK_FRAME_ALIGNMENT_BREAKTHROUGH_PLAN.md).
+For the post-v46 belief/forward-model route, see
+[`docs/C2C_V2_BELIEF_FORWARD_MODEL_PLAN.md`](C2C_V2_BELIEF_FORWARD_MODEL_PLAN.md).
 
 Operational defaults for this branch:
 
@@ -42,6 +44,10 @@ Current objective:
 - The immediate engineering target is to keep strict
   `alignment_ready_for_handoff` as the only close predicate while replacing
   proxy-first correction with task-frame state estimation.
+- The next named capability target should use semantic names, not another
+  version-number label: `belief_forward_task_frame_candidate`.
+  Its purpose is observability-aware belief estimation plus uncertainty-aware
+  command-conditioned forward modeling, not a pure candidate-ranker loss sweep.
 - The current readiness checkpoints are:
   - `runtime_artifacts/coarse2contact_v2/checkpoints/v43_task_frame_z_readiness.pt`
   - `runtime_artifacts/coarse2contact_v2/checkpoints/v44_task_frame_yaw_readiness.pt`
@@ -3825,3 +3831,50 @@ Interpretation:
   retain/flush large-XY/large-Yaw source roots and add a hard-negative or
   uncertainty-aware selector that can distinguish "safe Z guard" from "needed
   yaw-negative" without sacrificing XY contraction.
+
+## 2026-06-11 Status Update: Belief + Forward-Model Route
+
+The latest external-style method review is adopted as the next route, with one
+naming correction: do not introduce another `v47`-style label for the next
+candidate.  The next semantic target is:
+
+```text
+belief_forward_task_frame_candidate
+```
+
+New plan document:
+
+```text
+docs/C2C_V2_BELIEF_FORWARD_MODEL_PLAN.md
+```
+
+Core takeaways:
+
+- The main blocker is not a missing scalar/ranker loss.  It is the gap between
+  task-frame belief semantics and true closed-loop command consequences.
+- Yaw is conditionally controllable but often ambiguous or unobservable because
+  of square symmetry, occlusion, and partial wrist views.
+- The scarce supervision is same-window, zero-baselined executed transition
+  data, not generic relabeled state snapshots.
+- Typed candidate context was useful because it removed worse-than-zero folds,
+  but it still does not prove positive worst-root beat-zero behavior and it
+  regressed held-out XY.
+
+Next target:
+
+- build an observability-aware belief model that can say `correct`, `hold`,
+  `reacquire`, or `probe`, rather than forcing a confident residual on every
+  axis
+- train an uncertainty-aware command-conditioned forward model that predicts
+  post-command residual mean/logvar and selects commands only when they beat
+  same-window zero after collateral penalties
+- collect more retain/flush large-XY/large-Yaw, partial-view, yaw-observable,
+  and yaw-ambiguous transition groups with zero/no-op baselines
+- keep strict handoff and planner-owned close frozen
+
+Gate before MP4/promotion:
+
+- worst-root combined and yaw minus zero must be positive, not tied
+- XY contraction must not regress relative to v42/v46 evidence
+- yaw false positives on ambiguous/unobservable windows must stay controlled
+- close leak count remains zero
