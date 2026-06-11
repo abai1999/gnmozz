@@ -20,6 +20,9 @@ For the next method-level push beyond proxy correction, see
 [`docs/C2C_V2_TASK_FRAME_ALIGNMENT_BREAKTHROUGH_PLAN.md`](C2C_V2_TASK_FRAME_ALIGNMENT_BREAKTHROUGH_PLAN.md).
 For the post-v46 belief/forward-model route, see
 [`docs/C2C_V2_BELIEF_FORWARD_MODEL_PLAN.md`](C2C_V2_BELIEF_FORWARD_MODEL_PLAN.md).
+For the complete next-stage execution plan for general high-precision takeover,
+see
+[`docs/C2C_V2_GENERAL_PRECISION_TAKEOVER_EXECUTION_PLAN.md`](C2C_V2_GENERAL_PRECISION_TAKEOVER_EXECUTION_PLAN.md).
 
 Operational defaults for this branch:
 
@@ -48,6 +51,9 @@ Current objective:
   version-number label: `belief_forward_task_frame_candidate`.
   Its purpose is observability-aware belief estimation plus uncertainty-aware
   command-conditioned forward modeling, not a pure candidate-ranker loss sweep.
+- The next-stage plan must be skill-contract based and reusable across
+  high-precision local operations, not hardcoded to one insert window or one
+  hard bucket.  `insert_onto_square_peg` remains the first proving task.
 - The current readiness checkpoints are:
   - `runtime_artifacts/coarse2contact_v2/checkpoints/v43_task_frame_z_readiness.pt`
   - `runtime_artifacts/coarse2contact_v2/checkpoints/v44_task_frame_yaw_readiness.pt`
@@ -3885,3 +3891,36 @@ Gate before MP4/promotion:
 - dyaw must be blocked when yaw is ambiguous/unobservable unless the action is
   an explicitly bounded open-only probe/reacquire candidate
 - close leak count remains zero
+
+## 2026-06-11 Final Next-Stage Execution Plan
+
+The next execution plan has been consolidated here:
+
+```text
+docs/C2C_V2_GENERAL_PRECISION_TAKEOVER_EXECUTION_PLAN.md
+```
+
+This plan is the handoff document for future AI agents.  Its scope is broader
+than `insert_onto_square_peg`: insert is the first proving task, but the module
+must become a reusable skill-contract-driven local precision layer for all
+high-precision operations that can define reference/target frames, controlled
+axes, tolerances, symmetry, safe bounds, and handoff predicates.
+
+Final direction:
+
+- keep strict planner-owned close and handoff frozen;
+- build `belief_forward_task_frame_candidate`;
+- train task-frame belief and command-conditioned post-residual prediction;
+- use conservative lower-confidence beat-zero search with hard collateral
+  constraints;
+- support open-only `hold`, `reacquire`, and `probe` as information-gathering
+  candidates;
+- require source-held-out positive worst-root beat-zero evidence before MP4 or
+  insert-success claims.
+
+Final success target:
+
+- for insert: improve random/source-held-out failure-tail alignment and insert
+  success without close leaks or privileged runtime shortcuts;
+- for future precision skills: reuse the same belief/forward/control interface
+  by changing the skill contract, not by rewriting the controller.
